@@ -38,9 +38,9 @@ class SemiMarkov(_Struct):
             lengths: (batch,) sequence lengths
             force_grad: If True, force gradient computation even if not needed
             use_linear_scan: Algorithm selection
-                - None (default): Auto-select based on state space size
-                - True: Use O(N) linear scan (_dp_standard) - Lower memory, better for large K*C
-                - False: Use O(log N) binary tree - Faster for small K*C
+                - None (default): Auto-select based on state space size (KC > 200 -> linear scan)
+                - True: Use O(N) linear scan - Lower memory O(TKC), recommended for most uses
+                - False: Use O(log N) binary tree - Warning: creates O((KC)^3) temporaries per matmul
             use_vectorized: If True (default), use vectorized linear scan for 2-3x speedup
             use_banded: If True, attempt banded path (prototype); falls back to linear scan for now.
             banded_perm: Permutation strategy for banded path ("auto", "none", "snake", "rcm").
@@ -49,6 +49,13 @@ class SemiMarkov(_Struct):
         Returns:
             v: Log partition function Z(x)
             potentials: List of tensors for gradient computation
+
+        Note:
+            The binary tree algorithm (use_linear_scan=False) has O(log N) sequential depth
+            but creates O((KC)^3) temporary tensors per matrix multiply due to log-semiring
+            broadcast semantics. For state spaces KC > 50-100, this typically causes OOM
+            before the depth advantage helps. Use linear scan (default) for practical applications.
+            If you must use the tree, consider CheckpointShardSemiring to reduce peak memory.
         """
         # Auto-select algorithm if not specified (before _check_potentials to get dimensions)
         if use_linear_scan is None:
@@ -78,6 +85,29 @@ class SemiMarkov(_Struct):
         log_potentials, batch, N, K, C, lengths = self._check_potentials(log_potentials, lengths)
 
         # Binary tree algorithm (original implementation below)
+        #
+        # MEMORY WARNING: The binary tree achieves O(log N) sequential depth but has
+        # significant memory overhead from log-semiring matrix multiplication.
+        #
+        # The semiring.matmul() for LogSemiring computes:
+        #   result[i,k] = logsumexp_j(A[i,j] + B[j,k])
+        #
+        # This is implemented via broadcasting:
+        #   A.unsqueeze(-1) + B.unsqueeze(-3)  # (KC,KC,1) + (1,KC,KC) -> (KC,KC,KC)
+        #
+        # This creates an O((KC)^3) temporary tensor for EACH matrix multiply.
+        # At the base tree level, we do ~T/2 such multiplies, creating massive
+        # memory pressure that often causes OOM before the O(log N) depth helps.
+        #
+        # To mitigate this, use CheckpointShardSemiring which splits the matmul
+        # into smaller chunks, trading time for memory:
+        #   from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
+        #   ShardedLogSemiring = CheckpointShardSemiring(LogSemiring, max_size=10000)
+        #   struct = SemiMarkov(ShardedLogSemiring)
+        #
+        # For most practical applications, the linear scan backends are recommended
+        # as they avoid this O((KC)^3) temporary issue entirely.
+        #
         # Setup
         semiring = self.semiring
         ssize = semiring.size()
@@ -305,6 +335,101 @@ class SemiMarkov(_Struct):
         # Final: Sum over sequence endpoints (keep original implementation)
         v = semiring.sum(torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1))
         return v, [edge], beta
+
+    def _dp_scan_streaming(self, edge, lengths=None, force_grad=False):
+        """
+        True streaming O(N) scan that does NOT allocate O(T*K*C) alpha or O(T*C) beta.
+
+        Memory profile: O(K*C) DP state (ring buffer of last K betas)
+
+        This matches the paper's "memory is the constraint" narrative: the linear scan's
+        resident DP memory does not scale with sequence length T.
+
+        Recurrence:
+            beta[n, c] = logsumexp_{k=1..min(K,n), c_prev} (
+                beta[n-k, c_prev] + edge[n-k, k, c, c_prev]
+            )
+
+        We only need beta[n-1], beta[n-2], ..., beta[n-K+1] to compute beta[n],
+        so we keep a ring buffer of the last K betas instead of all T betas.
+        Alpha is not stored at all - it's computed inline and consumed immediately.
+        """
+        semiring = self.semiring
+        ssize = semiring.size()
+        edge, batch, N, K, C, lengths = self._check_potentials(edge, lengths)
+        edge.requires_grad_(True)
+
+        # Initialize beta[0] = one for all labels (paths of length 0 ending at position 0)
+        beta_current = torch.zeros((ssize, batch, C), dtype=edge.dtype, device=edge.device)
+        beta_current = semiring.fill(
+            beta_current, torch.tensor(True, device=edge.device), semiring.one
+        )
+
+        # Ring buffer: beta_hist[:, :, k-1, :] holds beta from k steps ago
+        # beta_hist[:, :, 0, :] = beta[n-1] (most recent)
+        # beta_hist[:, :, 1, :] = beta[n-2]
+        # ...
+        # beta_hist[:, :, K-1, :] = beta[n-K]
+        beta_hist = torch.zeros((ssize, batch, K, C), dtype=edge.dtype, device=edge.device)
+        beta_hist = semiring.fill(
+            beta_hist, torch.tensor(True, device=edge.device), semiring.zero
+        )
+        beta_hist[:, :, 0, :] = beta_current
+
+        # Store final beta for each batch item (at their respective lengths)
+        final_beta = semiring.fill(
+            torch.zeros_like(beta_current),
+            torch.tensor(True, device=edge.device),
+            semiring.zero,
+        )
+        # Handle length=1 case
+        mask_len1 = (lengths == 1).view(1, batch, 1)
+        final_beta = torch.where(mask_len1, beta_current, final_beta)
+
+        for n in range(1, N):
+            # Number of valid durations at this position
+            k_eff = min(K, n)
+
+            # Duration indices: 1, 2, ..., k_eff
+            dur = torch.arange(1, k_eff + 1, device=edge.device)
+
+            # Position indices where segments start: n-1, n-2, ..., n-k_eff
+            start = n - dur
+
+            # Get previous betas from ring buffer
+            # dur-1 maps [1,2,...,k_eff] to [0,1,...,k_eff-1] (ring buffer indices)
+            beta_prev = beta_hist[:, :, dur - 1, :]  # (ssize, batch, k_eff, C)
+
+            # Get edge potentials for these (start, duration) pairs
+            # edge shape: (ssize, batch, N-1, K, C, C)
+            # Advanced indexing pairs start[i] with dur[i]
+            edge_slice = edge[:, :, start, dur, :, :]  # (ssize, batch, k_eff, C, C)
+
+            # Compute: logsumexp over c_prev (last dim) of beta_prev + edge
+            # beta_prev: (ssize, batch, k_eff, C) -> unsqueeze to (ssize, batch, k_eff, 1, C)
+            # edge_slice: (ssize, batch, k_eff, C, C)
+            # broadcast: (ssize, batch, k_eff, C, C)
+            # sum over c_prev (dim=-1): (ssize, batch, k_eff, C)
+            scores = semiring.sum(
+                beta_prev.unsqueeze(-2) + edge_slice, dim=-1
+            )
+
+            # Sum over duration dimension to get beta[n]
+            beta_n = semiring.sum(scores, dim=2)  # (ssize, batch, C)
+
+            # Capture final beta for sequences ending at this position
+            mask_end = (lengths == (n + 1)).view(1, batch, 1)
+            final_beta = torch.where(mask_end, beta_n, final_beta)
+
+            # Update ring buffer: shift and insert new beta
+            # Roll existing values back by 1 position
+            if K > 1:
+                beta_hist[:, :, 1:, :] = beta_hist[:, :, :-1, :].clone()
+            beta_hist[:, :, 0, :] = beta_n
+
+        # Final partition function: sum over labels
+        v = semiring.sum(final_beta, dim=-1)  # (ssize, batch)
+        return v, [edge], None
 
     def _compute_bandwidth(self, span_length, K, C):
         """

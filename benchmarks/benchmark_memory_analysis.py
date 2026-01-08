@@ -39,6 +39,7 @@ import torch
 
 from torch_semimarkov import SemiMarkov
 from torch_semimarkov.semirings import LogSemiring
+from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
 
 
 @dataclass
@@ -90,45 +91,95 @@ def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> D
     - dp_state: Forward/backward DP tables
     - workspace: Intermediate computation tensors
     - autograd: Saved tensors for backward pass
+
+    NOTE: These are estimates based on actual implementation analysis.
+    For precise measurements, use torch.cuda.memory_snapshot().
+
+    Actual implementation details (as of code review):
+    - linear_scan stores alpha: (ssize, B, N, K, C) -> O(T*K*C)
+    - linear_scan stores beta: list of N tensors (ssize, B, C) -> O(T*C)
+    - binary_tree log-semiring matmul materializes O((KC)^3) temporaries
     """
     float_bytes = 4  # float32
+    N = T - 1  # number of positions
 
     # Potentials: (B, T-1, K, C, C) - always present
-    potentials_bytes = B * (T - 1) * K * C * C * float_bytes
+    potentials_bytes = B * N * K * C * C * float_bytes
 
     # DP state depends on backend
     if backend in ["linear_scan", "linear_scan_vectorized"]:
-        # O(TC) state - just alpha table
-        dp_state_bytes = B * T * C * float_bytes
-        # Workspace for vectorized: O(KC²) per step
+        # ACTUAL implementation (not theoretical O(TC)):
+        # alpha: (ssize, B, N, K, C) -> O(T*K*C) resident
+        # beta: list of N tensors of shape (ssize, B, C) -> O(T*C)
+        # Total DP state is O(T*K*C + T*C) = O(T*K*C) when K > 1
+        alpha_bytes = 1 * B * N * K * C * float_bytes  # ssize=1 for LogSemiring
+        beta_bytes = 1 * B * N * C * float_bytes
+        dp_state_bytes = alpha_bytes + beta_bytes
+
+        # Workspace for vectorized: index tensors + gathered tensors
         if backend == "linear_scan_vectorized":
-            workspace_bytes = B * K * C * C * float_bytes * 2  # temp buffers
+            # time_indices, dur_indices: (K,) each
+            # gathered: (ssize, B, K, C) per step
+            workspace_bytes = B * K * C * float_bytes * 2  # gathered + temp
         else:
             workspace_bytes = B * C * float_bytes  # minimal
-        # Autograd saves potentials slice per step
-        autograd_bytes = potentials_bytes  # roughly
+
+        # Autograd: saves computation graph, roughly proportional to potentials
+        autograd_bytes = potentials_bytes
+
+    elif backend == "linear_scan_streaming":
+        # TRUE streaming scan: O(K*C) DP state, independent of T
+        # beta_hist: (ssize, B, K, C) ring buffer of last K betas
+        # final_beta: (ssize, B, C)
+        # NO alpha storage, NO full beta history
+        dp_state_bytes = 1 * B * K * C * float_bytes + 1 * B * C * float_bytes
+        # Workspace: edge_slice (B, k_eff, C, C), scores (B, k_eff, C) per step
+        workspace_bytes = B * K * C * C * float_bytes + B * K * C * float_bytes
+        # Autograd: saves edge (potentials) + ring buffer states
+        autograd_bytes = potentials_bytes + dp_state_bytes * N  # graph grows with T
 
     elif backend == "binary_tree":
-        # O(T * KC * KC) for tree matrices
+        # Tree stores chart matrices of shape (ssize, B, KC, KC) at each level
+        # CRITICAL: log-semiring matmul materializes O((KC)^3) temporary
+        # because it computes: result[i,k] = logsumexp_j(A[i,j] + B[j,k])
+        # via broadcast: (KC, KC, 1) + (1, KC, KC) -> (KC, KC, KC)
         KC = K * C
-        dp_state_bytes = B * T * KC * float_bytes
-        workspace_bytes = B * T * KC * KC * float_bytes  # the killer!
-        autograd_bytes = workspace_bytes * 2  # saved for backward
+        # Chart storage across ~log(T) levels, but dominant cost is at base
+        dp_state_bytes = B * N * KC * float_bytes  # vector at each position
+        # Workspace: the O((KC)^3) temporary per matmul is the killer
+        # At each level, we do ~T/2^level matmuls; base level is worst
+        workspace_bytes = B * KC * KC * KC * float_bytes  # (KC)^3 temporary!
+        # Autograd saves inputs for backward through all matmuls
+        autograd_bytes = B * N * KC * KC * float_bytes * 2
+
+    elif backend == "binary_tree_sharded":
+        # Same algorithm as binary_tree but using CheckpointShardSemiring
+        # which splits the O((KC)^3) matmul into smaller shards
+        # This reduces peak memory at the cost of more serial computation
+        KC = K * C
+        dp_state_bytes = B * N * KC * float_bytes
+        # Workspace is reduced because we shard the matmul
+        # Instead of (KC)^3 all at once, we do it in chunks
+        shard_size = 10000  # default shard size from checkpoint.py
+        workspace_bytes = B * min(KC * KC * KC, shard_size * KC) * float_bytes
+        # Autograd still needs to save inputs but recomputes forward in backward
+        autograd_bytes = B * N * KC * KC * float_bytes  # ~half of non-sharded
 
     elif backend == "banded":
         # O(T * KC * BW) where BW is bandwidth
         KC = K * C
         bw = min(KC, K * 2)  # rough bandwidth estimate
-        dp_state_bytes = B * T * KC * float_bytes
-        workspace_bytes = B * T * KC * bw * float_bytes
-        autograd_bytes = workspace_bytes
+        dp_state_bytes = B * N * KC * float_bytes
+        workspace_bytes = B * KC * bw * float_bytes  # per-multiply workspace
+        autograd_bytes = B * N * KC * bw * float_bytes
 
     elif backend == "block_triangular":
-        # Similar to binary tree but with block structure
+        # Similar to binary tree but with block sparsity
+        # Current impl converts to/from dense at each level (suboptimal)
         KC = K * C
-        dp_state_bytes = B * T * KC * float_bytes
-        workspace_bytes = B * T * KC * KC * float_bytes
-        autograd_bytes = workspace_bytes * 2
+        dp_state_bytes = B * N * KC * float_bytes
+        workspace_bytes = B * KC * KC * float_bytes  # dense conversion overhead
+        autograd_bytes = B * N * KC * KC * float_bytes
 
     else:
         dp_state_bytes = 0
@@ -202,16 +253,52 @@ def run_single_benchmark(
         peak_allocated = 0
         peak_reserved = 0
 
-        for rep in range(repeats):
-            edge_run = edge.clone().detach().requires_grad_(True)
+        # Warmup run (not recorded) to stabilize CUDA state
+        if device.type == "cuda":
+            edge_warmup = edge.clone().detach().requires_grad_(True)
+            try:
+                if backend == "binary_tree":
+                    v_warm, _ = struct.logpartition(edge_warmup, lengths=lengths, use_linear_scan=False)
+                elif backend == "linear_scan":
+                    v_warm, _, _ = struct._dp_standard(edge_warmup, lengths, force_grad=True)
+                elif backend == "linear_scan_vectorized":
+                    v_warm, _, _ = struct._dp_standard_vectorized(edge_warmup, lengths, force_grad=True)
+                elif backend == "banded":
+                    v_warm, _, _ = struct.logpartition(
+                        edge_warmup, lengths=lengths,
+                        use_linear_scan=True, use_vectorized=True,
+                        use_banded=True, banded_perm="auto", banded_bw_ratio=0.6,
+                    )
+                elif backend == "block_triangular":
+                    if hasattr(struct, "_dp_blocktriangular"):
+                        v_warm, _, _ = struct._dp_blocktriangular(edge_warmup, lengths, force_grad=True)
+                elif backend == "binary_tree_sharded":
+                    # Use CheckpointShardSemiring to reduce peak memory
+                    ShardedLogSemiring = CheckpointShardSemiring(LogSemiring, max_size=10000)
+                    struct_sharded = SemiMarkov(ShardedLogSemiring)
+                    v_warm, _ = struct_sharded.logpartition(edge_warmup, lengths=lengths, use_linear_scan=False)
+                elif backend == "linear_scan_streaming":
+                    # True streaming scan with O(K*C) DP state
+                    v_warm, _, _ = struct._dp_scan_streaming(edge_warmup, lengths, force_grad=True)
+                v_warm.sum().backward()
+                del edge_warmup, v_warm
+            except Exception:
+                pass  # If warmup fails, actual run will catch it
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            gc.collect()
 
-            # Clear cache and reset stats
+        for rep in range(repeats):
+            # IMPORTANT: Reset memory stats BEFORE allocating edge_run
+            # so that edge_run allocation is included in peak measurement
             if device.type == "cuda":
-                torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
 
             gc.collect()
+
+            edge_run = edge.clone().detach().requires_grad_(True)
+
             t0 = time.perf_counter()
 
             # Run the appropriate backend
@@ -232,6 +319,15 @@ def run_single_benchmark(
                     v, _, _ = struct._dp_blocktriangular(edge_run, lengths, force_grad=True)
                 else:
                     raise NotImplementedError("block_triangular not available")
+            elif backend == "binary_tree_sharded":
+                # Use CheckpointShardSemiring to reduce peak memory at cost of time
+                # This is a "fair" tree baseline that doesn't suffer from O((KC)^3) peak
+                ShardedLogSemiring = CheckpointShardSemiring(LogSemiring, max_size=10000)
+                struct_sharded = SemiMarkov(ShardedLogSemiring)
+                v, _ = struct_sharded.logpartition(edge_run, lengths=lengths, use_linear_scan=False)
+            elif backend == "linear_scan_streaming":
+                # True streaming scan: O(K*C) DP state, matches paper's memory narrative
+                v, _, _ = struct._dp_scan_streaming(edge_run, lengths, force_grad=True)
             else:
                 raise ValueError(f"Unknown backend: {backend}")
 
@@ -249,11 +345,9 @@ def run_single_benchmark(
                 peak_allocated = max(peak_allocated, torch.cuda.max_memory_allocated(device))
                 peak_reserved = max(peak_reserved, torch.cuda.max_memory_reserved(device))
 
-            # Clean up
+            # Clean up (no empty_cache here - only between configs, not repeats)
             del edge_run, v, loss
             gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         # Compute statistics
         times_sorted = sorted(times_ms)
@@ -334,7 +428,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
         "--backends", type=str,
-        default="linear_scan,linear_scan_vectorized,binary_tree,banded,block_triangular"
+        default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,banded,block_triangular",
+        help="Comma-separated list of backends. linear_scan_streaming has O(K*C) DP state. binary_tree_sharded uses CheckpointShardSemiring."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument("--max-memory-gb", type=float, default=40.0,
