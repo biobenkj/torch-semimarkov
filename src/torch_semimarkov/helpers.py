@@ -6,9 +6,7 @@ from .semirings import LogSemiring
 class Chart:
     def __init__(self, size, potentials, semiring):
         c = torch.zeros(
-            *((semiring.size(),) + size),
-            dtype=potentials.dtype,
-            device=potentials.device
+            *((semiring.size(),) + size), dtype=potentials.dtype, device=potentials.device
         )
         c[:] = semiring.zero.view((semiring.size(),) + len(size) * (1,))
 
@@ -54,9 +52,7 @@ class _Struct:
         chart = []
         for _ in range(N):
             c = torch.zeros(
-                *((self.semiring.size(),) + size),
-                dtype=potentials.dtype,
-                device=potentials.device
+                *((self.semiring.size(),) + size), dtype=potentials.dtype, device=potentials.device
             )
             c[:] = self.semiring.zero.view((self.semiring.size(),) + len(size) * (1,))
             c.requires_grad_(force_grad and not potentials.requires_grad)

@@ -107,9 +107,7 @@ def run_backend_once(
     elif backend == "block_triangular":
         # Block-triangular DP
         if hasattr(struct, "_dp_blocktriangular"):
-            v, _, _ = struct._dp_blocktriangular(
-                edge_run, lengths, force_grad=True
-            )
+            v, _, _ = struct._dp_blocktriangular(edge_run, lengths, force_grad=True)
         elif "use_block_triangular" in struct._dp_standard.__code__.co_varnames:
             v, _, _ = struct._dp_standard(
                 edge_run,
@@ -189,12 +187,8 @@ def main():
             for C in C_list:
                 # Build random edge potentials on the target device
                 B = args.B
-                edge = torch.randn(
-                    B, T - 1, K, C, C, device=device, requires_grad=False
-                )
-                lengths = torch.full(
-                    (B,), T, dtype=torch.long, device=device
-                )
+                edge = torch.randn(B, T - 1, K, C, C, device=device, requires_grad=False)
+                lengths = torch.full((B,), T, dtype=torch.long, device=device)
 
                 struct = SemiMarkov(LogSemiring)
 

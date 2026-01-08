@@ -33,12 +33,12 @@ from .blocktriangular import BlockTriangularMatrix, block_triang_matmul
 __version__ = "0.1.0"
 
 __all__ = [
-    'SemiMarkov',
-    'BandedMatrix',
-    'BlockTriangularMatrix',
-    'block_triang_matmul',
-    'measure_effective_bandwidth',
-    'snake_ordering',
-    'rcm_ordering_from_adjacency',
-    'apply_permutation',
+    "SemiMarkov",
+    "BandedMatrix",
+    "BlockTriangularMatrix",
+    "block_triang_matmul",
+    "measure_effective_bandwidth",
+    "snake_ordering",
+    "rcm_ordering_from_adjacency",
+    "apply_permutation",
 ]

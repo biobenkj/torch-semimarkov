@@ -95,7 +95,9 @@ def span_lengths(T: int) -> Iterable[int]:
         yield 2 ** (level + 1)
 
 
-def gating_summary(struct: SemiMarkov, T: int, K: int, C: int, perm: str, bw_ratio: float, device) -> Dict[str, object]:
+def gating_summary(
+    struct: SemiMarkov, T: int, K: int, C: int, perm: str, bw_ratio: float, device
+) -> Dict[str, object]:
     spans = list(span_lengths(T))
     size = (K - 1) * C
     flags = []
@@ -124,15 +126,34 @@ def gating_summary(struct: SemiMarkov, T: int, K: int, C: int, perm: str, bw_rat
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--T", type=str, default="512,1024,2048,3072,4096", help="Comma-separated sequence lengths.")
-    parser.add_argument("--K", type=str, default="8,12,16,20", help="Comma-separated max durations.")
+    parser.add_argument(
+        "--T", type=str, default="512,1024,2048,3072,4096", help="Comma-separated sequence lengths."
+    )
+    parser.add_argument(
+        "--K", type=str, default="8,12,16,20", help="Comma-separated max durations."
+    )
     parser.add_argument("--C", type=str, default="3,6", help="Comma-separated label counts.")
     parser.add_argument("--B", type=int, default=4, help="Batch size.")
-    parser.add_argument("--repeats", type=int, default=3, help="Repeats per config/mode for timing.")
-    parser.add_argument("--bw-ratio", type=float, default=0.6, help="Bandwidth ratio threshold for banded gating.")
-    parser.add_argument("--banded-perm", type=str, default="auto", choices=["auto", "none", "snake", "rcm"], help="Permutation strategy for banded path.")
+    parser.add_argument(
+        "--repeats", type=int, default=3, help="Repeats per config/mode for timing."
+    )
+    parser.add_argument(
+        "--bw-ratio", type=float, default=0.6, help="Bandwidth ratio threshold for banded gating."
+    )
+    parser.add_argument(
+        "--banded-perm",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "snake", "rcm"],
+        help="Permutation strategy for banded path.",
+    )
     parser.add_argument("--csv", type=Path, default=None, help="Optional CSV output path.")
-    parser.add_argument("--device", type=str, default=None, help="torch device to use (e.g., cuda, cuda:0, cpu). Defaults to cuda if available.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="torch device to use (e.g., cuda, cuda:0, cpu). Defaults to cuda if available.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)

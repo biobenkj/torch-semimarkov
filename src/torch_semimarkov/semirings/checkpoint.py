@@ -4,6 +4,7 @@ has_genbmm = False
 try:
     from torch_semimarkov._genbmm import BandedMatrix
     import torch_semimarkov._genbmm as genbmm
+
     has_genbmm = True
 except ImportError:
     pass

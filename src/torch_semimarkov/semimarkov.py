@@ -75,9 +75,7 @@ class SemiMarkov(_Struct):
                 return self._dp_standard(log_potentials, lengths, force_grad)
 
         # Binary tree algorithm: check and prepare potentials
-        log_potentials, batch, N, K, C, lengths = self._check_potentials(
-            log_potentials, lengths
-        )
+        log_potentials, batch, N, K, C, lengths = self._check_potentials(log_potentials, lengths)
 
         # Binary tree algorithm (original implementation below)
         # Setup
@@ -85,9 +83,7 @@ class SemiMarkov(_Struct):
         ssize = semiring.size()
         log_potentials.requires_grad_(True)
         log_N, bin_N = self._bin_length(N - 1)
-        init = self._chart(
-            (batch, bin_N, K - 1, K - 1, C, C), log_potentials, force_grad
-        )
+        init = self._chart((batch, bin_N, K - 1, K - 1, C, C), log_potentials, force_grad)
 
         # Init.
         mask = torch.zeros(*init.shape, device=log_potentials.device).bool()
@@ -130,9 +126,7 @@ class SemiMarkov(_Struct):
 
         # Order n, n-1
         chart = (
-            init.permute(0, 1, 2, 3, 5, 4, 6)
-            .contiguous()
-            .view(-1, batch, bin_N, K_1 * C, K_1 * C)
+            init.permute(0, 1, 2, 3, 5, 4, 6).contiguous().view(-1, batch, bin_N, K_1 * C, K_1 * C)
         )
 
         for n in range(1, log_N + 1):
@@ -175,9 +169,7 @@ class SemiMarkov(_Struct):
             beta[n][:] = semiring.sum(
                 torch.stack([alpha[:, :, a, b] for a, b in zip(f1, f2)], dim=-1)
             )
-        v = semiring.sum(
-            torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1)
-        )
+        v = semiring.sum(torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1))
         return v, [edge], beta
 
     def _dp_blocktriangular(self, edge, lengths=None, force_grad=False):
@@ -193,9 +185,7 @@ class SemiMarkov(_Struct):
         edge.requires_grad_(True)
 
         log_N, bin_N = self._bin_length(N - 1)
-        init = self._chart(
-            (batch, bin_N, K - 1, K - 1, C, C), edge, force_grad
-        )
+        init = self._chart((batch, bin_N, K - 1, K - 1, C, C), edge, force_grad)
 
         # Init mask (same as standard)
         mask = torch.zeros(*init.shape, device=edge.device).bool()
@@ -238,15 +228,13 @@ class SemiMarkov(_Struct):
 
         # Flatten to (K*C, K*C) - same permutation as standard algorithm
         chart = (
-            init.permute(0, 1, 2, 3, 5, 4, 6)
-            .contiguous()
-            .view(-1, batch, bin_N, K_1 * C, K_1 * C)
+            init.permute(0, 1, 2, 3, 5, 4, 6).contiguous().view(-1, batch, bin_N, K_1 * C, K_1 * C)
         )
 
         for level in range(1, log_N + 1):
             span_length = 2 ** (level + 1)
 
-            left = chart[:, :, 1::2]   # Odd indices
+            left = chart[:, :, 1::2]  # Odd indices
             right = chart[:, :, 0::2]  # Even indices
 
             result_parts = []
@@ -255,16 +243,10 @@ class SemiMarkov(_Struct):
                 left_dense = left[s].reshape(-1, K_1 * C, K_1 * C)
                 right_dense = right[s].reshape(-1, K_1 * C, K_1 * C)
 
-                left_bt = BlockTriangularMatrix.from_dense(
-                    left_dense, K_1, C, span_length
-                )
-                right_bt = BlockTriangularMatrix.from_dense(
-                    right_dense, K_1, C, span_length
-                )
+                left_bt = BlockTriangularMatrix.from_dense(left_dense, K_1, C, span_length)
+                right_bt = BlockTriangularMatrix.from_dense(right_dense, K_1, C, span_length)
 
-                prod_bt = block_triang_matmul(
-                    left_bt, right_bt, semiring, span_length
-                )
+                prod_bt = block_triang_matmul(left_bt, right_bt, semiring, span_length)
                 prod_dense = prod_bt.to_dense().reshape(batch, -1, K_1 * C, K_1 * C)
                 result_parts.append(prod_dense)
 
@@ -304,8 +286,7 @@ class SemiMarkov(_Struct):
             # Original: semiring.dot(beta[n-1].view(...), edge[n-1].view(...))
             # Optimized: Direct broadcasting with semiring.sum over last dim
             alpha[:, :, n - 1] = semiring.sum(
-                beta[n - 1].view(ssize, batch, 1, 1, C) + edge[:, :, n - 1],
-                dim=-1
+                beta[n - 1].view(ssize, batch, 1, 1, C) + edge[:, :, n - 1], dim=-1
             )
 
             # Beta accumulation: Vectorized advanced indexing
@@ -322,9 +303,7 @@ class SemiMarkov(_Struct):
             beta[n][:] = semiring.sum(gathered, dim=-2)  # Sum over k dimension
 
         # Final: Sum over sequence endpoints (keep original implementation)
-        v = semiring.sum(
-            torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1)
-        )
+        v = semiring.sum(torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1))
         return v, [edge], beta
 
     def _compute_bandwidth(self, span_length, K, C):
@@ -433,7 +412,9 @@ class SemiMarkov(_Struct):
         use_banded = best_bw < threshold
         return use_banded, best_perm, best_bw, threshold
 
-    def _dp_banded(self, edge, lengths=None, force_grad=False, banded_perm="auto", banded_bw_ratio=0.6):
+    def _dp_banded(
+        self, edge, lengths=None, force_grad=False, banded_perm="auto", banded_bw_ratio=0.6
+    ):
         """
         Banded Semi-Markov binary tree forward pass.
 
@@ -459,9 +440,7 @@ class SemiMarkov(_Struct):
 
         # Binary tree setup (same as standard algorithm)
         log_N, bin_N = self._bin_length(N - 1)
-        init = self._chart(
-            (batch, bin_N, K - 1, K - 1, C, C), edge, force_grad
-        )
+        init = self._chart((batch, bin_N, K - 1, K - 1, C, C), edge, force_grad)
 
         # Init mask (same as standard)
         mask = torch.zeros(*init.shape, device=edge.device).bool()
@@ -504,9 +483,7 @@ class SemiMarkov(_Struct):
 
         # Flatten to (K*C, K*C) - same permutation as standard algorithm
         chart = (
-            init.permute(0, 1, 2, 3, 5, 4, 6)
-            .contiguous()
-            .view(-1, batch, bin_N, K_1 * C, K_1 * C)
+            init.permute(0, 1, 2, 3, 5, 4, 6).contiguous().view(-1, batch, bin_N, K_1 * C, K_1 * C)
         )
 
         # Binary tree with banded matmul
@@ -519,7 +496,7 @@ class SemiMarkov(_Struct):
             lu, ld = self._compute_bandwidth(span_length, K, C)
 
             # Get left and right charts for composition
-            left = chart[:, :, 1::2]   # Odd indices
+            left = chart[:, :, 1::2]  # Odd indices
             right = chart[:, :, 0::2]  # Even indices
 
             # Decide whether banded is worthwhile and optionally permute states
@@ -538,7 +515,7 @@ class SemiMarkov(_Struct):
                 right = right[..., perm, :]
 
             # Determine fill value based on semiring
-            fill_value = semiring.zero if hasattr(semiring, 'zero') else -1e9
+            fill_value = semiring.zero if hasattr(semiring, "zero") else -1e9
 
             # Convert to banded representation for memory-efficient matmul
             # Shape: (ssize, batch, n_pairs, K*C, K*C) -> use genbmm.BandedMatrix
@@ -554,19 +531,15 @@ class SemiMarkov(_Struct):
                     right_matrices = right[s, b]
 
                     # Convert to BandedMatrix (CPU-only for now, CUDA via semirings later)
-                    left_banded = BandedMatrix.from_dense(
-                        left_matrices, lu, ld, fill_value
-                    )
-                    right_banded = BandedMatrix.from_dense(
-                        right_matrices, lu, ld, fill_value
-                    )
+                    left_banded = BandedMatrix.from_dense(left_matrices, lu, ld, fill_value)
+                    right_banded = BandedMatrix.from_dense(right_matrices, lu, ld, fill_value)
 
                     # Banded matmul using appropriate semiring operation
                     # Must use b.op(a.transpose()) to match semiring.matmul semantics
-                    if hasattr(semiring, 'zero') and semiring.zero == -1e9:
+                    if hasattr(semiring, "zero") and semiring.zero == -1e9:
                         # Log semiring: use multiply_log (logsumexp)
                         result_banded = right_banded.multiply_log(left_banded.transpose())
-                    elif hasattr(semiring, 'one') and semiring.one == -1e9:
+                    elif hasattr(semiring, "one") and semiring.one == -1e9:
                         # Max semiring: use multiply_max
                         result_banded = right_banded.multiply_max(left_banded.transpose())
                     else:

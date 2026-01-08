@@ -25,8 +25,7 @@ class BandedMatrix:
     def __post_init__(self):
         assert self.data.dim() == 3, "BandedMatrix expects (batch, n, width)"
         assert self.data.size(-1) == self.lu + self.ld + 1, (
-            "Width must equal lu + ld + 1 "
-            f"(got {self.data.size(-1)} vs {self.lu + self.ld + 1})"
+            "Width must equal lu + ld + 1 " f"(got {self.data.size(-1)} vs {self.lu + self.ld + 1})"
         )
         # cache width
         self.width = self.data.size(-1)

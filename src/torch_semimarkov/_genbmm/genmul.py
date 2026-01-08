@@ -5,8 +5,10 @@ try:
 except ImportError:
     pass
 
+
 def trans(s):
     return s.transpose(-2, -1).contiguous()
+
 
 class LogMatMulBack(torch.autograd.Function):
     @staticmethod
@@ -18,8 +20,9 @@ class LogMatMulBack(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         a, b, grad_out, part, maxes = ctx.saved_tensors
-        grad_a, grad_b, grad_grad = _genbmm.backbackward(a, b, grad_out.contiguous(),
-                                                         part, maxes, grad_output.contiguous(), 0)
+        grad_a, grad_b, grad_grad = _genbmm.backbackward(
+            a, b, grad_out.contiguous(), part, maxes, grad_output.contiguous(), 0
+        )
 
         return grad_a, grad_b, grad_grad, None, None
 
@@ -35,8 +38,9 @@ class LogMatMul(torch.autograd.Function):
     def backward(ctx, grad_output):
         a, b, out, maxes = ctx.saved_tensors
         grad_a = LogMatMulBack.apply(a, b, grad_output.contiguous(), out, maxes)
-        grad_b = LogMatMulBack.apply(trans(b), trans(a),
-                                     trans(grad_output), trans(out), trans(maxes))
+        grad_b = LogMatMulBack.apply(
+            trans(b), trans(a), trans(grad_output), trans(out), trans(maxes)
+        )
 
         return grad_a, trans(grad_b)
 
@@ -52,7 +56,12 @@ class MaxMatMul(torch.autograd.Function):
     def backward(ctx, grad_output):
         a, b, switches = ctx.saved_tensors
         grad_a, grad_b = _genbmm.backward(
-            a.float(), b.float(), grad_output.contiguous().float(), switches.float(), switches.float(), 1
+            a.float(),
+            b.float(),
+            grad_output.contiguous().float(),
+            switches.float(),
+            switches.float(),
+            1,
         )
         return grad_a.to(a.dtype), grad_b.to(b.dtype)
 
@@ -68,7 +77,12 @@ class SampleMatMul(torch.autograd.Function):
     def backward(ctx, grad_output):
         a, b, switches = ctx.saved_tensors
         grad_a, grad_b = _genbmm.backward(
-            a.float(), b.float(), grad_output.contiguous().float(), switches.float(), switches.float(), 2
+            a.float(),
+            b.float(),
+            grad_output.contiguous().float(),
+            switches.float(),
+            switches.float(),
+            2,
         )
         return grad_a.to(a.dtype), grad_b.to(b.dtype)
 
@@ -84,7 +98,12 @@ class ProdMaxMatMul(torch.autograd.Function):
     def backward(ctx, grad_output):
         a, b, switches = ctx.saved_tensors
         grad_a, grad_b = _genbmm.backward(
-            a.float(), b.float(), grad_output.contiguous().float(), switches.float(), switches.float(), 3
+            a.float(),
+            b.float(),
+            grad_output.contiguous().float(),
+            switches.float(),
+            switches.float(),
+            3,
         )
         return grad_a.to(a.dtype), grad_b.to(b.dtype)
 

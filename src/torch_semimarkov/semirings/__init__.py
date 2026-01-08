@@ -15,12 +15,12 @@ from .semirings import (
 from .checkpoint import CheckpointSemiring, CheckpointShardSemiring
 
 __all__ = [
-    'LogSemiring',
-    'MaxSemiring',
-    'StdSemiring',
-    'KMaxSemiring',
-    'EntropySemiring',
-    'CrossEntropySemiring',
-    'CheckpointSemiring',
-    'CheckpointShardSemiring',
+    "LogSemiring",
+    "MaxSemiring",
+    "StdSemiring",
+    "KMaxSemiring",
+    "EntropySemiring",
+    "CrossEntropySemiring",
+    "CheckpointSemiring",
+    "CheckpointShardSemiring",
 ]

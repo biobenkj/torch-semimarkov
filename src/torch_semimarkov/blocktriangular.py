@@ -274,12 +274,12 @@ def _get_or_build_structure(
 
     if num_e_blocks == 0:
         structure = {
-            'e_block_indices': e_block_indices,
-            'triplets': triplets,
-            'e_ptr': torch.zeros(1, dtype=torch.long, device=device),
-            'sorted_idx': torch.zeros(0, dtype=torch.long, device=device),
-            'c_zero_idx': c_zero_idx,
-            'd_zero_idx': d_zero_idx,
+            "e_block_indices": e_block_indices,
+            "triplets": triplets,
+            "e_ptr": torch.zeros(1, dtype=torch.long, device=device),
+            "sorted_idx": torch.zeros(0, dtype=torch.long, device=device),
+            "c_zero_idx": c_zero_idx,
+            "d_zero_idx": d_zero_idx,
         }
         _STRUCTURE_CACHE[cache_key] = structure
         return structure
@@ -296,16 +296,16 @@ def _get_or_build_structure(
         e_indices_sorted = e_indices[sorted_idx]
         e_ptr = torch.searchsorted(
             e_indices_sorted.contiguous(),
-            torch.arange(num_e_blocks + 1, device=device, dtype=e_indices.dtype)
+            torch.arange(num_e_blocks + 1, device=device, dtype=e_indices.dtype),
         )
 
     structure = {
-        'e_block_indices': e_block_indices,
-        'triplets': triplets,
-        'e_ptr': e_ptr,
-        'sorted_idx': sorted_idx,
-        'c_zero_idx': c_zero_idx,
-        'd_zero_idx': d_zero_idx,
+        "e_block_indices": e_block_indices,
+        "triplets": triplets,
+        "e_ptr": e_ptr,
+        "sorted_idx": sorted_idx,
+        "c_zero_idx": c_zero_idx,
+        "d_zero_idx": d_zero_idx,
     }
 
     _STRUCTURE_CACHE[cache_key] = structure
@@ -365,17 +365,19 @@ def block_triang_matmul(
     # (K, span, duration_mask_key, device))
     # This avoids rebuilding triplets/CSR structure on every call
     structure = _get_or_build_structure(C_bt, D_bt, K, span)
-    e_block_indices = structure['e_block_indices']
-    triplets = structure['triplets']
-    e_ptr = structure['e_ptr']
-    sorted_idx = structure['sorted_idx']
-    c_zero_idx = structure['c_zero_idx']
-    d_zero_idx = structure['d_zero_idx']
+    e_block_indices = structure["e_block_indices"]
+    triplets = structure["triplets"]
+    e_ptr = structure["e_ptr"]
+    sorted_idx = structure["sorted_idx"]
+    c_zero_idx = structure["c_zero_idx"]
+    d_zero_idx = structure["d_zero_idx"]
 
     if debug:
         cache_key = (K, span, C_bt.duration_mask_key, str(C_bt.device))
         is_cached = cache_key in _STRUCTURE_CACHE
-        print(f"\nStructure cache: {'HIT' if is_cached else 'MISS'} (cache size: {len(_STRUCTURE_CACHE)})")
+        print(
+            f"\nStructure cache: {'HIT' if is_cached else 'MISS'} (cache size: {len(_STRUCTURE_CACHE)})"
+        )
         print(f"Result blocks (k1,k3): {e_block_indices.tolist()}")
         print(f"Triplets (e_idx, c_idx, d_idx):")
         for t in triplets.tolist():
@@ -410,7 +412,7 @@ def block_triang_matmul(
     C_values_padded = torch.cat([C_bt.values, zero_block_left], dim=1)
     D_values_padded = torch.cat([D_bt.values, zero_block_right], dim=1)
 
-    left_blocks = C_values_padded[:, c_indices]   # [B, T, C, C]
+    left_blocks = C_values_padded[:, c_indices]  # [B, T, C, C]
     right_blocks = D_values_padded[:, d_indices]  # [B, T, C, C]
 
     BT = B * num_triplets
@@ -438,10 +440,12 @@ def block_triang_matmul(
     if debug:
         e_indices_sorted = e_indices[sorted_idx]
         print(f"\n=== CSR accumulation structure (from cache) ===")
-        print(f"Sorted e_indices: {e_indices_sorted.tolist()[:20]}{'...' if num_triplets > 20 else ''}")
+        print(
+            f"Sorted e_indices: {e_indices_sorted.tolist()[:20]}{'...' if num_triplets > 20 else ''}"
+        )
         print(f"e_ptr (CSR pointers): {e_ptr.tolist()}")
         for e in range(min(5, num_e_blocks)):
-            start, end = e_ptr[e].item(), e_ptr[e+1].item()
+            start, end = e_ptr[e].item(), e_ptr[e + 1].item()
             print(f"  Block {e}: triplets [{start}:{end}] ({end-start} contributions)")
 
     # Initialize result blocks with semiring zero (must cover all e_blocks, even if num_triplets=0)
@@ -458,7 +462,7 @@ def block_triang_matmul(
     # This replaces the Python loop over triplets with a loop over result blocks,
     # dramatically reducing overhead (num_e_blocks << num_triplets typically)
     for e in range(num_e_blocks):
-        start, end = e_ptr[e].item(), e_ptr[e+1].item()
+        start, end = e_ptr[e].item(), e_ptr[e + 1].item()
         if start == end:
             # No contributions to this block (shouldn't happen with current triplet building)
             continue
@@ -525,8 +529,8 @@ def get_structure_cache_info() -> dict:
             - 'keys': list of (K, span, mask_key, device) tuples
     """
     return {
-        'size': len(_STRUCTURE_CACHE),
-        'keys': list(_STRUCTURE_CACHE.keys()),
+        "size": len(_STRUCTURE_CACHE),
+        "keys": list(_STRUCTURE_CACHE.keys()),
     }
 
 
