@@ -3,17 +3,12 @@
 Generate publication-quality figures for Semi-Markov CRF backend analysis.
 
 Figures:
-1. OOM feasibility heatmaps (colorblind-safe, consistent GB units)
-2. Time vs state-space size (median + IQR bands)
-3. Memory breakdown stacked bars
+1. Time ratio vs state size (per T, with IQR bands)
+2. Memory ratio vs state size (per T, with IQR bands)
+3. OOM frontier summary
+4. Backend comparison bars (representative config)
 
-Addresses reviewer feedback:
-- Colorblind-safe palette (blue/orange, with hatching for OOM)
-- Consistent GB units throughout
-- Median + IQR for timing
-- Time per position normalization
-- Explicit annotations for key findings
-- Clear legend for "not tested" cells
+All metrics are normalized to the vectorized linear scan baseline.
 
 Example:
     python benchmarks/plot_figures.py \
@@ -22,11 +17,9 @@ Example:
 """
 
 import argparse
-import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -36,438 +29,515 @@ def check_matplotlib():
         import matplotlib
         matplotlib.use('Agg')  # Non-interactive backend
         import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-        from matplotlib.colors import LinearSegmentedColormap
         return True
     except ImportError:
         print("matplotlib not installed. Install with: pip install matplotlib")
         return False
 
 
-def plot_oom_heatmaps(df: pd.DataFrame, output_dir: Path, T_values: List[int] = None):
-    """
-    Generate OOM feasibility heatmaps.
+# -----------------------------------------------------------------------------
+# Backend styling
+# -----------------------------------------------------------------------------
 
-    Features:
-    - Colorblind-safe palette (blue for success, orange for OOM, gray for not tested)
-    - Hatching pattern for OOM cells
-    - Memory values in GB inside successful cells
-    - Annotation for OOM frontier
+BACKEND_ORDER = [
+    'linear_scan',
+    'linear_scan_vectorized',
+    'linear_scan_streaming',
+    'binary_tree',
+    'binary_tree_sharded',
+    'block_triangular',
+]
+
+BACKEND_LABELS = {
+    'linear_scan': 'Linear Scan',
+    'linear_scan_vectorized': 'Vectorized Linear',
+    'linear_scan_streaming': 'Streaming Linear',
+    'binary_tree': 'Binary Tree',
+    'binary_tree_sharded': 'Sharded Tree',
+    'block_triangular': 'Block Triangular',
+}
+
+# Colorblind-safe palette
+BACKEND_COLORS = {
+    'linear_scan': '#1f77b4',            # Blue
+    'linear_scan_vectorized': '#ff7f0e', # Orange (baseline)
+    'linear_scan_streaming': '#2ca02c',  # Green
+    'binary_tree': '#d62728',            # Red
+    'binary_tree_sharded': '#9467bd',    # Purple
+    'block_triangular': '#8c564b',       # Brown
+}
+
+BACKEND_MARKERS = {
+    'linear_scan': 'o',
+    'linear_scan_vectorized': 's',
+    'linear_scan_streaming': 'D',
+    'binary_tree': '^',
+    'binary_tree_sharded': 'v',
+    'block_triangular': 'p',
+}
+
+
+def get_backends_from_data(df: pd.DataFrame) -> List[str]:
+    """Extract and sort backends found in data."""
+    backends_in_data = set(df['backend'].unique())
+
+    def sort_key(b):
+        if b in BACKEND_ORDER:
+            return (0, BACKEND_ORDER.index(b))
+        return (1, b)
+
+    return sorted(backends_in_data, key=sort_key)
+
+
+def get_backend_label(backend: str) -> str:
+    return BACKEND_LABELS.get(backend, backend.replace('_', ' ').title())
+
+
+def get_backend_color(backend: str, idx: int = 0) -> str:
+    if backend in BACKEND_COLORS:
+        return BACKEND_COLORS[backend]
+    fallback_colors = ['#17becf', '#bcbd22', '#7f7f7f', '#aec7e8', '#ffbb78']
+    return fallback_colors[idx % len(fallback_colors)]
+
+
+def get_backend_marker(backend: str, idx: int = 0) -> str:
+    if backend in BACKEND_MARKERS:
+        return BACKEND_MARKERS[backend]
+    fallback_markers = ['*', 'X', 'P', '<', '>']
+    return fallback_markers[idx % len(fallback_markers)]
+
+
+# -----------------------------------------------------------------------------
+# Data preparation
+# -----------------------------------------------------------------------------
+
+def prepare_ratio_data(df: pd.DataFrame, baseline: str = 'linear_scan_vectorized') -> pd.DataFrame:
+    """
+    Compute ratios vs baseline for time and memory.
+
+    Args:
+        df: Raw benchmark DataFrame with columns: T, K, C, backend, status,
+            time_per_position_ms, peak_reserved_gb
+        baseline: Backend to normalize against
+
+    Returns:
+        DataFrame with columns: T, K, C, state_n, backend, time_ratio, mem_ratio
+    """
+    # Define state size n = (K-1)*C (semi-Markov state space dimension)
+    df = df.copy()
+    df['state_n'] = (df['K'] - 1) * df['C']
+
+    # Keep only successful runs
+    succ = df[df['status'] == 'success'].copy()
+
+    if len(succ) == 0:
+        print("Warning: No successful runs found")
+        return pd.DataFrame()
+
+    # Check for required columns
+    time_col = 'time_per_position_ms'
+    mem_col = 'peak_reserved_gb'
+
+    if time_col not in succ.columns:
+        # Fall back to computing from time_ms_median
+        if 'time_ms_median' in succ.columns:
+            succ[time_col] = succ['time_ms_median'] / succ['T']
+        else:
+            print(f"Warning: Neither {time_col} nor time_ms_median found")
+            return pd.DataFrame()
+
+    if mem_col not in succ.columns:
+        if 'peak_allocated_gb' in succ.columns:
+            mem_col = 'peak_allocated_gb'
+        else:
+            print(f"Warning: {mem_col} not found")
+            return pd.DataFrame()
+
+    # Pivot to get baseline values
+    pivot = succ.pivot_table(
+        index=['T', 'K', 'C', 'state_n'],
+        columns='backend',
+        values=[time_col, mem_col],
+    )
+    pivot.columns = ['__'.join(c) for c in pivot.columns]
+    pivot = pivot.reset_index()
+
+    # Get baseline columns
+    base_time_col = f'{time_col}__{baseline}'
+    base_mem_col = f'{mem_col}__{baseline}'
+
+    if base_time_col not in pivot.columns:
+        print(f"Warning: Baseline {baseline} not found in data")
+        return pd.DataFrame()
+
+    base_time = pivot[base_time_col]
+    base_mem = pivot[base_mem_col]
+
+    # Build ratio dataframe for each backend
+    ratio_dfs = []
+    backends = [b for b in get_backends_from_data(succ) if b != baseline]
+
+    for backend in backends:
+        tcol = f'{time_col}__{backend}'
+        mcol = f'{mem_col}__{backend}'
+
+        if tcol not in pivot.columns:
+            continue
+
+        ratio_df = pivot[['T', 'K', 'C', 'state_n']].copy()
+        ratio_df['backend'] = backend
+        ratio_df['time_ratio'] = pivot[tcol] / base_time
+        ratio_df['mem_ratio'] = pivot[mcol] / base_mem
+        ratio_df = ratio_df.dropna(subset=['time_ratio', 'mem_ratio'])
+        ratio_dfs.append(ratio_df)
+
+    if not ratio_dfs:
+        return pd.DataFrame()
+
+    return pd.concat(ratio_dfs, ignore_index=True)
+
+
+# -----------------------------------------------------------------------------
+# Plotting functions
+# -----------------------------------------------------------------------------
+
+def plot_ratio_vs_state(
+    ratios: pd.DataFrame,
+    output_dir: Path,
+    metric: str = 'time',
+    T_values: List[int] = None,
+    baseline_label: str = 'Vectorized Linear',
+):
+    """
+    Plot ratio vs state size with IQR bands, split by T.
+
+    Args:
+        ratios: DataFrame from prepare_ratio_data()
+        output_dir: Where to save figures
+        metric: 'time' or 'mem'
+        T_values: List of T values to plot (separate subplot each)
+        baseline_label: Human-readable name of baseline
     """
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    import matplotlib.colors as mcolors
+
+    if len(ratios) == 0:
+        print(f"Skipping {metric} ratio plot - no data")
+        return
 
     if T_values is None:
-        T_values = sorted(df['T'].unique())
+        T_values = sorted(ratios['T'].unique())
 
-    backends = ['linear_scan_vectorized', 'binary_tree', 'banded', 'block_triangular']
-    backend_labels = {
-        'linear_scan': 'Linear Scan',
-        'linear_scan_vectorized': 'Vectorized Linear Scan',
-        'binary_tree': 'Binary Tree',
-        'banded': 'Banded',
-        'block_triangular': 'Block Triangular',
-    }
+    ratio_col = f'{metric}_ratio'
+    if ratio_col not in ratios.columns:
+        print(f"Skipping {metric} ratio plot - column not found")
+        return
 
-    # Colorblind-safe colors
-    color_success = '#2166ac'  # Blue
-    color_oom = '#d6604d'      # Orange-red
-    color_not_tested = '#969696'  # Gray
+    backends = sorted(ratios['backend'].unique(), key=lambda b: BACKEND_ORDER.index(b) if b in BACKEND_ORDER else 999)
 
-    K_values = sorted(df['K'].unique())
-    C_values = sorted(df['C'].unique())
-
-    for T in T_values:
-        fig, axes = plt.subplots(1, len(backends), figsize=(4 * len(backends), 4))
-        if len(backends) == 1:
-            axes = [axes]
-
-        for ax_idx, backend in enumerate(backends):
-            ax = axes[ax_idx]
-            subset = df[(df['T'] == T) & (df['backend'] == backend)]
-
-            # Create matrix
-            matrix = np.full((len(K_values), len(C_values)), np.nan)
-            status_matrix = np.full((len(K_values), len(C_values)), '', dtype=object)
-            mem_matrix = np.full((len(K_values), len(C_values)), np.nan)
-
-            for _, row in subset.iterrows():
-                k_idx = K_values.index(row['K'])
-                c_idx = C_values.index(row['C'])
-                status_matrix[k_idx, c_idx] = row['status']
-                if row['status'] == 'success':
-                    mem_matrix[k_idx, c_idx] = row['peak_allocated_gb']
-                    matrix[k_idx, c_idx] = 1  # Success
-                elif row['status'] == 'oom':
-                    matrix[k_idx, c_idx] = 0  # OOM
-                else:
-                    matrix[k_idx, c_idx] = 0.5  # Not tested
-
-            # Plot base heatmap
-            im = ax.imshow(matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto',
-                          origin='lower', interpolation='nearest')
-
-            # Add hatching for OOM cells and text annotations
-            for i, K in enumerate(K_values):
-                for j, C in enumerate(C_values):
-                    status = status_matrix[i, j]
-                    if status == 'success':
-                        mem = mem_matrix[i, j]
-                        # Format memory value
-                        if mem < 0.01:
-                            text = f'{mem*1000:.0f}M'
-                        elif mem < 1:
-                            text = f'{mem:.2f}'
-                        else:
-                            text = f'{mem:.1f}'
-                        ax.text(j, i, text, ha='center', va='center',
-                               fontsize=7, color='white', fontweight='bold')
-                    elif status == 'oom':
-                        # Add X pattern for OOM
-                        ax.text(j, i, '×', ha='center', va='center',
-                               fontsize=14, color='white', fontweight='bold')
-                    elif status == 'not_tested':
-                        ax.add_patch(plt.Rectangle((j-0.5, i-0.5), 1, 1,
-                                                   fill=True, facecolor=color_not_tested,
-                                                   edgecolor='white', linewidth=0.5))
-
-            ax.set_xticks(range(len(C_values)))
-            ax.set_xticklabels(C_values)
-            ax.set_yticks(range(len(K_values)))
-            ax.set_yticklabels(K_values)
-            ax.set_xlabel('C (num labels)')
-            ax.set_ylabel('K (max duration)')
-            ax.set_title(f'{backend_labels.get(backend, backend)}')
-
-            # Add KC grid lines
-            for i in range(len(K_values)):
-                for j in range(len(C_values)):
-                    kc = K_values[i] * C_values[j]
-                    if kc in [100, 150, 200]:
-                        ax.plot([j-0.5, j+0.5], [i-0.5, i-0.5], 'k--', linewidth=0.5, alpha=0.5)
-
-        # Add legend
-        legend_elements = [
-            Patch(facecolor='#2ca02c', label='Success (GB shown)'),
-            Patch(facecolor='#d62728', label='OOM (×)'),
-            Patch(facecolor=color_not_tested, label='Not tested'),
-        ]
-        fig.legend(handles=legend_elements, loc='upper center',
-                  ncol=3, bbox_to_anchor=(0.5, 0.02), frameon=False)
-
-        fig.suptitle(f'OOM Feasibility: T={T}\n(values show peak memory in GB)', fontsize=12)
-        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
-
-        output_path = output_dir / f'oom_heatmap_T{T}.pdf'
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved {output_path}")
-
-
-def plot_time_vs_kc(df: pd.DataFrame, output_dir: Path, T_values: List[int] = None):
-    """
-    Generate time vs state-space size (KC) plots.
-
-    Features:
-    - Log-log scale
-    - Median line with IQR shading
-    - Separate panel per T value
-    - Time per position option
-    """
-    import matplotlib.pyplot as plt
-
-    if T_values is None:
-        T_values = sorted(df['T'].unique())
-
-    backends = ['linear_scan', 'linear_scan_vectorized', 'binary_tree', 'banded', 'block_triangular']
-    backend_labels = {
-        'linear_scan': 'Linear Scan',
-        'linear_scan_vectorized': 'Vectorized Linear',
-        'binary_tree': 'Binary Tree',
-        'banded': 'Banded',
-        'block_triangular': 'Block Triangular',
-    }
-
-    # Colorblind-safe palette
-    colors = {
-        'linear_scan': '#1f77b4',
-        'linear_scan_vectorized': '#ff7f0e',
-        'binary_tree': '#2ca02c',
-        'banded': '#d62728',
-        'block_triangular': '#9467bd',
-    }
-
-    markers = {
-        'linear_scan': 'o',
-        'linear_scan_vectorized': 's',
-        'binary_tree': '^',
-        'banded': 'D',
-        'block_triangular': 'v',
-    }
-
-    # Figure 1: Absolute time
-    fig, axes = plt.subplots(1, len(T_values), figsize=(4 * len(T_values), 4), sharey=True)
-    if len(T_values) == 1:
+    # Create figure with subplots for each T
+    n_plots = len(T_values)
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5), sharey=True)
+    if n_plots == 1:
         axes = [axes]
 
     for ax_idx, T in enumerate(T_values):
         ax = axes[ax_idx]
+        t_data = ratios[ratios['T'] == T]
 
-        for backend in backends:
-            subset = df[(df['T'] == T) & (df['backend'] == backend) & (df['status'] == 'success')]
-            if len(subset) == 0:
+        for b_idx, backend in enumerate(backends):
+            b_data = t_data[t_data['backend'] == backend]
+            if len(b_data) == 0:
                 continue
 
-            subset = subset.sort_values('KC')
-            kc = subset['KC'].values
-            median = subset['time_ms_median'].values
-            iqr_low = subset['time_ms_iqr_low'].values
-            iqr_high = subset['time_ms_iqr_high'].values
+            # Aggregate by state_n: median and IQR
+            agg = b_data.groupby('state_n')[ratio_col].agg(['median', lambda x: x.quantile(0.25), lambda x: x.quantile(0.75)])
+            agg.columns = ['median', 'q25', 'q75']
+            agg = agg.reset_index().sort_values('state_n')
 
-            ax.plot(kc, median, color=colors.get(backend, 'gray'),
-                   marker=markers.get(backend, 'o'), markersize=4,
-                   label=backend_labels.get(backend, backend), linewidth=1.5)
-            ax.fill_between(kc, iqr_low, iqr_high, color=colors.get(backend, 'gray'),
-                           alpha=0.2)
+            color = get_backend_color(backend, b_idx)
+            marker = get_backend_marker(backend, b_idx)
+            label = get_backend_label(backend)
 
-        ax.set_xscale('log')
+            # Plot median line with markers
+            ax.plot(agg['state_n'], agg['median'], color=color, marker=marker,
+                   markersize=5, linewidth=1.5, label=label)
+
+            # Add IQR band
+            ax.fill_between(agg['state_n'], agg['q25'], agg['q75'],
+                           color=color, alpha=0.15)
+
+        # Reference line at ratio = 1
+        ax.axhline(1.0, color='black', linewidth=1, linestyle='-', alpha=0.5)
+
+        ax.set_xscale('linear')
         ax.set_yscale('log')
-        ax.set_xlabel('State-space size (K×C)')
-        if ax_idx == 0:
-            ax.set_ylabel('Time (ms)')
-        ax.set_title(f'T={T}')
+        ax.set_xlabel('State size n = (K-1) * C')
+        ax.set_title(f'T = {T}')
         ax.grid(True, alpha=0.3, which='both')
 
-        # Add reference lines for typical genomic regimes
-        for kc_ref, label in [(100, ''), (150, 'OOM\nfrontier'), (200, '')]:
-            if kc_ref <= subset['KC'].max() if len(subset) > 0 else False:
-                ax.axvline(kc_ref, color='gray', linestyle='--', alpha=0.5, linewidth=0.5)
+        # Set reasonable y-axis limits
+        ax.set_ylim(0.1, 100)
 
-    # Single legend for all panels
+    # Y-label only on first subplot
+    if metric == 'time':
+        axes[0].set_ylabel(f'Time ratio vs {baseline_label}\n(log scale, lower is better)')
+    else:
+        axes[0].set_ylabel(f'Memory ratio vs {baseline_label}\n(log scale, lower is better)')
+
+    # Single legend for all subplots
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', ncol=len(backends),
-              bbox_to_anchor=(0.5, 0.02), frameon=False, fontsize=9)
+    if handles:
+        fig.legend(handles, labels, loc='upper center', ncol=min(len(backends), 6),
+                  bbox_to_anchor=(0.5, 0.02), frameon=False, fontsize=9)
 
-    fig.suptitle('Forward+Backward Time vs State-Space Size\n(median with IQR band)', fontsize=12)
-    plt.tight_layout(rect=[0, 0.08, 1, 0.95])
+    if metric == 'time':
+        fig.suptitle('Runtime vs State Size\n(median with 25-75% IQR band)', fontsize=12)
+    else:
+        fig.suptitle('Peak Memory vs State Size\n(median with 25-75% IQR band)', fontsize=12)
 
-    output_path = output_dir / 'time_vs_kc.pdf'
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved {output_path}")
+    plt.tight_layout(rect=[0, 0.08, 1, 0.93])
 
-    # Figure 2: Time per position
-    fig, axes = plt.subplots(1, len(T_values), figsize=(4 * len(T_values), 4), sharey=True)
-    if len(T_values) == 1:
-        axes = [axes]
-
-    for ax_idx, T in enumerate(T_values):
-        ax = axes[ax_idx]
-
-        for backend in backends:
-            subset = df[(df['T'] == T) & (df['backend'] == backend) & (df['status'] == 'success')]
-            if len(subset) == 0:
-                continue
-
-            subset = subset.sort_values('KC')
-            kc = subset['KC'].values
-            time_per_pos = subset['time_per_position_ms'].values
-
-            ax.plot(kc, time_per_pos, color=colors.get(backend, 'gray'),
-                   marker=markers.get(backend, 'o'), markersize=4,
-                   label=backend_labels.get(backend, backend), linewidth=1.5)
-
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.set_xlabel('State-space size (K×C)')
-        if ax_idx == 0:
-            ax.set_ylabel('Time per position (ms/T)')
-        ax.set_title(f'T={T}')
-        ax.grid(True, alpha=0.3, which='both')
-
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', ncol=len(backends),
-              bbox_to_anchor=(0.5, 0.02), frameon=False, fontsize=9)
-
-    fig.suptitle('Time per Position vs State-Space Size\n(enables cross-T comparison)', fontsize=12)
-    plt.tight_layout(rect=[0, 0.08, 1, 0.95])
-
-    output_path = output_dir / 'time_per_position_vs_kc.pdf'
+    output_path = output_dir / f'{metric}_ratio_vs_state.pdf'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved {output_path}")
 
 
-def plot_memory_breakdown(df: pd.DataFrame, output_dir: Path):
+def plot_oom_frontier(df: pd.DataFrame, output_dir: Path):
     """
-    Generate memory breakdown stacked bar charts.
-
-    Shows allocation categories:
-    - Potentials (edge potentials tensor)
-    - DP State (alpha/beta tables)
-    - Workspace (intermediate computations - the killer!)
-    - Autograd (saved tensors for backward)
+    Plot OOM frontier: max feasible state_n vs T for each backend.
     """
     import matplotlib.pyplot as plt
 
-    # Select representative configs: below frontier, near frontier, past frontier
-    # Defined by KC thresholds
-    configs = [
-        ("Below frontier", 50, 100),   # KC ~50-100
-        ("Near frontier", 100, 150),   # KC ~100-150
-        ("Past frontier", 150, 250),   # KC ~150-250
-    ]
+    df = df.copy()
+    df['state_n'] = (df['K'] - 1) * df['C']
 
-    backends = ['linear_scan_vectorized', 'binary_tree', 'banded', 'block_triangular']
-    backend_labels = {
-        'linear_scan_vectorized': 'Vec. Linear',
-        'binary_tree': 'Binary Tree',
-        'banded': 'Banded',
-        'block_triangular': 'Block Tri.',
-    }
-
-    # Colors for memory categories
-    category_colors = {
-        'potentials': '#1f77b4',
-        'dp_state': '#ff7f0e',
-        'workspace': '#d62728',  # Red - the killer!
-        'autograd': '#9467bd',
-    }
-
-    fig, axes = plt.subplots(1, len(configs), figsize=(4 * len(configs), 5))
-
-    for ax_idx, (config_name, kc_min, kc_max) in enumerate(configs):
-        ax = axes[ax_idx]
-
-        # Find configs in this KC range
-        subset = df[(df['KC'] >= kc_min) & (df['KC'] < kc_max)]
-
-        # For each backend, get a representative row
-        x_positions = []
-        x_labels = []
-
-        for i, backend in enumerate(backends):
-            backend_subset = subset[subset['backend'] == backend]
-
-            if len(backend_subset) > 0:
-                # Pick median KC config
-                row = backend_subset.iloc[len(backend_subset) // 2]
-
-                bottom = 0
-                for cat, col in [
-                    ('potentials', 'est_potentials_gb'),
-                    ('dp_state', 'est_dp_state_gb'),
-                    ('workspace', 'est_workspace_gb'),
-                    ('autograd', 'est_autograd_gb'),
-                ]:
-                    if col in row and not pd.isna(row[col]):
-                        height = row[col]
-                        ax.bar(i, height, bottom=bottom, color=category_colors[cat],
-                              edgecolor='white', linewidth=0.5)
-                        bottom += height
-
-                # Add actual peak memory as marker
-                if row['status'] == 'success' and not pd.isna(row['peak_allocated_gb']):
-                    ax.plot(i, row['peak_allocated_gb'], 'ko', markersize=8)
-                    ax.plot(i, row['peak_reserved_gb'], 'k^', markersize=6, alpha=0.5)
-
-                x_positions.append(i)
-                x_labels.append(f"{backend_labels.get(backend, backend)}\nKC={int(row['KC'])}")
-
-        ax.set_xticks(x_positions)
-        ax.set_xticklabels(x_labels, fontsize=8)
-        ax.set_ylabel('Memory (GB)')
-        ax.set_title(f'{config_name}\n(KC ∈ [{kc_min}, {kc_max}))')
-
-        # Add OOM threshold line
-        ax.axhline(y=24, color='red', linestyle='--', alpha=0.5, label='24GB limit')
-
-    # Legend
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
-
-    legend_elements = [
-        Patch(facecolor=category_colors['potentials'], label='Potentials'),
-        Patch(facecolor=category_colors['dp_state'], label='DP State'),
-        Patch(facecolor=category_colors['workspace'], label='Workspace'),
-        Patch(facecolor=category_colors['autograd'], label='Autograd'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=8, label='Peak Allocated'),
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='black', markersize=6, label='Peak Reserved'),
-    ]
-    fig.legend(handles=legend_elements, loc='upper center', ncol=6,
-              bbox_to_anchor=(0.5, 0.02), frameon=False, fontsize=9)
-
-    fig.suptitle('Memory Breakdown by Allocation Category\n(workspace is the "killer" term for tree methods)',
-                fontsize=12)
-    plt.tight_layout(rect=[0, 0.08, 1, 0.95])
-
-    output_path = output_dir / 'memory_breakdown.pdf'
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved {output_path}")
-
-
-def plot_oom_frontier_summary(df: pd.DataFrame, output_dir: Path):
-    """
-    Generate OOM frontier summary plot.
-
-    Shows max feasible KC vs T for each backend.
-    """
-    import matplotlib.pyplot as plt
-
-    backends = ['linear_scan_vectorized', 'binary_tree', 'banded', 'block_triangular']
-    backend_labels = {
-        'linear_scan_vectorized': 'Vectorized Linear Scan',
-        'binary_tree': 'Binary Tree',
-        'banded': 'Banded',
-        'block_triangular': 'Block Triangular',
-    }
-
-    colors = {
-        'linear_scan_vectorized': '#ff7f0e',
-        'binary_tree': '#2ca02c',
-        'banded': '#d62728',
-        'block_triangular': '#9467bd',
-    }
-
+    backends = get_backends_from_data(df)
     T_values = sorted(df['T'].unique())
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for backend in backends:
-        max_kc_per_T = []
+    for b_idx, backend in enumerate(backends):
+        max_state_per_T = []
         for T in T_values:
             successful = df[(df['T'] == T) & (df['backend'] == backend) & (df['status'] == 'success')]
             if len(successful) > 0:
-                max_kc = successful['KC'].max()
+                max_state = successful['state_n'].max()
             else:
-                max_kc = 0
-            max_kc_per_T.append(max_kc)
+                max_state = 0
+            max_state_per_T.append(max_state)
 
-        ax.plot(T_values, max_kc_per_T, 'o-', color=colors.get(backend, 'gray'),
-               label=backend_labels.get(backend, backend), linewidth=2, markersize=8)
+        if any(s > 0 for s in max_state_per_T):
+            color = get_backend_color(backend, b_idx)
+            marker = get_backend_marker(backend, b_idx)
+            ax.plot(T_values, max_state_per_T, marker=marker, color=color,
+                   label=get_backend_label(backend), linewidth=2, markersize=8)
 
     ax.set_xlabel('Sequence Length (T)')
-    ax.set_ylabel('Max Feasible State-Space Size (KC)')
-    ax.set_title('OOM Frontier: Max Feasible KC vs T\n(higher is better)')
-    ax.legend(loc='upper right')
+    ax.set_ylabel('Max Feasible State Size n = (K-1) * C')
+    ax.set_title('OOM Frontier by Backend\n(higher is better)')
+    ax.legend(loc='best')
     ax.grid(True, alpha=0.3)
-
-    # Add annotation
-    ax.annotate('Vectorized linear scan:\nuniversally feasible',
-               xy=(T_values[-1], max(df[df['backend']=='linear_scan_vectorized']['KC'])),
-               xytext=(T_values[-1] * 0.6, max(df['KC']) * 0.8),
-               fontsize=10, ha='center',
-               arrowprops=dict(arrowstyle='->', color='gray', alpha=0.5))
 
     plt.tight_layout()
 
-    output_path = output_dir / 'oom_frontier_summary.pdf'
+    output_path = output_dir / 'oom_frontier.pdf'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+def plot_backend_comparison(df: pd.DataFrame, output_dir: Path):
+    """
+    Bar chart comparing all backends at a representative config.
+    """
+    import matplotlib.pyplot as plt
+
+    backends = get_backends_from_data(df)
+
+    # Find config with most backend coverage
+    success_df = df[df['status'] == 'success']
+    if len(success_df) == 0:
+        print("No successful runs for backend comparison")
+        return
+
+    config_counts = success_df.groupby(['T', 'K', 'C']).size().reset_index(name='count')
+    config_counts = config_counts.sort_values('count', ascending=False)
+    best_config = config_counts.iloc[0]
+    T, K, C = int(best_config['T']), int(best_config['K']), int(best_config['C'])
+
+    subset = df[(df['T'] == T) & (df['K'] == K) & (df['C'] == C)]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    x_positions = []
+    x_labels = []
+    times = []
+    memories = []
+    colors = []
+
+    for b_idx, backend in enumerate(backends):
+        row = subset[subset['backend'] == backend]
+        if len(row) == 0:
+            continue
+        row = row.iloc[0]
+
+        x_positions.append(len(x_labels))
+        x_labels.append(get_backend_label(backend))
+        colors.append(get_backend_color(backend, b_idx))
+
+        if row['status'] == 'success':
+            times.append(row.get('time_ms_median', 0))
+            memories.append(row.get('peak_reserved_gb', row.get('peak_allocated_gb', 0)))
+        else:
+            times.append(0)
+            memories.append(0)
+
+    # Time bars
+    ax1.bar(x_positions, times, color=colors, edgecolor='white')
+    ax1.set_xticks(x_positions)
+    ax1.set_xticklabels(x_labels, rotation=45, ha='right')
+    ax1.set_ylabel('Time (ms)')
+    ax1.set_title(f'Forward+Backward Time\n(T={T}, K={K}, C={C})')
+
+    for i, t in enumerate(times):
+        if t == 0:
+            ax1.text(i, ax1.get_ylim()[1] * 0.5, 'OOM', ha='center', va='center',
+                    fontsize=10, color='red', fontweight='bold')
+
+    # Memory bars
+    ax2.bar(x_positions, memories, color=colors, edgecolor='white')
+    ax2.set_xticks(x_positions)
+    ax2.set_xticklabels(x_labels, rotation=45, ha='right')
+    ax2.set_ylabel('Peak Memory (GB)')
+    ax2.set_title(f'Peak Reserved Memory\n(T={T}, K={K}, C={C})')
+
+    for i, m in enumerate(memories):
+        if m == 0:
+            ax2.text(i, ax2.get_ylim()[1] * 0.5, 'OOM', ha='center', va='center',
+                    fontsize=10, color='red', fontweight='bold')
+
+    plt.tight_layout()
+
+    output_path = output_dir / 'backend_comparison.pdf'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+def plot_absolute_metrics(df: pd.DataFrame, output_dir: Path, T_values: List[int] = None):
+    """
+    Plot absolute time and memory vs state size (not ratios).
+    Useful when baseline is missing or for overall picture.
+    """
+    import matplotlib.pyplot as plt
+
+    df = df.copy()
+    df['state_n'] = (df['K'] - 1) * df['C']
+    succ = df[df['status'] == 'success']
+
+    if len(succ) == 0:
+        print("No successful runs for absolute metrics")
+        return
+
+    if T_values is None:
+        T_values = sorted(succ['T'].unique())
+
+    backends = get_backends_from_data(succ)
+
+    # Time plot
+    n_plots = len(T_values)
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5), sharey=True)
+    if n_plots == 1:
+        axes = [axes]
+
+    for ax_idx, T in enumerate(T_values):
+        ax = axes[ax_idx]
+        t_data = succ[succ['T'] == T]
+
+        for b_idx, backend in enumerate(backends):
+            b_data = t_data[t_data['backend'] == backend].sort_values('state_n')
+            if len(b_data) == 0:
+                continue
+
+            color = get_backend_color(backend, b_idx)
+            marker = get_backend_marker(backend, b_idx)
+
+            # Use time_per_position if available, else compute
+            if 'time_per_position_ms' in b_data.columns:
+                y = b_data['time_per_position_ms']
+            elif 'time_ms_median' in b_data.columns:
+                y = b_data['time_ms_median'] / b_data['T']
+            else:
+                continue
+
+            ax.plot(b_data['state_n'], y, color=color, marker=marker,
+                   markersize=5, linewidth=1.5, label=get_backend_label(backend))
+
+        ax.set_yscale('log')
+        ax.set_xlabel('State size n = (K-1) * C')
+        ax.set_title(f'T = {T}')
+        ax.grid(True, alpha=0.3, which='both')
+
+    axes[0].set_ylabel('Time per position (ms)')
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc='upper center', ncol=min(len(backends), 6),
+                  bbox_to_anchor=(0.5, 0.02), frameon=False, fontsize=9)
+
+    fig.suptitle('Time per Position vs State Size', fontsize=12)
+    plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+
+    output_path = output_dir / 'time_absolute_vs_state.pdf'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_path}")
+
+    # Memory plot
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5), sharey=True)
+    if n_plots == 1:
+        axes = [axes]
+
+    for ax_idx, T in enumerate(T_values):
+        ax = axes[ax_idx]
+        t_data = succ[succ['T'] == T]
+
+        for b_idx, backend in enumerate(backends):
+            b_data = t_data[t_data['backend'] == backend].sort_values('state_n')
+            if len(b_data) == 0:
+                continue
+
+            color = get_backend_color(backend, b_idx)
+            marker = get_backend_marker(backend, b_idx)
+
+            mem_col = 'peak_reserved_gb' if 'peak_reserved_gb' in b_data.columns else 'peak_allocated_gb'
+            if mem_col not in b_data.columns:
+                continue
+
+            ax.plot(b_data['state_n'], b_data[mem_col], color=color, marker=marker,
+                   markersize=5, linewidth=1.5, label=get_backend_label(backend))
+
+        ax.set_yscale('log')
+        ax.set_xlabel('State size n = (K-1) * C')
+        ax.set_title(f'T = {T}')
+        ax.grid(True, alpha=0.3, which='both')
+
+    axes[0].set_ylabel('Peak Memory (GB)')
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc='upper center', ncol=min(len(backends), 6),
+                  bbox_to_anchor=(0.5, 0.02), frameon=False, fontsize=9)
+
+    fig.suptitle('Peak Memory vs State Size', fontsize=12)
+    plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+
+    output_path = output_dir / 'memory_absolute_vs_state.pdf'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.savefig(output_path.with_suffix('.png'), dpi=300, bbox_inches='tight')
     plt.close()
@@ -475,10 +545,16 @@ def plot_oom_frontier_summary(df: pd.DataFrame, output_dir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input-dir", type=Path, default=Path("results"))
     parser.add_argument("--output-dir", type=Path, default=Path("figures"))
-    parser.add_argument("--T", type=str, default=None, help="Comma-separated T values to plot")
+    parser.add_argument("--T", type=str, default=None,
+                       help="Comma-separated T values to plot (default: all)")
+    parser.add_argument("--csv", type=str, default="benchmark_full.csv",
+                       help="CSV filename within input-dir")
+    parser.add_argument("--baseline", type=str, default="linear_scan_vectorized",
+                       help="Backend to normalize ratios against")
     args = parser.parse_args()
 
     if not check_matplotlib():
@@ -487,27 +563,46 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load data
-    csv_path = args.input_dir / "benchmark_full.csv"
+    csv_path = args.input_dir / args.csv
     if not csv_path.exists():
-        print(f"Error: {csv_path} not found. Run benchmark_memory_analysis.py first.")
+        print(f"Error: {csv_path} not found")
         return
 
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} results from {csv_path}")
+
+    backends = get_backends_from_data(df)
+    print(f"Backends: {', '.join(backends)}")
 
     # Parse T values
     if args.T:
         T_values = [int(x) for x in args.T.split(",")]
     else:
         T_values = sorted(df['T'].unique())
+    print(f"T values: {T_values}")
 
-    # Generate figures
     print("\nGenerating figures...")
 
-    plot_oom_heatmaps(df, args.output_dir, T_values)
-    plot_time_vs_kc(df, args.output_dir, T_values)
-    plot_memory_breakdown(df, args.output_dir)
-    plot_oom_frontier_summary(df, args.output_dir)
+    # Prepare ratio data
+    ratios = prepare_ratio_data(df, baseline=args.baseline)
+
+    if len(ratios) > 0:
+        # Ratio plots (main figures)
+        plot_ratio_vs_state(ratios, args.output_dir, metric='time',
+                           T_values=T_values, baseline_label=get_backend_label(args.baseline))
+        plot_ratio_vs_state(ratios, args.output_dir, metric='mem',
+                           T_values=T_values, baseline_label=get_backend_label(args.baseline))
+    else:
+        print("Warning: Could not compute ratios - baseline may be missing")
+
+    # Absolute metric plots (useful regardless)
+    plot_absolute_metrics(df, args.output_dir, T_values)
+
+    # OOM frontier
+    plot_oom_frontier(df, args.output_dir)
+
+    # Backend comparison bars
+    plot_backend_comparison(df, args.output_dir)
 
     print(f"\nAll figures saved to {args.output_dir}/")
 
