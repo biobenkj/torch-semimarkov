@@ -346,13 +346,16 @@ class SemiMarkov(_Struct):
         resident DP memory does not scale with sequence length T.
 
         Recurrence:
-            beta[n, c] = logsumexp_{k=1..min(K,n), c_prev} (
+            beta[n, c] = logsumexp_{k=1..min(K-1,n), c_prev} (
                 beta[n-k, c_prev] + edge[n-k, k, c, c_prev]
             )
 
         We only need beta[n-1], beta[n-2], ..., beta[n-K+1] to compute beta[n],
         so we keep a ring buffer of the last K betas instead of all T betas.
         Alpha is not stored at all - it's computed inline and consumed immediately.
+
+        Implementation uses a head pointer with modular indexing to avoid O(K*C)
+        buffer shifts each timestep.
         """
         semiring = self.semiring
         ssize = semiring.size()
@@ -360,49 +363,50 @@ class SemiMarkov(_Struct):
         edge.requires_grad_(True)
 
         # Initialize beta[0] = one for all labels (paths of length 0 ending at position 0)
-        beta_current = torch.zeros((ssize, batch, C), dtype=edge.dtype, device=edge.device)
-        beta_current = semiring.fill(
-            beta_current, torch.tensor(True, device=edge.device), semiring.one
-        )
+        beta0 = torch.zeros((ssize, batch, C), dtype=edge.dtype, device=edge.device)
+        beta0 = semiring.fill(beta0, torch.tensor(True, device=edge.device), semiring.one)
 
-        # Ring buffer: beta_hist[:, :, k-1, :] holds beta from k steps ago
-        # beta_hist[:, :, 0, :] = beta[n-1] (most recent)
-        # beta_hist[:, :, 1, :] = beta[n-2]
-        # ...
-        # beta_hist[:, :, K-1, :] = beta[n-K]
-        beta_hist = torch.zeros((ssize, batch, K, C), dtype=edge.dtype, device=edge.device)
+        # Ring buffer with head pointer (no shifting needed)
+        # beta_hist[:, :, (head - k) % K, :] holds beta from k steps ago
+        ring_len = K
+        beta_hist = torch.zeros((ssize, batch, ring_len, C), dtype=edge.dtype, device=edge.device)
         beta_hist = semiring.fill(
             beta_hist, torch.tensor(True, device=edge.device), semiring.zero
         )
-        beta_hist[:, :, 0, :] = beta_current
+        beta_hist[:, :, 0, :] = beta0
+        head = 0  # beta[n-1] lives at beta_hist[:, :, head, :]
 
         # Store final beta for each batch item (at their respective lengths)
         final_beta = semiring.fill(
-            torch.zeros_like(beta_current),
+            torch.zeros_like(beta0),
             torch.tensor(True, device=edge.device),
             semiring.zero,
         )
         # Handle length=1 case
         mask_len1 = (lengths == 1).view(1, batch, 1)
-        final_beta = torch.where(mask_len1, beta_current, final_beta)
+        final_beta = torch.where(mask_len1, beta0, final_beta)
+
+        # Pre-allocate duration indices (avoid re-creating each step)
+        dur_full = torch.arange(1, K, device=edge.device)  # 1..K-1
 
         for n in range(1, N):
             # Number of valid durations at this position
-            k_eff = min(K, n)
+            # k_eff = min(K-1, n) is the max duration index (durations are 1-indexed)
+            k_eff = min(K - 1, n)
 
-            # Duration indices: 1, 2, ..., k_eff
-            dur = torch.arange(1, k_eff + 1, device=edge.device)
+            # Duration indices: 1, 2, ..., k_eff (slice pre-allocated tensor)
+            dur = dur_full[:k_eff]
 
             # Position indices where segments start: n-1, n-2, ..., n-k_eff
             start = n - dur
 
-            # Get previous betas from ring buffer
-            # dur-1 maps [1,2,...,k_eff] to [0,1,...,k_eff-1] (ring buffer indices)
-            beta_prev = beta_hist[:, :, dur - 1, :]  # (ssize, batch, k_eff, C)
+            # Get previous betas from ring buffer using modular indexing
+            # beta[n-dur] is at index (head - (dur - 1)) % ring_len
+            ring_idx = (head - (dur - 1)) % ring_len
+            beta_prev = beta_hist.index_select(2, ring_idx)  # (ssize, batch, k_eff, C)
 
             # Get edge potentials for these (start, duration) pairs
             # edge shape: (ssize, batch, N-1, K, C, C)
-            # Advanced indexing pairs start[i] with dur[i]
             edge_slice = edge[:, :, start, dur, :, :]  # (ssize, batch, k_eff, C, C)
 
             # Compute: logsumexp over c_prev (last dim) of beta_prev + edge
@@ -421,11 +425,9 @@ class SemiMarkov(_Struct):
             mask_end = (lengths == (n + 1)).view(1, batch, 1)
             final_beta = torch.where(mask_end, beta_n, final_beta)
 
-            # Update ring buffer: shift and insert new beta
-            # Roll existing values back by 1 position
-            if K > 1:
-                beta_hist[:, :, 1:, :] = beta_hist[:, :, :-1, :].clone()
-            beta_hist[:, :, 0, :] = beta_n
+            # Advance head pointer and write beta_n (no shifting!)
+            head = (head + 1) % ring_len
+            beta_hist[:, :, head, :] = beta_n
 
         # Final partition function: sum over labels
         v = semiring.sum(final_beta, dim=-1)  # (ssize, batch)

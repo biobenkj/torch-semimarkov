@@ -428,7 +428,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
         "--backends", type=str,
-        default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,banded,block_triangular",
+        default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,block_triangular",
         help="Comma-separated list of backends. linear_scan_streaming has O(K*C) DP state. binary_tree_sharded uses CheckpointShardSemiring."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
