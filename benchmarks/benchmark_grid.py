@@ -23,8 +23,8 @@ import argparse
 import csv
 import time
 import tracemalloc
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List
 
 import torch
 
@@ -32,7 +32,7 @@ from torch_semimarkov import SemiMarkov
 from torch_semimarkov.semirings import LogSemiring
 
 
-def parse_list(s: str) -> List[int]:
+def parse_list(s: str) -> list[int]:
     return [int(x) for x in s.split(",") if x.strip()]
 
 
@@ -45,7 +45,7 @@ def measure_time_and_peak(
     bw_ratio: float,
     repeats: int,
     device: torch.device,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     times = []
     peaks = []
     for _ in range(repeats):
@@ -97,7 +97,7 @@ def span_lengths(T: int) -> Iterable[int]:
 
 def gating_summary(
     struct: SemiMarkov, T: int, K: int, C: int, perm: str, bw_ratio: float, device
-) -> Dict[str, object]:
+) -> dict[str, object]:
     spans = list(span_lengths(T))
     size = (K - 1) * C
     flags = []
