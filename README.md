@@ -5,8 +5,8 @@ Efficient Semi-Markov CRF Inference for PyTorch
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
-[![CI](https://github.com/benjohnson/torch-semimarkov/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/benjohnson/torch-semimarkov/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/benjohnson/torch-semimarkov/branch/main/graph/badge.svg)](https://codecov.io/gh/benjohnson/torch-semimarkov)
+[![CI](https://github.com/biobenkj/torch-semimarkov/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/biobenkj/torch-semimarkov/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/biobenkj/torch-semimarkov/branch/main/graph/badge.svg)](https://codecov.io/gh/biobenkj/torch-semimarkov)
 
 ## Overview
 
