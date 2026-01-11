@@ -20,10 +20,7 @@ from pathlib import Path
 from setuptools import setup
 
 # Check for CUDA build request
-BUILD_CUDA = (
-    "--cuda" in sys.argv
-    or os.environ.get("TORCH_SEMIMARKOV_CUDA", "0") == "1"
-)
+BUILD_CUDA = "--cuda" in sys.argv or os.environ.get("TORCH_SEMIMARKOV_CUDA", "0") == "1"
 
 if "--cuda" in sys.argv:
     sys.argv.remove("--cuda")
@@ -43,6 +40,7 @@ def get_cuda_extensions():
     # Check CUDA availability
     try:
         import torch
+
         if not torch.cuda.is_available():
             print("Warning: CUDA not available, skipping CUDA extension build")
             return []
@@ -90,6 +88,7 @@ def main():
     # Only use cmdclass if we have extensions to build
     if ext_modules:
         from torch.utils.cpp_extension import BuildExtension
+
         cmdclass = {"build_ext": BuildExtension}
     else:
         cmdclass = {}

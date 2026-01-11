@@ -63,6 +63,7 @@ def get_linear_backends():
 # Backend Execution Helpers
 # -----------------------------------------------------------------------------
 
+
 def run_backend(struct, edge, lengths, backend: str, force_grad: bool = True):
     """
     Run a specific backend and return (partition_value, potentials_list).
@@ -115,6 +116,7 @@ def create_test_data(T, K, C, B, device="cpu", dtype=torch.float32, seed=42):
 # -----------------------------------------------------------------------------
 # Pytest Tests
 # -----------------------------------------------------------------------------
+
 
 @pytest.fixture
 def small_config():
@@ -369,6 +371,7 @@ class TestNumericalStability:
 # CLI Interface for Manual Testing
 # -----------------------------------------------------------------------------
 
+
 def _sync_if_cuda(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -446,7 +449,9 @@ def run_equivalence_check(device, dtype, configs, backends, verbose=True):
                 if backend == "linear_scan":
                     print(f"  {backend:25s}: v={v[0].item():10.4f} (reference)  {t:8.2f}ms")
                 else:
-                    print(f"  {backend:25s}: v_diff={v_diff:.2e}, g_diff={g_diff:.2e}  {t:8.2f}ms  {status}")
+                    print(
+                        f"  {backend:25s}: v_diff={v_diff:.2e}, g_diff={g_diff:.2e}  {t:8.2f}ms  {status}"
+                    )
 
     return all_pass
 
@@ -461,28 +466,25 @@ Examples:
   python test_backend_equivalence.py --device cuda      # Run on GPU
   python test_backend_equivalence.py --quick            # Quick test (linear backends only)
   python test_backend_equivalence.py --backends linear_scan,linear_scan_streaming
-"""
+""",
     )
     parser.add_argument(
-        "--device", default=None,
-        help="Device to use (cuda, cpu). Default: cuda if available"
+        "--device", default=None, help="Device to use (cuda, cpu). Default: cuda if available"
     )
     parser.add_argument(
-        "--dtype", default="float32",
+        "--dtype",
+        default="float32",
         choices=["float32", "float64"],
-        help="Data type for computations"
+        help="Data type for computations",
     )
     parser.add_argument(
-        "--backends", default=None,
-        help="Comma-separated list of backends to test. Default: all"
+        "--backends", default=None, help="Comma-separated list of backends to test. Default: all"
     )
+    parser.add_argument("--quick", action="store_true", help="Quick test with linear backends only")
     parser.add_argument(
-        "--quick", action="store_true",
-        help="Quick test with linear backends only"
-    )
-    parser.add_argument(
-        "--configs", default="small,medium",
-        help="Comma-separated configs: small, medium, or T:K:C:B format"
+        "--configs",
+        default="small,medium",
+        help="Comma-separated configs: small, medium, or T:K:C:B format",
     )
     args = parser.parse_args()
 

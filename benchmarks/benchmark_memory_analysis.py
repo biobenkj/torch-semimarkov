@@ -45,6 +45,7 @@ from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
 @dataclass
 class BenchmarkResult:
     """Single benchmark result with full metrics."""
+
     T: int
     K: int
     C: int
@@ -198,9 +199,12 @@ def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> D
 
 
 def should_skip_config(
-    T: int, K: int, C: int, backend: str,
+    T: int,
+    K: int,
+    C: int,
+    backend: str,
     oom_history: Dict[str, List[Tuple[int, int, int]]],
-    max_memory_gb: float = 40.0
+    max_memory_gb: float = 40.0,
 ) -> Tuple[bool, str]:
     """
     Determine if we should skip this config based on:
@@ -212,7 +216,7 @@ def should_skip_config(
     # Check if adjacent (smaller) config OOM'd for this backend
     key = backend
     if key in oom_history:
-        for (oom_t, oom_k, oom_c) in oom_history[key]:
+        for oom_t, oom_k, oom_c in oom_history[key]:
             # If a smaller config OOM'd, skip larger ones
             if T >= oom_t and K >= oom_k and C >= oom_c:
                 if T > oom_t or K > oom_k or C > oom_c:
@@ -227,7 +231,10 @@ def should_skip_config(
 
 
 def run_single_benchmark(
-    T: int, K: int, C: int, B: int,
+    T: int,
+    K: int,
+    C: int,
+    B: int,
     backend: str,
     device: torch.device,
     repeats: int = 5,
@@ -236,7 +243,12 @@ def run_single_benchmark(
 
     KC = K * C
     result_base = {
-        "T": T, "K": K, "C": C, "B": B, "KC": KC, "backend": backend,
+        "T": T,
+        "K": K,
+        "C": C,
+        "B": B,
+        "KC": KC,
+        "backend": backend,
     }
 
     # Estimate memory breakdown
@@ -258,25 +270,37 @@ def run_single_benchmark(
             edge_warmup = edge.clone().detach().requires_grad_(True)
             try:
                 if backend == "binary_tree":
-                    v_warm, _ = struct.logpartition(edge_warmup, lengths=lengths, use_linear_scan=False)
+                    v_warm, _ = struct.logpartition(
+                        edge_warmup, lengths=lengths, use_linear_scan=False
+                    )
                 elif backend == "linear_scan":
                     v_warm, _, _ = struct._dp_standard(edge_warmup, lengths, force_grad=True)
                 elif backend == "linear_scan_vectorized":
-                    v_warm, _, _ = struct._dp_standard_vectorized(edge_warmup, lengths, force_grad=True)
+                    v_warm, _, _ = struct._dp_standard_vectorized(
+                        edge_warmup, lengths, force_grad=True
+                    )
                 elif backend == "banded":
                     v_warm, _, _ = struct.logpartition(
-                        edge_warmup, lengths=lengths,
-                        use_linear_scan=True, use_vectorized=True,
-                        use_banded=True, banded_perm="auto", banded_bw_ratio=0.6,
+                        edge_warmup,
+                        lengths=lengths,
+                        use_linear_scan=True,
+                        use_vectorized=True,
+                        use_banded=True,
+                        banded_perm="auto",
+                        banded_bw_ratio=0.6,
                     )
                 elif backend == "block_triangular":
                     if hasattr(struct, "_dp_blocktriangular"):
-                        v_warm, _, _ = struct._dp_blocktriangular(edge_warmup, lengths, force_grad=True)
+                        v_warm, _, _ = struct._dp_blocktriangular(
+                            edge_warmup, lengths, force_grad=True
+                        )
                 elif backend == "binary_tree_sharded":
                     # Use CheckpointShardSemiring to reduce peak memory
                     ShardedLogSemiring = CheckpointShardSemiring(LogSemiring, max_size=10000)
                     struct_sharded = SemiMarkov(ShardedLogSemiring)
-                    v_warm, _ = struct_sharded.logpartition(edge_warmup, lengths=lengths, use_linear_scan=False)
+                    v_warm, _ = struct_sharded.logpartition(
+                        edge_warmup, lengths=lengths, use_linear_scan=False
+                    )
                 elif backend == "linear_scan_streaming":
                     # True streaming scan with O(K*C) DP state
                     v_warm, _, _ = struct._dp_scan_streaming(edge_warmup, lengths, force_grad=True)
@@ -310,9 +334,13 @@ def run_single_benchmark(
                 v, _, _ = struct._dp_standard_vectorized(edge_run, lengths, force_grad=True)
             elif backend == "banded":
                 v, _, _ = struct.logpartition(
-                    edge_run, lengths=lengths,
-                    use_linear_scan=True, use_vectorized=True,
-                    use_banded=True, banded_perm="auto", banded_bw_ratio=0.6,
+                    edge_run,
+                    lengths=lengths,
+                    use_linear_scan=True,
+                    use_vectorized=True,
+                    use_banded=True,
+                    banded_perm="auto",
+                    banded_bw_ratio=0.6,
                 )
             elif backend == "block_triangular":
                 if hasattr(struct, "_dp_blocktriangular"):
@@ -419,7 +447,9 @@ def run_single_benchmark(
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--T", type=str, default="128,256,512,1024")
     parser.add_argument("--K", type=str, default="4,8,12,16,20,24")
@@ -427,15 +457,24 @@ def main():
     parser.add_argument("--B", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
-        "--backends", type=str,
+        "--backends",
+        type=str,
         default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,block_triangular",
-        help="Comma-separated list of backends. linear_scan_streaming has O(K*C) DP state. binary_tree_sharded uses CheckpointShardSemiring."
+        help="Comma-separated list of backends. linear_scan_streaming has O(K*C) DP state. binary_tree_sharded uses CheckpointShardSemiring.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
-    parser.add_argument("--max-memory-gb", type=float, default=40.0,
-                        help="Skip configs predicted to exceed this memory")
-    parser.add_argument("--skip-adjacent-oom", action="store_true", default=True,
-                        help="Skip configs if smaller adjacent config OOM'd")
+    parser.add_argument(
+        "--max-memory-gb",
+        type=float,
+        default=40.0,
+        help="Skip configs predicted to exceed this memory",
+    )
+    parser.add_argument(
+        "--skip-adjacent-oom",
+        action="store_true",
+        default=True,
+        help="Skip configs if smaller adjacent config OOM'd",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -474,29 +513,42 @@ def main():
                             T, K, C, backend, oom_history, args.max_memory_gb
                         )
                         if skip:
-                            print(f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, KC={KC}, {backend}: {reason}")
-                            results.append(BenchmarkResult(
-                                T=T, K=K, C=C, B=args.B, KC=KC, backend=backend,
-                                time_ms_median=float("nan"),
-                                time_ms_iqr_low=float("nan"),
-                                time_ms_iqr_high=float("nan"),
-                                time_per_position_ms=float("nan"),
-                                peak_allocated_gb=float("nan"),
-                                peak_reserved_gb=float("nan"),
-                                status="not_tested",
-                                error_msg=reason,
-                            ))
+                            print(
+                                f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, KC={KC}, {backend}: {reason}"
+                            )
+                            results.append(
+                                BenchmarkResult(
+                                    T=T,
+                                    K=K,
+                                    C=C,
+                                    B=args.B,
+                                    KC=KC,
+                                    backend=backend,
+                                    time_ms_median=float("nan"),
+                                    time_ms_iqr_low=float("nan"),
+                                    time_ms_iqr_high=float("nan"),
+                                    time_per_position_ms=float("nan"),
+                                    peak_allocated_gb=float("nan"),
+                                    peak_reserved_gb=float("nan"),
+                                    status="not_tested",
+                                    error_msg=reason,
+                                )
+                            )
                             continue
 
-                    print(f"[{completed}/{total_configs}] T={T}, K={K}, C={C}, KC={KC}, {backend}...", end=" ", flush=True)
-
-                    result = run_single_benchmark(
-                        T, K, C, args.B, backend, device, args.repeats
+                    print(
+                        f"[{completed}/{total_configs}] T={T}, K={K}, C={C}, KC={KC}, {backend}...",
+                        end=" ",
+                        flush=True,
                     )
+
+                    result = run_single_benchmark(T, K, C, args.B, backend, device, args.repeats)
                     results.append(result)
 
                     if result.status == "success":
-                        print(f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved")
+                        print(
+                            f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved"
+                        )
                     elif result.status == "oom":
                         print(f"OOM")
                         oom_history[backend].append((T, K, C))
@@ -521,36 +573,56 @@ def main():
         key = f"{r.backend}_T{r.T}"
         if key not in heatmap_data:
             heatmap_data[key] = {"backend": r.backend, "T": r.T, "cells": []}
-        heatmap_data[key]["cells"].append({
-            "K": r.K, "C": r.C, "KC": r.KC,
-            "status": r.status,
-            "peak_gb": r.peak_allocated_gb if r.status == "success" else None,
-            "time_ms": r.time_ms_median if r.status == "success" else None,
-        })
+        heatmap_data[key]["cells"].append(
+            {
+                "K": r.K,
+                "C": r.C,
+                "KC": r.KC,
+                "status": r.status,
+                "peak_gb": r.peak_allocated_gb if r.status == "success" else None,
+                "time_ms": r.time_ms_median if r.status == "success" else None,
+            }
+        )
     with open(heatmap_path, "w") as f:
         json.dump(heatmap_data, f, indent=2)
     print(f"Saved heatmap data to {heatmap_path}")
 
     # 3. Memory breakdown summary
     breakdown_path = args.output_dir / "memory_breakdown.csv"
-    breakdown_fields = ["backend", "T", "K", "C", "KC", "status",
-                        "peak_allocated_gb", "peak_reserved_gb",
-                        "est_potentials_gb", "est_dp_state_gb",
-                        "est_workspace_gb", "est_autograd_gb"]
+    breakdown_fields = [
+        "backend",
+        "T",
+        "K",
+        "C",
+        "KC",
+        "status",
+        "peak_allocated_gb",
+        "peak_reserved_gb",
+        "est_potentials_gb",
+        "est_dp_state_gb",
+        "est_workspace_gb",
+        "est_autograd_gb",
+    ]
     with open(breakdown_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=breakdown_fields)
         writer.writeheader()
         for r in results:
-            writer.writerow({
-                "backend": r.backend, "T": r.T, "K": r.K, "C": r.C, "KC": r.KC,
-                "status": r.status,
-                "peak_allocated_gb": r.peak_allocated_gb,
-                "peak_reserved_gb": r.peak_reserved_gb,
-                "est_potentials_gb": r.memory_potentials_gb,
-                "est_dp_state_gb": r.memory_dp_state_gb,
-                "est_workspace_gb": r.memory_workspace_gb,
-                "est_autograd_gb": r.memory_autograd_gb,
-            })
+            writer.writerow(
+                {
+                    "backend": r.backend,
+                    "T": r.T,
+                    "K": r.K,
+                    "C": r.C,
+                    "KC": r.KC,
+                    "status": r.status,
+                    "peak_allocated_gb": r.peak_allocated_gb,
+                    "peak_reserved_gb": r.peak_reserved_gb,
+                    "est_potentials_gb": r.memory_potentials_gb,
+                    "est_dp_state_gb": r.memory_dp_state_gb,
+                    "est_workspace_gb": r.memory_workspace_gb,
+                    "est_autograd_gb": r.memory_autograd_gb,
+                }
+            )
     print(f"Saved memory breakdown to {breakdown_path}")
 
     # 4. Summary statistics
@@ -571,7 +643,9 @@ def main():
             max_kc = 0
             max_mem = 0
 
-        print(f"{backend:25s}: {success:3d} success, {oom:3d} OOM, {skipped:3d} skipped | max KC={max_kc:4d}, max mem={max_mem:.2f}GB")
+        print(
+            f"{backend:25s}: {success:3d} success, {oom:3d} OOM, {skipped:3d} skipped | max KC={max_kc:4d}, max mem={max_mem:.2f}GB"
+        )
 
 
 if __name__ == "__main__":

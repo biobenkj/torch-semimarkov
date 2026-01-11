@@ -370,9 +370,7 @@ class SemiMarkov(_Struct):
         # beta_hist[:, :, (head - k) % K, :] holds beta from k steps ago
         ring_len = K
         beta_hist = torch.zeros((ssize, batch, ring_len, C), dtype=edge.dtype, device=edge.device)
-        beta_hist = semiring.fill(
-            beta_hist, torch.tensor(True, device=edge.device), semiring.zero
-        )
+        beta_hist = semiring.fill(beta_hist, torch.tensor(True, device=edge.device), semiring.zero)
         beta_hist[:, :, 0, :] = beta0
         head = 0  # beta[n-1] lives at beta_hist[:, :, head, :]
 
@@ -414,9 +412,7 @@ class SemiMarkov(_Struct):
             # edge_slice: (ssize, batch, k_eff, C, C)
             # broadcast: (ssize, batch, k_eff, C, C)
             # sum over c_prev (dim=-1): (ssize, batch, k_eff, C)
-            scores = semiring.sum(
-                beta_prev.unsqueeze(-2) + edge_slice, dim=-1
-            )
+            scores = semiring.sum(beta_prev.unsqueeze(-2) + edge_slice, dim=-1)
 
             # Sum over duration dimension to get beta[n]
             beta_n = semiring.sum(scores, dim=2)  # (ssize, batch, C)
