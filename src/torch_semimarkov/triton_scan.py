@@ -7,15 +7,7 @@ a single operation, keeping the K×C frontier in fast memory.
 
 Implementations:
 1. PyTorch reference (CPU/GPU) - always available, used for testing
-2. Triton kernel (GPU only) - requires triton package, ~2-5x faster
-
-Key insight from systems analysis:
-    "A custom kernel would allow you to perform Fused Streaming Inference,
-    keeping the K×D frontier in Shared Memory (SRAM) rather than constantly
-    round-tripping to Global Memory (DRAM)."
-
-Memory profile: O(K×C) per batch element (typically 2-8 KB)
-Compute pattern: Fuses N kernel launches into 1
+2. Triton kernel (GPU only) - requires triton package, much faster when feasible
 
 Usage:
     from torch_semimarkov.triton_scan import semi_crf_triton_forward
@@ -137,41 +129,48 @@ if HAS_TRITON:
     def semi_crf_scan_kernel(
         # Inputs
         edge_ptr,           # (batch, N-1, K, C, C) - edge potentials
-        ring_ptr,           # (batch, K, C) - ring buffer (read/write)
+        ring_ptr,           # (batch, K, C_PAD) - ring buffer (read/write)
         out_ptr,            # (batch,) - output partition
         lengths_ptr,        # (batch,) - sequence lengths
         # Dimensions
         batch_size,
-        N: tl.constexpr,    # max sequence length
-        K: tl.constexpr,    # max duration
-        C: tl.constexpr,    # num labels (must be <= 32 for warp shuffles)
+        N: tl.constexpr,        # max sequence length
+        K: tl.constexpr,        # max duration
+        C: tl.constexpr,        # actual num labels
+        C_PAD: tl.constexpr,    # padded num labels (power of 2)
         # Strides for edge tensor
         stride_eb, stride_en, stride_ek, stride_ec1, stride_ec2,
-        # Strides for ring buffer
+        # Strides for ring buffer (uses C_PAD)
         stride_rb, stride_rk, stride_rc,
     ):
         """
         Fused Semi-Markov CRF forward scan with arbitrary K support.
 
         Uses global memory ring buffer (L2/L1 cached) for the DP state.
-        Each warp handles one batch element, threads handle labels.
+        Each program handles one batch element.
+        Loads full [C, C] edge blocks for better numerical stability.
+        C_PAD is padded to power of 2 for Triton's tl.arange requirement.
 
-        Ring buffer layout: ring[batch, k, c]
+        Ring buffer layout: ring[batch, k, c_pad]
         - k=0 is head (most recent beta)
         - k=1..K-1 are older betas
         - We rotate head pointer instead of shifting data
         """
-        NEG_INF: tl.constexpr = -1e20
+        NEG_INF: tl.constexpr = -1e9  # Match PyTorch reference
 
-        # Batch index (one warp per batch)
+        # Batch index (one program per batch element)
         batch_idx = tl.program_id(0)
         if batch_idx >= batch_size:
             return
 
-        # Lane/thread handles one label
-        lane = tl.arange(0, 32)
-        c = lane
-        c_mask = c < C
+        # 1D indices for labels (padded to power of 2)
+        c_idx = tl.arange(0, C_PAD)
+        c_mask = c_idx < C  # mask for valid label indices
+
+        # 2D indices for [C_PAD, C_PAD] edge block loads
+        c_dst = tl.arange(0, C_PAD)[:, None]  # [C_PAD, 1]
+        c_src = tl.arange(0, C_PAD)[None, :]  # [1, C_PAD]
+        c_mask_2d = (c_dst < C) & (c_src < C)  # [C_PAD, C_PAD]
 
         # Load sequence length
         seq_len = tl.load(lengths_ptr + batch_idx)
@@ -181,119 +180,112 @@ if HAS_TRITON:
         ring_base = ring_ptr + batch_idx * stride_rb
 
         # Initialize ring buffer: slot 0 = 0.0, rest = NEG_INF
-        for k in range(K):
-            val = tl.where(k == 0, 0.0, NEG_INF)
-            val = tl.where(c_mask, val, NEG_INF)
-            ring_offset = ring_base + k * stride_rk + c * stride_rc
-            tl.store(ring_offset, val, mask=c_mask)
+        for k_init in tl.static_range(0, K):
+            val = 0.0 if k_init == 0 else NEG_INF
+            ring_offset = ring_base + k_init * stride_rk + c_idx * stride_rc
+            tl.store(ring_offset, tl.where(c_mask, val, NEG_INF), mask=c_mask)
 
-        # Head pointer (index into ring buffer for most recent beta)
-        head = 0
-
-        # Track final beta for each batch
-        final_beta = tl.where(c_mask, 0.0, NEG_INF)
+        # Track final beta for each batch - shape [C_PAD]
+        final_beta = tl.where(c_mask, 0.0, NEG_INF).to(tl.float32)
 
         # Main loop over sequence positions
-        for n in range(1, N):
-            # Early exit if past sequence length
-            if n >= seq_len:
-                break
+        for n in tl.range(1, N):
+            # Use mask instead of break (Triton doesn't support break)
+            active = n < seq_len
 
-            # Effective max duration
-            k_max = tl.minimum(K - 1, n)
+            # Accumulate new_beta = logsumexp over (k, c_prev) - shape [C_PAD]
+            new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-            # Accumulate new_beta = logsumexp over (k, c_prev)
-            new_beta = tl.full([32], NEG_INF, dtype=tl.float32)
-
-            # Loop over durations k = 1, 2, ..., k_max
-            for k in tl.static_range(1, K):
-                # Skip if duration exceeds position or max
-                if k > k_max:
-                    continue
+            # Loop over durations k = 1, 2, ..., K-1
+            for k in tl.range(1, K):
+                # Skip if duration exceeds position
+                k_valid = (k <= n) & (k <= K - 1)
 
                 start_pos = n - k
 
-                # Ring index for beta[n-k]: (head - (k-1)) mod K
-                # After head update: head points to n-1, so:
-                # - beta[n-1] is at ring[head]
-                # - beta[n-2] is at ring[(head-1) % K]
-                # - beta[n-k] is at ring[(head - (k-1)) % K]
-                ring_k_idx = (head - (k - 1) + K) % K
+                # Ring index for beta[n-k]: (n-k) % K
+                ring_k_idx = (n - k) % K
 
-                # Load beta_prev[c] for all labels from ring buffer
-                # Each thread loads its own label's value
-                beta_prev_self = tl.load(
-                    ring_base + ring_k_idx * stride_rk + c * stride_rc,
-                    mask=c_mask,
+                # Load beta_prev for ALL labels [C_PAD] from ring buffer
+                beta_prev_all = tl.load(
+                    ring_base + ring_k_idx * stride_rk + c_idx * stride_rc,
+                    mask=active & k_valid & c_mask,
                     other=NEG_INF
-                )
+                )  # shape [C_PAD]
 
-                # Logsumexp over c_prev: need values from all threads
-                score_accum = tl.full([32], NEG_INF, dtype=tl.float32)
+                # Load entire [C_PAD, C_PAD] edge block for this (start_pos, k)
+                # Only load valid [C, C] portion
+                edge_offset_2d = (
+                    edge_base +
+                    start_pos * stride_en +
+                    k * stride_ek +
+                    c_dst * stride_ec1 +
+                    c_src * stride_ec2
+                )  # [C_PAD, C_PAD]
 
-                for c_prev in tl.static_range(0, C):
-                    # Get beta[n-k, c_prev] via warp shuffle
-                    beta_from_cprev = tl.extra.cuda.shfl_sync(
-                        0xFFFFFFFF, beta_prev_self, c_prev
-                    )
+                edge_block = tl.load(
+                    edge_offset_2d,
+                    mask=active & k_valid & c_mask_2d,
+                    other=NEG_INF
+                )  # [C_PAD, C_PAD]
 
-                    # Load edge[start_pos, k, c, c_prev]
-                    edge_offset = (
-                        edge_base +
-                        start_pos * stride_en +
-                        k * stride_ek +
-                        c * stride_ec1 +
-                        c_prev * stride_ec2
-                    )
-                    edge_val = tl.load(edge_offset, mask=c_mask, other=NEG_INF)
+                # Compute scores: scores[c, cp] = beta_prev[cp] + edge[c, cp]
+                scores = beta_prev_all[None, :] + edge_block  # [C_PAD, C_PAD]
 
-                    # Accumulate: logsumexp(score_accum, beta + edge)
-                    contrib = beta_from_cprev + edge_val
-                    max_sc = tl.maximum(score_accum, contrib)
-                    score_accum = max_sc + tl.log(
-                        tl.exp(score_accum - max_sc) + tl.exp(contrib - max_sc)
-                    )
+                # Mask out invalid source labels before reduction
+                scores = tl.where(c_mask_2d, scores, NEG_INF)
 
-                # Accumulate this duration into new_beta
-                max_nb = tl.maximum(new_beta, score_accum)
+                # Numerically stable logsumexp over source labels (axis=1)
+                max_scores = tl.max(scores, axis=1)  # [C_PAD]
+                score_for_k = max_scores + tl.log(
+                    tl.sum(tl.exp(scores - max_scores[:, None]), axis=1)
+                )  # [C_PAD]
+
+                # Mask invalid durations and invalid destination labels
+                score_for_k = tl.where(k_valid & c_mask, score_for_k, NEG_INF)
+
+                # Accumulate this duration into new_beta via logsumexp
+                max_nb = tl.maximum(new_beta, score_for_k)
                 new_beta = max_nb + tl.log(
-                    tl.exp(new_beta - max_nb) + tl.exp(score_accum - max_nb)
+                    tl.exp(new_beta - max_nb) + tl.exp(score_for_k - max_nb)
                 )
 
-            # Advance head pointer (circular)
-            head = (head + 1) % K
-
-            # Store new_beta to ring buffer at new head position
-            new_beta_masked = tl.where(c_mask, new_beta, NEG_INF)
+            # Store new_beta to ring buffer at current head position
+            new_head = n % K
+            new_beta_masked = tl.where(active & c_mask, new_beta, NEG_INF)
             tl.store(
-                ring_base + head * stride_rk + c * stride_rc,
+                ring_base + new_head * stride_rk + c_idx * stride_rc,
                 new_beta_masked,
-                mask=c_mask
+                mask=active & c_mask
             )
 
             # Capture final beta at sequence end
-            if n == seq_len - 1:
-                final_beta = new_beta_masked
+            is_final = (n == seq_len - 1)
+            final_beta = tl.where(is_final & c_mask, new_beta_masked, final_beta)
 
-        # Final reduction: logsumexp over labels
-        max_fb = tl.where(c_mask, final_beta, NEG_INF)
-        for offset in [16, 8, 4, 2, 1]:
-            other = tl.extra.cuda.shfl_xor_sync(0xFFFFFFFF, max_fb, offset)
-            max_fb = tl.maximum(max_fb, other)
-        max_val = tl.extra.cuda.shfl_sync(0xFFFFFFFF, max_fb, 0)
-
+        # Final reduction: logsumexp over labels (only valid ones)
+        final_beta_masked = tl.where(c_mask, final_beta, NEG_INF)
+        max_val = tl.max(final_beta_masked, axis=0)
         exp_fb = tl.where(c_mask, tl.exp(final_beta - max_val), 0.0)
-        for offset in [16, 8, 4, 2, 1]:
-            other = tl.extra.cuda.shfl_xor_sync(0xFFFFFFFF, exp_fb, offset)
-            exp_fb = exp_fb + other
-        sum_exp = tl.extra.cuda.shfl_sync(0xFFFFFFFF, exp_fb, 0)
-
+        sum_exp = tl.sum(exp_fb, axis=0)
         partition = max_val + tl.log(sum_exp)
 
-        # Lane 0 writes result
-        if lane[0] == 0:
-            tl.store(out_ptr + batch_idx, partition)
+        # Store result (partition is a scalar)
+        tl.store(out_ptr + batch_idx, partition)
 
+
+    def _next_power_of_2(n):
+        """Return the smallest power of 2 >= n."""
+        if n <= 0:
+            return 1
+        # Handle powers of 2
+        if n & (n - 1) == 0:
+            return n
+        # Find next power of 2
+        p = 1
+        while p < n:
+            p *= 2
+        return p
 
     def launch_triton_kernel(edge, lengths):
         """
@@ -309,12 +301,15 @@ if HAS_TRITON:
         batch, N_1, K, C, _ = edge.shape
         N = N_1 + 1
 
+        # Pad C to next power of 2 (Triton requirement for tl.arange)
+        C_PAD = _next_power_of_2(C)
+
         # Ensure contiguous
         edge = edge.contiguous()
 
-        # Allocate ring buffer (small, will be L2 cached)
+        # Allocate ring buffer with padded C (small, will be L2 cached)
         ring_buffer = torch.empty(
-            (batch, K, C),
+            (batch, K, C_PAD),
             device=edge.device,
             dtype=edge.dtype
         )
@@ -330,7 +325,7 @@ if HAS_TRITON:
         grid = (batch,)
         semi_crf_scan_kernel[grid](
             edge, ring_buffer, partition, lengths,
-            batch, N, K, C,
+            batch, N, K, C, C_PAD,
             stride_eb, stride_en, stride_ek, stride_ec1, stride_ec2,
             stride_rb, stride_rk, stride_rc,
         )
@@ -352,15 +347,11 @@ class SemiCRFTritonForward(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, edge, lengths, use_triton=True):
-        batch, N_1, K, C, C2 = edge.shape
-        N = N_1 + 1
-
         # Check if Triton kernel is applicable
         use_triton_kernel = (
             HAS_TRITON and
             use_triton and
-            edge.is_cuda and
-            C <= 32  # Warp size limit for shuffle-based communication
+            edge.is_cuda
         )
 
         if use_triton_kernel:
@@ -395,7 +386,7 @@ class SemiCRFTritonForward(torch.autograd.Function):
         return grad_edge, None, None
 
 
-def semi_crf_triton_forward(edge, lengths, use_triton=True):
+def semi_crf_triton_forward(edge, lengths, use_triton=True, validate=False):
     """
     Main entry point for Semi-Markov CRF forward scan.
 
@@ -406,10 +397,19 @@ def semi_crf_triton_forward(edge, lengths, use_triton=True):
         edge: (batch, N-1, K, C, C) log potentials
         lengths: (batch,) sequence lengths
         use_triton: If True, use Triton when possible
+        validate: If True, use float64 PyTorch implementation for
+            high-precision debugging. Useful for validating numerical
+            accuracy. Returns result in original dtype.
 
     Returns:
         partition: (batch,) log partition function
     """
+    if validate:
+        # Use float64 for high-precision validation
+        orig_dtype = edge.dtype
+        partition = semi_crf_forward_pytorch(edge.double(), lengths)
+        return partition.to(orig_dtype)
+
     return SemiCRFTritonForward.apply(edge, lengths, use_triton)
 
 
@@ -434,6 +434,8 @@ def test_against_library():
         (4, 50, 16, 8),
         (2, 100, 32, 4),
         (2, 100, 64, 8),   # Larger K
+        (2, 50, 16, 16),   # Larger C
+        (2, 50, 16, 32),   # C=32
     ]
 
     all_passed = True
@@ -476,11 +478,20 @@ def test_triton_kernel():
     print("Testing Triton kernel vs PyTorch reference...")
 
     test_cases = [
+        # Basic tests
         (1, 20, 4, 4),
         (4, 50, 8, 8),
         (2, 100, 16, 8),
+        # Large K tests
         (1, 100, 32, 8),
-        (2, 100, 64, 8),   # Large K test
+        (2, 100, 64, 8),
+        # Large C tests (up to 32 labels)
+        (2, 50, 8, 16),
+        (2, 50, 16, 24),
+        (2, 50, 16, 32),
+        # Combined large K and C
+        (1, 100, 32, 16),
+        (1, 100, 64, 32),
     ]
 
     all_passed = True
@@ -508,6 +519,41 @@ def test_triton_kernel():
     return all_passed
 
 
+def test_validate_mode():
+    """Test validate mode with float64 precision."""
+    print("Testing validate mode (float64)...")
+
+    if not torch.cuda.is_available() or not HAS_TRITON:
+        print("  Skipping (requires CUDA + Triton)")
+        return True
+
+    # Use a larger case where precision differences are visible
+    batch, N, K, C = 4, 500, 64, 8
+    edge = torch.randn(batch, N-1, K, C, C, device='cuda')
+    lengths = torch.full((batch,), N, dtype=torch.long, device='cuda')
+
+    # Triton (float32)
+    triton_out = semi_crf_triton_forward(edge, lengths, use_triton=True)
+
+    # PyTorch float32
+    pytorch_f32 = semi_crf_triton_forward(edge, lengths, use_triton=False)
+
+    # Validate mode (float64)
+    validate_out = semi_crf_triton_forward(edge, lengths, validate=True)
+
+    # Compare
+    triton_vs_f32 = (triton_out - pytorch_f32).abs().max().item()
+    triton_vs_f64 = (triton_out - validate_out).abs().max().item()
+    f32_vs_f64 = (pytorch_f32 - validate_out).abs().max().item()
+
+    print(f"  Config: batch={batch}, N={N}, K={K}, C={C}")
+    print(f"  Triton vs PyTorch(f32): {triton_vs_f32:.2e}")
+    print(f"  Triton vs validate(f64): {triton_vs_f64:.2e}")
+    print(f"  PyTorch(f32) vs validate(f64): {f32_vs_f64:.2e}")
+
+    return True
+
+
 def test_gradients():
     """Test gradient computation."""
     print("Testing gradients...")
@@ -528,6 +574,101 @@ def test_gradients():
     print(f"  Grad stats: min={edge.grad.min():.4f}, max={edge.grad.max():.4f}")
 
     return True
+
+
+def benchmark_against_semimarkov(batch=4, N=500, K=64, C=8, n_iters=10):
+    """
+    Benchmark Triton fused kernel against SemiMarkov._dp_standard_vectorized.
+
+    This compares:
+    1. Triton fused kernel (this module)
+    2. SemiMarkov._dp_standard_vectorized (streaming linear scan from semimarkov.py)
+    3. PyTorch reference (this module)
+    """
+    import time
+
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping benchmark")
+        return
+
+    # Try to import SemiMarkov from the local torch_semimarkov package
+    try:
+        from torch_semimarkov import SemiMarkov
+        from torch_semimarkov.semirings import LogSemiring
+    except ImportError as e:
+        print(f"Could not import torch_semimarkov SemiMarkov: {e}")
+        print("Skipping comparison benchmark")
+        return
+
+    print(f"Benchmark: Triton vs SemiMarkov._dp_standard_vectorized")
+    print(f"Config: batch={batch}, N={N}, K={K}, C={C}")
+    print("-" * 60)
+
+    device = 'cuda'
+    edge = torch.randn(batch, N-1, K, C, C, device=device)
+    lengths = torch.full((batch,), N, dtype=torch.long, device=device)
+
+    # Create SemiMarkov instance with LogSemiring
+    sm = SemiMarkov(LogSemiring)
+
+    # Warmup all implementations
+    for _ in range(3):
+        _ = launch_triton_kernel(edge, lengths)
+        _, _, _ = sm._dp_standard_vectorized(edge, lengths)
+        _ = semi_crf_forward_pytorch(edge, lengths)
+    torch.cuda.synchronize()
+
+    # Benchmark Triton fused kernel
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        triton_out = launch_triton_kernel(edge, lengths)
+    torch.cuda.synchronize()
+    triton_ms = (time.perf_counter() - start) / n_iters * 1000
+
+    # Benchmark SemiMarkov._dp_standard_vectorized
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        sm_out, _, _ = sm._dp_standard_vectorized(edge, lengths)
+    torch.cuda.synchronize()
+    sm_vectorized_ms = (time.perf_counter() - start) / n_iters * 1000
+
+    # Benchmark PyTorch reference (this module)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(n_iters):
+        pytorch_out = semi_crf_forward_pytorch(edge, lengths)
+    torch.cuda.synchronize()
+    pytorch_ms = (time.perf_counter() - start) / n_iters * 1000
+
+    # Convert outputs for comparison
+    # SemiMarkov returns semiring-converted value, need to unconvert
+    sm_partition = LogSemiring.unconvert(sm_out)
+
+    # Check consistency
+    triton_vs_sm = (triton_out - sm_partition).abs().max().item()
+    triton_vs_pytorch = (triton_out - pytorch_out).abs().max().item()
+    sm_vs_pytorch = (sm_partition - pytorch_out).abs().max().item()
+
+    print(f"Triton fused kernel:              {triton_ms:8.2f} ms")
+    print(f"SemiMarkov._dp_standard_vectorized: {sm_vectorized_ms:8.2f} ms")
+    print(f"PyTorch reference (this module):  {pytorch_ms:8.2f} ms")
+    print()
+    print(f"Speedup Triton vs SemiMarkov:     {sm_vectorized_ms/triton_ms:.2f}x")
+    print(f"Speedup Triton vs PyTorch ref:    {pytorch_ms/triton_ms:.2f}x")
+    print()
+    print("Consistency check (max abs diff):")
+    print(f"  Triton vs SemiMarkov:           {triton_vs_sm:.2e}")
+    print(f"  Triton vs PyTorch ref:          {triton_vs_pytorch:.2e}")
+    print(f"  SemiMarkov vs PyTorch ref:      {sm_vs_pytorch:.2e}")
+
+    return {
+        'triton_ms': triton_ms,
+        'sm_vectorized_ms': sm_vectorized_ms,
+        'pytorch_ms': pytorch_ms,
+        'triton_vs_sm': triton_vs_sm,
+    }
 
 
 def benchmark(batch=4, N=1024, K=64, C=8, n_iters=10, device='cpu'):
@@ -563,7 +704,7 @@ def benchmark(batch=4, N=1024, K=64, C=8, n_iters=10, device='cpu'):
     print(f"  Throughput: {throughput:.2f} M positions/sec")
 
     # Triton benchmark (GPU only)
-    if device == 'cuda' and HAS_TRITON and C <= 32:
+    if device == 'cuda' and HAS_TRITON:
         for _ in range(3):
             _ = launch_triton_kernel(edge, lengths)
         torch.cuda.synchronize()
@@ -600,12 +741,21 @@ if __name__ == "__main__":
     print("\n2. Testing Triton kernel (GPU):")
     test_triton_kernel()
 
-    print("\n3. Testing gradients:")
+    print("\n3. Testing validate mode (float64):")
+    test_validate_mode()
+
+    print("\n4. Testing gradients:")
     test_gradients()
 
-    print("\n4. Benchmarking on CPU:")
+    print("\n5. Benchmarking on CPU:")
     benchmark(batch=2, N=100, K=16, C=8, device='cpu')
 
     if torch.cuda.is_available():
-        print("\n5. Benchmarking on GPU:")
+        print("\n6. Benchmarking on GPU (C=8):")
         benchmark(batch=4, N=500, K=64, C=8, device='cuda')
+
+        print("\n7. Benchmarking on GPU (C=32):")
+        benchmark(batch=4, N=500, K=64, C=32, device='cuda')
+
+        print("\n8. Comparison with SemiMarkov._dp_standard_vectorized:")
+        benchmark_against_semimarkov(batch=4, N=500, K=64, C=8)
