@@ -2,8 +2,8 @@ import torch
 
 has_genbmm = False
 try:
-    from torch_semimarkov._genbmm import BandedMatrix
     import torch_semimarkov._genbmm as genbmm
+    from torch_semimarkov._genbmm import BandedMatrix
 
     has_genbmm = True
 except ImportError:

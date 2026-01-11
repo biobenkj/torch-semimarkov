@@ -1,5 +1,7 @@
-import torch
 import math
+
+import torch
+
 from .semirings import LogSemiring
 
 
@@ -14,21 +16,23 @@ class Chart:
         self.grad = self.data.detach().clone().fill_(0.0)
 
     def __getitem__(self, ind):
-        I = slice(None)
-        return self.data[(I, I) + ind]
+        slice_all = slice(None)
+        return self.data[(slice_all, slice_all) + ind]
 
     def __setitem__(self, ind, new):
-        I = slice(None)
-        self.data[(I, I) + ind] = new
+        slice_all = slice(None)
+        self.data[(slice_all, slice_all) + ind] = new
 
 
 class _Struct:
     def __init__(self, semiring=LogSemiring):
         self.semiring = semiring
 
-    def score(self, potentials, parts, batch_dims=[0]):
+    def score(self, potentials, parts, batch_dims=None):
+        if batch_dims is None:
+            batch_dims = [0]
         score = torch.mul(potentials, parts)
-        batch = tuple((score.shape[b] for b in batch_dims))
+        batch = tuple(score.shape[b] for b in batch_dims)
         return self.semiring.prod(score.view(batch + (-1,)))
 
     def _bin_length(self, length):

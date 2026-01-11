@@ -7,7 +7,7 @@ operations supporting multiple semiring modes (log, max, sample, product-max).
 The CUDA extension (_C) is optional; pure PyTorch fallbacks are used when unavailable.
 """
 
-from .genmul import logbmm, samplebmm, maxbmm, prodmaxbmm
+from .genmul import logbmm, maxbmm, prodmaxbmm, samplebmm
 from .sparse import BandedMatrix, banddiag
 
-__all__ = ["logbmm", "samplebmm", "maxbmm", "prodmaxbmm", "BandedMatrix", "banddiag"]
+__all__ = ["logbmm", "maxbmm", "prodmaxbmm", "samplebmm", "BandedMatrix", "banddiag"]

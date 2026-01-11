@@ -32,7 +32,7 @@ def get_cuda_extensions():
         return []
 
     try:
-        from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+        from torch.utils.cpp_extension import CUDA_HOME, CUDAExtension
     except ImportError:
         print("Warning: torch.utils.cpp_extension not available, skipping CUDA build")
         return []

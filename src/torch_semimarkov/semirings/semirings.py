@@ -4,7 +4,6 @@ import torch
 has_genbmm = False
 try:
     from torch_semimarkov._genbmm import BandedMatrix as GenbmmBandedMatrix
-    import torch_semimarkov._genbmm as genbmm
 
     has_genbmm = True
 except ImportError:
@@ -26,7 +25,7 @@ def matmul(cls, a, b):
     a = a.unsqueeze(-1)
     b = b.unsqueeze(act_on - 1)
     c = cls.times(a, b)
-    for d in range(act_on, -1, 1):
+    for _d in range(act_on, -1, 1):
         c = cls.sum(c.transpose(-2, -1))
     return c
 
@@ -67,8 +66,8 @@ class Semiring:
     def times(cls, *ls):
         "Multiply a list of tensors together"
         cur = ls[0]
-        for l in ls[1:]:
-            cur = cls.mul(cur, l)
+        for item in ls[1:]:
+            cur = cls.mul(cur, item)
         return cur
 
     @classmethod
@@ -224,7 +223,7 @@ def KMaxSemiring(k):
                 xs = xs.permute((xs.dim() - 1,) + tuple(range(0, xs.dim() - 1)))
                 assert xs.shape[0] == k
                 return xs
-            assert False
+            raise AssertionError("KMaxSemiring.sum only supports dim=-1")
 
         @staticmethod
         def sparse_sum(xs, dim=-1):
@@ -236,7 +235,7 @@ def KMaxSemiring(k):
                 xs2 = xs2.permute((xs.dim() - 1,) + tuple(range(0, xs.dim() - 1)))
                 assert xs.shape[0] == k
                 return xs, (xs2 % k, xs2 // k)
-            assert False
+            raise AssertionError("KMaxSemiring.sparse_sum only supports dim=-1")
 
         @staticmethod
         def mul(a, b):

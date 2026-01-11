@@ -1,13 +1,13 @@
 import pytest
 import torch
 
+import torch_semimarkov.blocktriangular as bt
 from torch_semimarkov.blocktriangular import (
     BlockTriangularMatrix,
     block_triang_matmul,
     clear_structure_cache,
 )
 from torch_semimarkov.semirings import LogSemiring
-import torch_semimarkov.blocktriangular as bt
 
 
 def _make_dense(batch, K, C, span, fill):

@@ -1,6 +1,7 @@
 import torch
-from .helpers import _Struct
+
 from .blocktriangular import BlockTriangularMatrix, block_triang_matmul
+from .helpers import _Struct
 
 
 class SemiMarkov(_Struct):
@@ -159,7 +160,7 @@ class SemiMarkov(_Struct):
             init.permute(0, 1, 2, 3, 5, 4, 6).contiguous().view(-1, batch, bin_N, K_1 * C, K_1 * C)
         )
 
-        for n in range(1, log_N + 1):
+        for _level in range(1, log_N + 1):
             chart = semiring.matmul(chart[:, :, 1::2], chart[:, :, 0::2])
 
         final = chart.view(-1, batch, K_1, C, K_1, C)
@@ -199,7 +200,9 @@ class SemiMarkov(_Struct):
             beta[n][:] = semiring.sum(
                 torch.stack([alpha[:, :, a, b] for a, b in zip(f1, f2)], dim=-1)
             )
-        v = semiring.sum(torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1))
+        v = semiring.sum(
+            torch.stack([beta[length_val - 1][:, i] for i, length_val in enumerate(lengths)], dim=1)
+        )
         return v, [edge], beta
 
     def _dp_blocktriangular(self, edge, lengths=None, force_grad=False):
@@ -333,7 +336,9 @@ class SemiMarkov(_Struct):
             beta[n][:] = semiring.sum(gathered, dim=-2)  # Sum over k dimension
 
         # Final: Sum over sequence endpoints (keep original implementation)
-        v = semiring.sum(torch.stack([beta[l - 1][:, i] for i, l in enumerate(lengths)], dim=1))
+        v = semiring.sum(
+            torch.stack([beta[length_val - 1][:, i] for i, length_val in enumerate(lengths)], dim=1)
+        )
         return v, [edge], beta
 
     def _dp_scan_streaming(self, edge, lengths=None, force_grad=False):

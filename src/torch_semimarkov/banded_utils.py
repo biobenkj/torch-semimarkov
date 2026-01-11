@@ -7,7 +7,7 @@ Utilities for banded Semi-Markov experiments:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -90,7 +90,7 @@ def snake_ordering(K: int, C: int) -> torch.Tensor:
     return torch.tensor(perm, dtype=torch.long)
 
 
-def rcm_ordering_from_adjacency(adj: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+def rcm_ordering_from_adjacency(adj: torch.Tensor) -> tuple[torch.Tensor, bool]:
     """
     Reverse Cuthill-McKee ordering for a square dense adjacency.
 

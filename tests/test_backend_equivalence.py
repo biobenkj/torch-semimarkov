@@ -17,17 +17,14 @@ All backends should produce identical partition functions within numerical toler
 """
 
 import argparse
-import gc
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
 
 from torch_semimarkov import SemiMarkov
 from torch_semimarkov.semirings import LogSemiring
-
 
 # -----------------------------------------------------------------------------
 # Test Configurations
@@ -516,7 +513,7 @@ Examples:
             parts = c.split(":")
             if len(parts) == 4:
                 T, K, C, B = map(int, parts)
-                configs.append({"T": T, "K": K, "C": C, "B": B, "name": f"Custom"})
+                configs.append({"T": T, "K": K, "C": C, "B": B, "name": "Custom"})
 
     print("\n")
     print("╔" + "=" * 78 + "╗")

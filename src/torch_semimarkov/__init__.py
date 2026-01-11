@@ -20,15 +20,15 @@ Modifications:
 - Optimized for genomic segmentation use cases
 """
 
-from .semimarkov import SemiMarkov
 from .banded import BandedMatrix
 from .banded_utils import (
-    measure_effective_bandwidth,
-    snake_ordering,
-    rcm_ordering_from_adjacency,
     apply_permutation,
+    measure_effective_bandwidth,
+    rcm_ordering_from_adjacency,
+    snake_ordering,
 )
 from .blocktriangular import BlockTriangularMatrix, block_triang_matmul
+from .semimarkov import SemiMarkov
 
 __version__ = "0.1.0"
 

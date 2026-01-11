@@ -15,7 +15,6 @@ Usage:
 """
 
 import torch
-import math
 
 # Triton is optional - kernel only available when installed and on GPU
 try:
@@ -603,7 +602,7 @@ def benchmark_against_semimarkov(batch=4, N=500, K=64, C=8, n_iters=10):
         print("Skipping comparison benchmark")
         return
 
-    print(f"Benchmark: Triton vs SemiMarkov._dp_standard_vectorized")
+    print("Benchmark: Triton vs SemiMarkov._dp_standard_vectorized")
     print(f"Config: batch={batch}, N={N}, K={K}, C={C}")
     print("-" * 60)
 
@@ -679,7 +678,7 @@ def benchmark(batch=4, N=1024, K=64, C=8, n_iters=10, device="cpu"):
     import time
 
     if device == "cuda" and not torch.cuda.is_available():
-        print(f"CUDA not available, skipping GPU benchmark")
+        print("CUDA not available, skipping GPU benchmark")
         return None
 
     edge = torch.randn(batch, N - 1, K, C, C, device=device)
@@ -721,7 +720,7 @@ def benchmark(batch=4, N=1024, K=64, C=8, n_iters=10, device="cpu"):
         # Check correctness
         max_diff = (partition_pt - partition_tr).abs().max().item()
 
-        print(f"Triton:")
+        print("Triton:")
         print(f"  Time: {triton_ms:.2f} ms")
         print(f"  Speedup vs PyTorch: {pytorch_ms/triton_ms:.2f}x")
         print(f"  Max diff from PyTorch: {max_diff:.2e}")

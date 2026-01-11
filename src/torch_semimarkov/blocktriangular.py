@@ -9,10 +9,9 @@ experimentation; correctness first, optimise later.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-
 
 # Module-level cache for structural metadata
 # Key: (K, span, duration_mask_key, device)
@@ -39,7 +38,7 @@ class BlockTriangularMatrix:
     block_indices: torch.Tensor
     K: int
     C: int
-    duration_mask_key: Optional[Tuple[int, ...]] = None
+    duration_mask_key: Optional[tuple[int, ...]] = None
 
     @property
     def device(self):
@@ -57,7 +56,7 @@ class BlockTriangularMatrix:
         C: int,
         span: int,
         duration_mask: Optional[torch.Tensor] = None,
-    ) -> "BlockTriangularMatrix":
+    ) -> BlockTriangularMatrix:
         """
         Compress a dense [B, N, N] tensor (N = K*C) into block-triangular form.
         """
@@ -151,7 +150,7 @@ def _build_triplets(
     span: int,
     c_zero_idx: int,
     d_zero_idx: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Build result block indices and contributing block triplets:
       E_{k1,k3} = sum_k2 C_{k1,k2} @ D_{k2,k3}
@@ -194,7 +193,7 @@ def _build_triplets(
     return e_block_indices_tensor, triplets_tensor
 
 
-def _duration_mask_key(duration_mask: Optional[torch.Tensor]) -> Optional[Tuple[int, ...]]:
+def _duration_mask_key(duration_mask: Optional[torch.Tensor]) -> Optional[tuple[int, ...]]:
     """
     Convert duration_mask to a hashable key.
 
@@ -208,7 +207,7 @@ def _duration_mask_key(duration_mask: Optional[torch.Tensor]) -> Optional[Tuple[
 
 
 def _duration_mask_from_key(
-    duration_mask_key: Optional[Tuple[int, ...]],
+    duration_mask_key: Optional[tuple[int, ...]],
     K: int,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
@@ -229,8 +228,8 @@ def _duration_mask_from_key(
 
 
 def _get_or_build_structure(
-    C_bt: "BlockTriangularMatrix",
-    D_bt: "BlockTriangularMatrix",
+    C_bt: BlockTriangularMatrix,
+    D_bt: BlockTriangularMatrix,
     K: int,
     span: int,
 ) -> dict:
@@ -356,7 +355,7 @@ def block_triang_matmul(
     B = C_bt.batch_size
 
     if debug:
-        print(f"\n=== block_triang_matmul DEBUG ===")
+        print("\n=== block_triang_matmul DEBUG ===")
         print(f"K={K}, C={C_dim}, B={B}, span={span}")
         print(f"C_bt blocks: {C_bt.block_indices.tolist()}")
         print(f"D_bt blocks: {D_bt.block_indices.tolist()}")
@@ -379,7 +378,7 @@ def block_triang_matmul(
             f"\nStructure cache: {'HIT' if is_cached else 'MISS'} (cache size: {len(_STRUCTURE_CACHE)})"
         )
         print(f"Result blocks (k1,k3): {e_block_indices.tolist()}")
-        print(f"Triplets (e_idx, c_idx, d_idx):")
+        print("Triplets (e_idx, c_idx, d_idx):")
         for t in triplets.tolist():
             e_idx, c_idx, d_idx = t
             k1_k2 = C_bt.block_indices[c_idx].tolist()
@@ -439,7 +438,7 @@ def block_triang_matmul(
 
     if debug:
         e_indices_sorted = e_indices[sorted_idx]
-        print(f"\n=== CSR accumulation structure (from cache) ===")
+        print("\n=== CSR accumulation structure (from cache) ===")
         print(
             f"Sorted e_indices: {e_indices_sorted.tolist()[:20]}{'...' if num_triplets > 20 else ''}"
         )
@@ -456,7 +455,7 @@ def block_triang_matmul(
     if debug:
         print(f"\nInitialized e_values with semiring.zero = {semiring.zero.item()}")
         print(f"e_values shape: {e_values.shape}")
-        print(f"\n=== Accumulating contributions (vectorized) ===")
+        print("\n=== Accumulating contributions (vectorized) ===")
 
     # Accumulate contributions per result block using vectorized semiring.sum
     # This replaces the Python loop over triplets with a loop over result blocks,
@@ -474,9 +473,9 @@ def block_triang_matmul(
             print(f"\nBlock {e}: reducing {end-start} contributions")
             print(f"  contrib shape: {contrib.shape}")
             if end - start == 1:
-                print(f"  Single contribution (no reduction needed)")
+                print("  Single contribution (no reduction needed)")
             else:
-                print(f"  Using semiring.sum over dim=1")
+                print("  Using semiring.sum over dim=1")
 
         # Reduce with semiring.sum: [B, num_contrib, C, C] -> [B, C, C]
         # StdSemiring: torch.sum(contrib, dim=1)
@@ -493,7 +492,7 @@ def block_triang_matmul(
             print(f"  Result e_values[0, {e}]:\n{e_values[0, e]}")
 
     if debug:
-        print(f"\n=== Final result ===")
+        print("\n=== Final result ===")
         print(f"Result block indices: {e_block_indices.tolist()}")
         print(f"Result values shape: {e_values.shape}")
         for i in range(min(3, num_e_blocks)):
@@ -515,7 +514,6 @@ def clear_structure_cache():
     Useful for testing or when you want to free memory after processing
     many different (K, span) configurations.
     """
-    global _STRUCTURE_CACHE
     _STRUCTURE_CACHE.clear()
 
 

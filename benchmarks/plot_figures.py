@@ -18,7 +18,7 @@ Example:
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Optional
 
 import pandas as pd
 
@@ -29,8 +29,6 @@ def check_matplotlib():
         import matplotlib
 
         matplotlib.use("Agg")  # Non-interactive backend
-        import matplotlib.pyplot as plt
-
         return True
     except ImportError:
         print("matplotlib not installed. Install with: pip install matplotlib")
@@ -79,7 +77,7 @@ BACKEND_MARKERS = {
 }
 
 
-def get_backends_from_data(df: pd.DataFrame) -> List[str]:
+def get_backends_from_data(df: pd.DataFrame) -> list[str]:
     """Extract and sort backends found in data."""
     backends_in_data = set(df["backend"].unique())
 
@@ -209,7 +207,7 @@ def plot_ratio_vs_state(
     ratios: pd.DataFrame,
     output_dir: Path,
     metric: str = "time",
-    T_values: List[int] = None,
+    T_values: Optional[list[int]] = None,
     baseline_label: str = "Vectorized Linear",
 ):
     """
@@ -475,7 +473,9 @@ def plot_backend_comparison(df: pd.DataFrame, output_dir: Path):
     print(f"Saved {output_path}")
 
 
-def plot_absolute_metrics(df: pd.DataFrame, output_dir: Path, T_values: List[int] = None):
+def plot_absolute_metrics(
+    df: pd.DataFrame, output_dir: Path, T_values: Optional[list[int]] = None
+):
     """
     Plot absolute time and memory vs state size (not ratios).
     Useful when baseline is missing or for overall picture.

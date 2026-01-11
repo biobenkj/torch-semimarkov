@@ -29,11 +29,10 @@ import argparse
 import csv
 import gc
 import json
-import time
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 import statistics
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import torch
 
@@ -74,7 +73,7 @@ class BenchmarkResult:
     memory_autograd_gb: float = 0.0
 
 
-def parse_int_list(s: str) -> List[int]:
+def parse_int_list(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
@@ -83,7 +82,7 @@ def bytes_to_gb(b: int) -> float:
     return round(b / (1024**3), 3)
 
 
-def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> Dict[str, float]:
+def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> dict[str, float]:
     """
     Estimate memory breakdown by category (in GB).
 
@@ -203,9 +202,9 @@ def should_skip_config(
     K: int,
     C: int,
     backend: str,
-    oom_history: Dict[str, List[Tuple[int, int, int]]],
+    oom_history: dict[str, list[tuple[int, int, int]]],
     max_memory_gb: float = 40.0,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     Determine if we should skip this config based on:
     1. Predicted memory > max_memory_gb
@@ -312,7 +311,7 @@ def run_single_benchmark(
             torch.cuda.empty_cache()
             gc.collect()
 
-        for rep in range(repeats):
+        for _rep in range(repeats):
             # IMPORTANT: Reset memory stats BEFORE allocating edge_run
             # so that edge_run allocation is included in peak measurement
             if device.type == "cuda":
@@ -487,8 +486,8 @@ def main():
 
     torch.manual_seed(42)
 
-    results: List[BenchmarkResult] = []
-    oom_history: Dict[str, List[Tuple[int, int, int]]] = {b: [] for b in backends}
+    results: list[BenchmarkResult] = []
+    oom_history: dict[str, list[tuple[int, int, int]]] = {b: [] for b in backends}
 
     total_configs = len(T_list) * len(K_list) * len(C_list) * len(backends)
     completed = 0
@@ -550,7 +549,7 @@ def main():
                             f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved"
                         )
                     elif result.status == "oom":
-                        print(f"OOM")
+                        print("OOM")
                         oom_history[backend].append((T, K, C))
                     else:
                         print(f"{result.status}: {result.error_msg}")
