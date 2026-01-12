@@ -66,6 +66,7 @@ def CheckpointSemiring(cls, min_size=0):
         >>> # Now binary tree uses less memory (but ~2x slower)
         >>> log_Z, _ = model.logpartition(edge, use_linear_scan=False)
     """
+
     class _Check(torch.autograd.Function):
         @staticmethod
         def forward(ctx, a, b):
@@ -142,6 +143,7 @@ def CheckpointShardSemiring(cls, max_size, min_size=0):
         Sharded checkpointing has significant overhead. Only use when necessary
         to avoid OOM on the binary tree algorithm with large state spaces.
     """
+
     class _Check(torch.autograd.Function):
         @staticmethod
         def forward(ctx, a, b):
