@@ -18,7 +18,7 @@ Efficient Semi-Markov CRF Inference using PyTorch and Triton
 
 Semi-Markov CRFs are powerful models for sequences with natural segment structure, such as genomic annotations. However, their inference algorithms are resource-intensive. The segment-level forward pass requires $O(TKC^2)$ time and critically $O(TKC)$ memory, where $T$ is sequence length, $K$ is maximum segment duration, and $C$ is the number of states. For chromosome-scale sequences with biologically realistic duration bounds, this memory footprint quickly exceeds GPU capacity.
 
-Existing implementations navigate this through various tradeoffs—bounding $D$, chunked processing, or filtering heuristics. This package takes a different approach:
+Existing implementations navigate this through various tradeoffs—bounding $K$, chunked processing, or filtering heuristics. This package takes a different approach:
 
 Streaming the linear scan collapses memory to $O(KC)$—independent of sequence length and duration.
 
