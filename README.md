@@ -2,7 +2,7 @@
 
 # torch-semimarkov
 
-Efficient Semi-Markov CRF Inference for PyTorch
+Efficient Semi-Markov CRF Inference using PyTorch and Triton
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
@@ -16,29 +16,37 @@ Efficient Semi-Markov CRF Inference for PyTorch
 
 ## Overview
 
-Optimized Semi-Markov CRF inference algorithms for genomic sequence annotation.
+Semi-Markov CRFs are powerful models for sequences with natural segment structure, such as genomic annotations. However, their inference algorithms are resource-intensive. The segment-level forward pass requires $O(TKC^2)$ time and—critically—$O(TKC)$ memory, where $T$ is sequence length, $K$ is maximum segment duration, and $C$ is the number of states. For chromosome-scale sequences with biologically realistic duration bounds, this memory footprint quickly exceeds GPU capacity.
+
+Existing implementations navigate this through various tradeoffs—bounding $D$, chunked processing, or filtering heuristics. This package takes a different approach:
+
+> **Key insight:** Streaming the linear scan collapses memory to $O(KC)$—independent of sequence length and duration.
+
+This makes Semi-Markov CRF inference practical for genome-scale annotation without architectural compromises.
+
+**torch-semimarkov** provides:
+
+- **Streaming scan** — $O(KC)$ memory, universally applicable across genomic parameter regimes
+- **Triton fused kernel** — optional GPU acceleration with up to 45× speedup
 
 > **Practical Semi-Markov CRF Inference for Genomic Sequence Annotation**
-> Benjamin K. Johnson (2026)
+> Johnson et al. (2026)
 
-**Key finding:** Memory, not time, is the binding constraint. Streaming linear scan is universally applicable across all genomic parameter regimes.
+## Why Semi-Markov CRFs in genomics contexts?
 
-- Streaming scan with O(KC) memory (default) - within a few percent of vectorized speed
-- Optional Triton fused kernel for up to 45x GPU speedup
-- Vectorized scan available when memory permits (O(TKC) memory, 2-3x faster than scalar)
+Many biological sequences have inherent *segment* structure like genes, exons, chromatin states, transposable elements, etc. where segment *duration* carries biological meaning. Linear-chain CRFs handle sequential dependencies well but lack explicit duration modeling, often requiring post-hoc grouping or producing biologically implausible outputs (single-base "exons," fragmentary annotations).
 
-## Why Semi-Markov CRFs?
+Semi-Markov CRFs resolve this by modeling segments directly. The potential function scores an entire segment spanning positions $s$ to $e$:
 
-Semi-Markov CRFs extend linear-chain CRFs with explicit duration modeling:
+$$\psi(x_{s:e}, c', c, d) = \underbrace{\psi_{\text{emit}}(x_{s:e}, c)}_{\text{sequence content}} + \underbrace{\psi_{\text{trans}}(c', c)}_{\text{state grammar}} + \underbrace{\psi_{\text{dur}}(c, d)}_{\text{length prior}}$$
 
-```
-psi(x_{s:e}, c', c, d) = psi_emission(x_{s:e}, c) + psi_transition(c', c) + psi_duration(c, d)
-```
+Each term encodes a distinct biological constraint: does the sequence *content* match this annotation? Is this state *transition* grammatically valid? Is this *duration* plausible for this feature type?
 
-This provides three structural advantages:
-1. **Guaranteed valid segmentations** - segments tile the sequence by construction
-2. **Explicit duration modeling** - incorporate biological priors (exon lengths, TE sizes)
-3. **Segment-level posteriors** - amenable to calibration and uncertainty quantification
+This formulation provides:
+
+- **Valid segmentations by construction** — segments tile the sequence exactly, eliminating post-processing
+- **Explicit duration modeling** — encode priors like "exons are typically 50–300 bp"
+- **Segment-level posteriors** — enable calibration and principled uncertainty quantification over whole features, not just positions
 
 ## Installation
 
@@ -118,12 +126,12 @@ Tests run CPU-only by default. GPU tests require CUDA and are skipped in CI.
 | Component | Status |
 |-----------|--------|
 | **Streaming Scan** | O(KC) memory, default backend |
-| **Vectorized Scan** | O(TKC) memory, 2-3x faster |
+| **Vectorized Scan** | O(TKC) memory, 2-3x faster than standard linear scan |
 | **Binary Tree** | O(log N) depth, high memory for large KC |
 | **Block-Triangular** | Exploits duration constraint sparsity |
 | **Semirings** | Log, Max, Std, KMax, Entropy, CrossEntropy |
 | **Checkpoint Semiring** | Memory-efficient gradients |
-| **BandedMatrix (CPU)** | Lightweight prototyping |
+| **BandedMatrix (CPU)** | Prototype and not a recommended backend |
 | **CUDA Extension** | Builds when nvcc available |
 | **Triton Kernel** | ~45x speedup on GPU |
 
@@ -134,7 +142,7 @@ If you use this library, please cite:
 ```bibtex
 @article{johnson2026semimarkov,
   title={Practical Semi-Markov CRF Inference for Genomic Sequence Annotation},
-  author={Johnson, Benjamin K.},
+  author={Johnson et al.},
   journal={arXiv preprint},
   year={2026}
 }
