@@ -9,7 +9,7 @@ description = "Efficient Semi-Markov CRF Inference for PyTorch"
 readme = "README.md"
 license = "MIT"
 authors = [
-    {name = "Benjamin K. Johnson", email = "ben.johnson@example.com"}
+    {name = "Benjamin K. Johnson", email = "ben.johnson@vai.org"}
 ]
 keywords = [
     "pytorch",

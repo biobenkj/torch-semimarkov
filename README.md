@@ -29,9 +29,6 @@ This makes Semi-Markov CRF inference practical for genome-scale annotation witho
 - **Streaming scan** — $O(KC)$ memory, universally applicable across genomic parameter regimes
 - **Triton fused kernel** — optional GPU acceleration with up to 45× speedup
 
-> **Practical Semi-Markov CRF Inference for Genomic Sequence Annotation**
-> Johnson et al. (2026)
-
 ## Why Semi-Markov CRFs in genomics contexts?
 
 Many biological sequences have inherent *segment* structurelike genes, exons, transcript isoforms, chromatin states, transposable elements, etc. where segment *duration* carries biological meaning. Linear-chain CRFs handle sequential dependencies well but lack explicit duration modeling, often requiring post-hoc grouping or producing biologically implausible outputs (single-base "exons," fragmentary annotations).
@@ -136,19 +133,6 @@ Tests run CPU-only by default. GPU tests require CUDA and are skipped in CI.
 | **BandedMatrix (CPU)** | Prototype and not a recommended backend |
 | **CUDA Extension** | Builds when nvcc available |
 | **Triton Kernel** | ~45x speedup on GPU |
-
-## Citation
-
-If you use this library, please cite:
-
-```bibtex
-@article{johnson2026semimarkov,
-  title={Practical Semi-Markov CRF Inference for Genomic Sequence Annotation},
-  author={Johnson et al.},
-  journal={arXiv preprint},
-  year={2026}
-}
-```
 
 ## Acknowledgments
 
