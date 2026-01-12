@@ -9,6 +9,7 @@ Efficient Semi-Markov CRF Inference using PyTorch and Triton
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![CI](https://github.com/biobenkj/torch-semimarkov/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/biobenkj/torch-semimarkov/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/biobenkj/torch-semimarkov/branch/main/graph/badge.svg)](https://codecov.io/gh/biobenkj/torch-semimarkov)
+![PyPI - Downloads](https://img.shields.io/pypi/dm/torch-semimarkov)
 
 [Install](#installation) | [Quick Start](#quick-start) | [Docs](docs/) | [Examples](#quick-start) | [GitHub](https://github.com/biobenkj/torch-semimarkov)
 
