@@ -249,7 +249,7 @@ class SemiMarkov(_Struct):
             f1 = torch.arange(n - 1, t, -1)
             f2 = torch.arange(1, len(f1) + 1)
             beta[n][:] = semiring.sum(
-                torch.stack([alpha[:, :, a, b] for a, b in zip(f1, f2)], dim=-1)
+                torch.stack([alpha[:, :, a, b] for a, b in zip(f1, f2, strict=True)], dim=-1)
             )
         v = semiring.sum(
             torch.stack([beta[length_val - 1][:, i] for i, length_val in enumerate(lengths)], dim=1)

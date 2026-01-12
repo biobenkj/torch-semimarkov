@@ -32,12 +32,12 @@ except ImportError:
 
 def broadcast_size(a, b):
     r"""Compute the broadcasted tensor size."""
-    return torch.tensor([max(i, j) for i, j in zip(a.shape, b.shape)]).prod()
+    return torch.tensor([max(i, j) for i, j in zip(a.shape, b.shape, strict=False)]).prod()
 
 
 def matmul_size(a, b):
     r"""Compute the output shape of matrix multiplication."""
-    size = [max(i, j) for i, j in zip(a.shape[:-2], b.shape[:-2])]
+    size = [max(i, j) for i, j in zip(a.shape[:-2], b.shape[:-2], strict=False)]
     size.append(a.shape[-2])
     size.append(b.shape[-1])
     return size
@@ -174,7 +174,7 @@ def CheckpointShardSemiring(cls, max_size, min_size=0):
     class _CheckpointSemiring(cls):
         @staticmethod
         def matmul(a, b):
-            size = torch.tensor([max(i, j) for i, j in zip(a.shape, b.shape)]).prod()
+            size = torch.tensor([max(i, j) for i, j in zip(a.shape, b.shape, strict=False)]).prod()
             if size < min_size:
                 return cls.matmul(a, b)
             else:
