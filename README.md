@@ -90,7 +90,7 @@ lengths = torch.full((batch_size,), seq_length)
 
 # Forward pass (partition function)
 # Uses streaming scan by default: O(KC) memory
-log_Z, _, _ = model.logpartition(edge, lengths=lengths)
+log_Z, _ = model.logpartition(edge, lengths=lengths)
 
 # Backward pass for gradients
 log_Z.sum().backward()
