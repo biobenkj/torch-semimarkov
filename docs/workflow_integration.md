@@ -67,13 +67,20 @@ had label c1."
 - When the HSMM factorization is too restrictive for your domain
 - When you want the encoder to learn everything end-to-end
 
+**Projection head definition:**
+
 ```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class DirectEdgeHead(nn.Module):
+    """Project encoder hidden states to semi-CRF edge potentials."""
+
     def __init__(self, hidden_dim, K, C):
         super().__init__()
         self.K = K
         self.C = C
-        # Project to edge potentials
         self.edge_proj = nn.Linear(hidden_dim, K * C * C)
 
     def forward(self, hidden_states):
@@ -83,6 +90,22 @@ class DirectEdgeHead(nn.Module):
         edge_hidden = hidden_states[:, :-1, :]  # (batch, T-1, hidden_dim)
         edge_flat = self.edge_proj(edge_hidden)  # (batch, T-1, K*C*C)
         return edge_flat.view(batch, T - 1, self.K, self.C, self.C)
+```
+
+**Using it with torch-semimarkov:**
+
+```python
+from torch_semimarkov import SemiMarkov
+from torch_semimarkov.semirings import LogSemiring
+
+# Build model
+head = DirectEdgeHead(hidden_dim=256, K=8, C=5)
+crf = SemiMarkov(LogSemiring)
+
+# Forward pass: encoder -> head -> semi-CRF
+hidden_states = encoder(x)              # your encoder
+edge = head(hidden_states)              # project to edge potentials
+log_Z, _ = crf.logpartition(edge, lengths=lengths)  # <-- torch-semimarkov
 ```
 
 **Variant: Context window for edge prediction**
@@ -99,7 +122,6 @@ class ContextEdgeHead(nn.Module):
         self.K = K
         self.C = C
         self.context_size = context_size
-        # MLP over concatenated context
         self.edge_mlp = nn.Sequential(
             nn.Linear(hidden_dim * context_size, hidden_dim),
             nn.ReLU(),
@@ -111,26 +133,28 @@ class ContextEdgeHead(nn.Module):
         pad = self.context_size // 2
 
         # Pad and unfold to get context windows
-        padded = F.pad(hidden_states, (0, 0, pad, pad))  # (batch, T+2*pad, H)
-        windows = padded.unfold(1, self.context_size, 1)  # (batch, T, H, ctx)
-        windows = windows.reshape(batch, T, -1)  # (batch, T, H*ctx)
+        padded = F.pad(hidden_states, (0, 0, pad, pad))
+        windows = padded.unfold(1, self.context_size, 1)
+        windows = windows.reshape(batch, T, -1)
 
-        # Predict edges from context (positions 0..T-2)
         edge_flat = self.edge_mlp(windows[:, :-1])
         return edge_flat.view(batch, T - 1, self.K, self.C, self.C)
 ```
 
 **Inspecting learned edge potentials**
 
-With direct edges, you can visualize what the model predicts at specific
+After training, you can visualize what the model predicts at specific
 positions to understand position-dependent patterns:
 
 ```python
-# After a forward pass, examine edges at specific positions
-edge = model(x, lengths)[1]  # (batch, T-1, K, C, C)
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# After a forward pass on some data
+edge = head(encoder(x))  # (batch, T-1, K, C, C)
 
 # Average edge potentials across a batch for a specific position
-pos = 50  # position of interest
+pos = 50
 avg_edge_at_pos = edge[:, pos].mean(dim=0)  # (K, C, C)
 
 # Plot transition preferences at this position for duration k=1
@@ -147,7 +171,7 @@ plt.ylabel("Current label")
 This lets you see if the model learns position-specific behavior, like
 different transition patterns near the start vs. middle of sequences.
 
-### 2. HSMM factorization (recommended for most cases)
+### 2. HSMM factorization
 
 The Hidden Semi-Markov Model (HSMM) factorization breaks edge potentials into
 interpretable components:
@@ -170,54 +194,17 @@ This factorization has two practical advantages:
 2. **Interpretability**: After training, you can extract and visualize the
    learned parameters to understand what the model learned about your domain.
 
-**Example: Inspecting a trained splicing model**
+**Projection head definition:**
 
 ```python
-import matplotlib.pyplot as plt
-import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_semimarkov import SemiMarkov
 
-# After training, extract the learned parameters
-model = trained_model.head  # your HSMMHead
-
-# Get transition probabilities (C x C matrix)
-trans_probs = torch.softmax(model.trans_logits, dim=-1).detach().cpu()
-
-# Get duration probabilities (C x K matrix)
-dur_probs = torch.softmax(model.dur_logits, dim=-1).detach().cpu()
-
-# Label names for a splicing model
-labels = ["5'UTR", "CDS", "intron", "3'UTR", "intergenic"]
-
-# Plot transition matrix as heatmap
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-sns.heatmap(trans_probs, annot=True, fmt=".2f",
-            xticklabels=labels, yticklabels=labels,
-            cmap="Blues", ax=axes[0])
-axes[0].set_xlabel("Next segment")
-axes[0].set_ylabel("Current segment")
-axes[0].set_title("Learned transition probabilities")
-
-# Plot duration distributions per label
-for i, label in enumerate(labels):
-    axes[1].plot(dur_probs[i], label=label)
-axes[1].set_xlabel("Duration (positions)")
-axes[1].set_ylabel("Probability")
-axes[1].set_title("Learned duration distributions")
-axes[1].legend()
-
-plt.tight_layout()
-plt.savefig("learned_splicing_structure.png")
-```
-
-This might reveal, for example:
-- CDS → intron and intron → CDS have high probability (expected for splicing)
-- intron → intron is near zero (introns don't self-transition)
-- Introns have a broader duration distribution than exons
-- 5'UTR → CDS is common, but CDS → 5'UTR is rare (directional gene structure)
-
-```python
 class HSMMHead(nn.Module):
+    """HSMM-factorized projection head for semi-CRF."""
+
     def __init__(self, hidden_dim, K, C):
         super().__init__()
         self.K = K
@@ -236,18 +223,76 @@ class HSMMHead(nn.Module):
         batch, T, _ = hidden_states.shape
 
         # Emission scores from encoder
-        emission_flat = self.emission_proj(hidden_states)  # (batch, T, K*C)
+        emission_flat = self.emission_proj(hidden_states)
         emission = emission_flat.view(batch, T, self.K, self.C)
 
-        # Normalize transition parameters
+        # Normalize transition parameters to log-probabilities
         init_z = F.log_softmax(self.init_logits, dim=-1)
         trans_z = F.log_softmax(self.trans_logits, dim=-1)
         dur_z = F.log_softmax(self.dur_logits, dim=-1)
 
-        # Combine into edge potentials
-        edge = SemiMarkov.hsmm(init_z, trans_z, dur_z, emission)
+        # Combine into edge potentials using torch-semimarkov helper
+        edge = SemiMarkov.hsmm(init_z, trans_z, dur_z, emission)  # <-- torch-semimarkov
         return edge
 ```
+
+**Using it with torch-semimarkov:**
+
+```python
+from torch_semimarkov import SemiMarkov
+from torch_semimarkov.semirings import LogSemiring
+
+# Build model
+head = HSMMHead(hidden_dim=256, K=8, C=5)
+crf = SemiMarkov(LogSemiring)
+
+# Forward pass: encoder -> head -> semi-CRF
+hidden_states = encoder(x)              # your encoder
+edge = head(hidden_states)              # project to edge potentials (uses SemiMarkov.hsmm)
+log_Z, _ = crf.logpartition(edge, lengths=lengths)  # <-- torch-semimarkov
+```
+
+**Inspecting a trained model**
+
+After training, you can extract and visualize the learned parameters:
+
+```python
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Extract learned parameters from trained head
+trans_probs = torch.softmax(head.trans_logits, dim=-1).detach().cpu()
+dur_probs = torch.softmax(head.dur_logits, dim=-1).detach().cpu()
+
+# Label names for a splicing model
+labels = ["5'UTR", "CDS", "intron", "3'UTR", "intergenic"]
+
+# Plot transition matrix and duration distributions
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+sns.heatmap(trans_probs, annot=True, fmt=".2f",
+            xticklabels=labels, yticklabels=labels,
+            cmap="Blues", ax=axes[0])
+axes[0].set_xlabel("Next segment")
+axes[0].set_ylabel("Current segment")
+axes[0].set_title("Learned transition probabilities")
+
+for i, label in enumerate(labels):
+    axes[1].plot(dur_probs[i], label=label)
+axes[1].set_xlabel("Duration (positions)")
+axes[1].set_ylabel("Probability")
+axes[1].set_title("Learned duration distributions")
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig("learned_splicing_structure.png")
+```
+
+This might reveal, for example:
+- CDS → intron and intron → CDS have high probability (expected for splicing)
+- intron → intron is near zero (introns don't self-transition)
+- Introns have a broader duration distribution than exons
+- 5'UTR → CDS is common, but CDS → 5'UTR is rare (directional gene structure)
 
 ## Integration examples
 
@@ -381,9 +426,35 @@ class BiLSTMSemiCRF(nn.Module):
         return log_Z, edge
 ```
 
-## Training
+## What to do with the outputs
 
-The standard training objective is **conditional log-likelihood**:
+### Understanding `log_Z` (the log partition function)
+
+When you call `crf.logpartition(edge, lengths)`, you get back `log_Z`, a tensor
+of shape `(batch,)`. This is the **log partition function** - the log of the
+sum of exponentiated scores over all possible segmentations:
+
+```
+log_Z = log( Σ_{all segmentations y} exp(score(y)) )
+```
+
+By itself, `log_Z` is just a number. Its purpose is as a **normalizer** that
+turns raw scores into probabilities. You'll use it in two main ways:
+
+1. **Training**: Compute the loss as `log_Z - score(gold_segmentation)`
+2. **Inference**: Compare `log_Z` across different inputs or use marginals
+
+### Training: Computing the loss
+
+The standard training objective is **conditional log-likelihood**. The loss
+for a single example is:
+
+```
+loss = log_Z - score(gold_segmentation)
+```
+
+This pushes the model to assign high scores to the correct segmentation
+relative to all other possible segmentations.
 
 ```python
 def compute_loss(model, x, lengths, gold_edges):
@@ -406,11 +477,105 @@ def compute_loss(model, x, lengths, gold_edges):
     return loss
 ```
 
-For creating `gold_edges` from label sequences, use `SemiMarkov.to_parts()`:
+**Preparing your labels:**
+
+Your ground truth labels need to be converted to edge format. Use
+`SemiMarkov.to_parts()`:
 
 ```python
-# labels: (batch, T) with -1 for continuation, 0..C-1 for segment starts
+# labels: (batch, T) tensor
+# -1 = continuation of previous segment
+# 0, 1, 2, ... = segment of that class starts here
+#
+# Example: [0, -1, -1, 1, -1, 2] means:
+#   - Class 0 segment from position 0-2
+#   - Class 1 segment from position 3-4
+#   - Class 2 segment at position 5
+
 gold_edges = SemiMarkov.to_parts(labels, extra=(C, K))
+# gold_edges: (batch, T-1, K, C, C) with 1s at segment boundaries
+```
+
+**Complete training loop:**
+
+```python
+model = MambaSemiCRF(input_dim=4, hidden_dim=256, K=8, C=5)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        x, labels, lengths = batch
+
+        # Convert labels to edge format
+        gold_edges = SemiMarkov.to_parts(labels, extra=(C, K)).float().to(x.device)
+
+        # Forward pass
+        log_Z, edge = model(x, lengths)
+
+        # Compute loss
+        gold_score = (edge * gold_edges).sum(dim=(1, 2, 3, 4))
+        loss = (log_Z - gold_score).mean()
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+```
+
+### Inference: Decoding the best segmentation
+
+To get the most likely segmentation (Viterbi decoding), use `MaxSemiring`:
+
+```python
+from torch_semimarkov import SemiMarkov
+from torch_semimarkov.semirings import MaxSemiring
+
+def decode(model, x, lengths):
+    """Get the most likely segmentation."""
+    # Get edge potentials from your model
+    hidden = model.encoder(x)
+    edge = model.head(hidden)
+
+    # Viterbi decoding with MaxSemiring
+    crf_max = SemiMarkov(MaxSemiring)
+    best_score, _ = crf_max.logpartition(edge, lengths=lengths)
+
+    # Get the actual segmentation via marginals
+    _, edge_marginals = crf_max.marginals(edge, lengths=lengths)
+
+    # edge_marginals now contains 1s at the best path edges
+    return edge_marginals, best_score
+```
+
+**Converting predictions back to labels:**
+
+```python
+# edge_marginals: (batch, T-1, K, C, C) with 1s at predicted boundaries
+predicted_labels, (C, K) = SemiMarkov.from_parts(edge_marginals)
+# predicted_labels: (batch, T) with -1 for continuation, class indices for starts
+```
+
+**Extracting segment boundaries:**
+
+```python
+def extract_segments(labels):
+    """Convert label sequence to list of (start, end, class) tuples."""
+    segments = []
+    current_start = 0
+    current_class = labels[0].item()
+
+    for i, label in enumerate(labels[1:], 1):
+        if label.item() != -1:  # New segment starts
+            segments.append((current_start, i, current_class))
+            current_start = i
+            current_class = label.item()
+
+    # Don't forget the last segment
+    segments.append((current_start, len(labels), current_class))
+    return segments
+
+# Example output: [(0, 3, 0), (3, 5, 1), (5, 6, 2)]
+# Meaning: class 0 from 0-3, class 1 from 3-5, class 2 from 5-6
 ```
 
 ## Performance tips
