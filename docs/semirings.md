@@ -182,7 +182,7 @@ $$
 H(Q, P) = -\sum_{\pi} Q(\pi)\,\log P(\pi)
 $$
 
-A common special case is when $Q$ is a delta distribution on the gold path $\pi^*$. Then:
+A common special case is when $Q$ is a delta distribution on the gold path $\pi^{*}$. Then:
 
 $$
 H(\delta_{\pi^*}, P) = -\log P(\pi^*) = \log Z - \text{score}(\pi^*)
