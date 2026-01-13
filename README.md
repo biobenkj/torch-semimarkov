@@ -54,7 +54,7 @@ These properties also make Semi-Markov CRFs natural structured decoders for neur
 pip install torch-semimarkov
 
 # Development installation
-git clone https://github.com/benjohnson/torch-semimarkov.git
+git clone https://github.com/biobenkj/torch-semimarkov.git
 cd torch-semimarkov
 pip install -e ".[dev]"
 
@@ -105,10 +105,12 @@ partition = semi_crf_triton_forward(edge, lengths)
 
 ## Documentation
 
-- [Parameter guide: T, K, C](docs/parameter_guide.md)
-- [Backends and Triton kernel](docs/backends.md)
-- [Benchmarking](docs/benchmarks.md)
-- [API reference](docs/api.md)
+- [Integration guide](docs/workflow_integration.md) — how to use torch-semimarkov with BERT, Mamba, CNNs, and other encoders
+- [Parameter guide: T, K, C](docs/parameter_guide.md) — understanding sequence length, duration, and state dimensions
+- [Semirings guide](docs/semirings.md) - context and intuition for semirings used in torch-semimarkov
+- [Backends and Triton kernel](docs/backends.md) — algorithm selection and GPU acceleration
+- [API reference](docs/api.md) — detailed API documentation
+- [Benchmarking](docs/benchmarks.md) — performance measurement
 - [AI disclosure](docs/disclosure.md)
 
 ## Testing
