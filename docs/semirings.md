@@ -185,7 +185,7 @@ $$
 A common special case is when $Q$ is a delta distribution on the gold path $\pi^{*}$. Then:
 
 $$
-H(\delta_{\pi^*}, P) = -\log P(\pi^*) = \log Z - \text{score}(\pi^*)
+H(\delta_{\pi^{*}}, P) = -\log P(\pi^{*}) = \log Z - \text{score}(\pi^{*})
 $$
 
 You can always compute this "by hand" with `LogSemiring` as `log_Z - gold_score`. The motivation for `CrossEntropySemiring` is that it can compute a cross-entropy quantity *directly in the semiring*, which can be convenient and sometimes more numerically stable depending on the target representation.
