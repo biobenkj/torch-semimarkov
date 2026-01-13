@@ -1,5 +1,8 @@
 # API reference
 
+For practical usage examples showing how to integrate these APIs with neural
+network encoders, see the [Integration guide](workflow_integration.md).
+
 ## SemiMarkov
 
 ```python

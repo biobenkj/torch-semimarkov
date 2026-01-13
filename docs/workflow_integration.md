@@ -4,6 +4,17 @@ This guide shows how to use `torch-semimarkov` as a structured prediction layer
 on top of upstream encoders like transformers, Mamba SSMs, CNNs, or any
 sequence model.
 
+## Contents
+
+- [Conceptual model](#conceptual-model) — how the pieces fit together
+- [Two parameterization approaches](#two-parameterization-approaches) — direct edge potentials vs. HSMM factorization
+- [Integration examples](#integration-examples) — BERT, Mamba, CNN, BiLSTM
+- [What to do with the outputs](#what-to-do-with-the-outputs) — training, loss computation, decoding
+- [Performance tips](#performance-tips) — Triton kernel, vectorized scan, batching
+- [Memory considerations](#memory-considerations) — streaming vs. vectorized tradeoffs
+- [Common patterns](#common-patterns) — genomics, NLP, time series
+- [Beyond point predictions](#beyond-point-predictions-uncertainty-at-segment-boundaries) — uncertainty quantification at segment boundaries
+
 ## Conceptual model
 
 ```
@@ -602,10 +613,10 @@ The semi-CRF layer adds minimal overhead to your model:
 - **Streaming scan** (default): O(KC) memory for the ring buffer, independent
   of sequence length. For typical values (K=100, C=8), this is negligible.
 - **Vectorized scan**: O(TKC) memory, scaling with sequence length. Use when
-  you have memory headroom and want 2-3x faster training.
+  you have memory headroom as it is slightly faster than the streaming approach under various use cases.
 
 In practice, your encoder (transformer, Mamba, etc.) will dominate memory.
-The semi-CRF inference layer is lightweight by comparison.
+The semi-CRF inference layer is now lightweight by comparison.
 
 ## Common patterns
 
