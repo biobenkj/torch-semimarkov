@@ -105,7 +105,7 @@ partition = semi_crf_triton_forward(edge, lengths)
 
 ## Documentation
 
-- **[Integration guide](docs/workflow_integration.md)** — how to use torch-semimarkov with BERT, Mamba, CNNs, and other encoders
+- [Integration guide](docs/workflow_integration.md) — how to use torch-semimarkov with BERT, Mamba, CNNs, and other encoders
 - [Parameter guide: T, K, C](docs/parameter_guide.md) — understanding sequence length, duration, and state dimensions
 - [Backends and Triton kernel](docs/backends.md) — algorithm selection and GPU acceleration
 - [API reference](docs/api.md) — detailed API documentation
