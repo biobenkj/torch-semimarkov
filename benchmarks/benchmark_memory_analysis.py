@@ -7,12 +7,10 @@ Generates data for:
 2. Time vs state-space size plots (with median/IQR)
 3. Memory breakdown by allocation category
 
-Addresses reviewer feedback:
-- Consistent units (GB with 2 sig figs)
-- Colorblind-safe output (blue/orange scheme recommended)
-- Memory breakdown: DP state, potentials, workspace, autograd
-- Reports both max_memory_allocated and max_memory_reserved
-- Time per position normalization
+Supports:
+- Multiple backends including Triton-accelerated scan
+- Forward-only, backward-only, or combined timing
+- Different semirings (Log, Max, Entropy, etc.)
 
 Example:
     python benchmarks/benchmark_memory_analysis.py \
@@ -22,6 +20,8 @@ Example:
         --C 3,6,9,12 \
         --B 4 \
         --repeats 5 \
+        --phases both \
+        --semirings Log,Max \
         --output-dir results/
 """
 
@@ -37,8 +37,19 @@ from pathlib import Path
 import torch
 
 from torch_semimarkov import SemiMarkov
-from torch_semimarkov.semirings import LogSemiring
+from torch_semimarkov.semirings import LogSemiring, MaxSemiring, EntropySemiring
 from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
+from torch_semimarkov.triton_scan import semi_crf_triton_forward, HAS_TRITON
+
+# Mapping of semiring names to classes
+SEMIRING_MAP = {
+    "Log": LogSemiring,
+    "Max": MaxSemiring,
+    "Entropy": EntropySemiring,
+}
+
+# Backends that only work with LogSemiring (due to hardcoded logsumexp)
+LOG_SEMIRING_ONLY_BACKENDS = {"triton", "triton_pytorch"}
 
 
 @dataclass
@@ -51,6 +62,8 @@ class BenchmarkResult:
     B: int
     KC: int  # state-space size
     backend: str
+    semiring: str  # "Log", "Max", "Entropy", etc.
+    phase: str  # "forward", "backward", "both"
 
     # Timing (all runs)
     time_ms_median: float
@@ -181,6 +194,24 @@ def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> d
         workspace_bytes = B * KC * KC * float_bytes  # dense conversion overhead
         autograd_bytes = B * N * KC * KC * float_bytes
 
+    elif backend in ("triton", "triton_pytorch"):
+        # Triton scan uses O(K*C) ring buffer, same as streaming scan
+        # triton: Fused GPU kernel with ring buffer in L1/L2
+        # triton_pytorch: Reference PyTorch implementation (same algorithm)
+        # Ring buffer: (B, K, C_PAD) where C_PAD = next_power_of_2(C)
+        C_PAD = 1
+        while C_PAD < C:
+            C_PAD *= 2
+        ring_buffer_bytes = B * K * C_PAD * float_bytes
+        # Output partition: (B,)
+        output_bytes = B * float_bytes
+        dp_state_bytes = ring_buffer_bytes + output_bytes
+        # Workspace: minimal for triton (fused kernel)
+        workspace_bytes = B * C * float_bytes  # final_beta temporary
+        # Autograd: Triton uses gradient checkpointing (recomputes forward in backward)
+        # So autograd memory is primarily the saved edge tensor
+        autograd_bytes = potentials_bytes
+
     else:
         dp_state_bytes = 0
         workspace_bytes = 0
@@ -237,8 +268,22 @@ def run_single_benchmark(
     backend: str,
     device: torch.device,
     repeats: int = 5,
+    semiring_name: str = "Log",
+    phase: str = "both",
 ) -> BenchmarkResult:
-    """Run a single benchmark configuration."""
+    """Run a single benchmark configuration.
+
+    Args:
+        T: Sequence length
+        K: Maximum duration
+        C: Number of labels
+        B: Batch size
+        backend: Backend name (linear_scan, triton, etc.)
+        device: Torch device
+        repeats: Number of repetitions for timing
+        semiring_name: Semiring to use ("Log", "Max", "Entropy")
+        phase: "forward" (forward only), "backward" (backward only), or "both"
+    """
 
     KC = K * C
     result_base = {
@@ -248,13 +293,19 @@ def run_single_benchmark(
         "B": B,
         "KC": KC,
         "backend": backend,
+        "semiring": semiring_name,
+        "phase": phase,
     }
 
     # Estimate memory breakdown
     breakdown = estimate_memory_breakdown(T, K, C, B, backend)
 
+    # Get semiring class
+    semiring_cls = SEMIRING_MAP.get(semiring_name, LogSemiring)
+
     try:
-        struct = SemiMarkov(LogSemiring)
+        # Create struct with appropriate semiring
+        struct = SemiMarkov(semiring_cls)
 
         # Create potentials
         edge = torch.randn(B, T - 1, K, C, C, device=device, requires_grad=False)
@@ -264,46 +315,61 @@ def run_single_benchmark(
         peak_allocated = 0
         peak_reserved = 0
 
+        def run_backend_forward(edge_input, struct_to_use):
+            """Run forward pass for the specified backend, returning partition value."""
+            if backend == "triton":
+                # Triton-accelerated scan (LogSemiring only)
+                return semi_crf_triton_forward(edge_input, lengths, use_triton=True)
+            elif backend == "triton_pytorch":
+                # PyTorch reference for Triton (LogSemiring only)
+                return semi_crf_triton_forward(edge_input, lengths, use_triton=False)
+            elif backend == "binary_tree":
+                v, _ = struct_to_use.logpartition(edge_input, lengths=lengths, use_linear_scan=False)
+                return v
+            elif backend == "linear_scan":
+                v, _, _ = struct_to_use._dp_standard(edge_input, lengths, force_grad=True)
+                return v
+            elif backend == "linear_scan_vectorized":
+                v, _, _ = struct_to_use._dp_standard_vectorized(edge_input, lengths, force_grad=True)
+                return v
+            elif backend == "banded":
+                v, _, _ = struct_to_use.logpartition(
+                    edge_input,
+                    lengths=lengths,
+                    use_linear_scan=True,
+                    use_vectorized=True,
+                    use_banded=True,
+                    banded_perm="auto",
+                    banded_bw_ratio=0.6,
+                )
+                return v
+            elif backend == "block_triangular":
+                if hasattr(struct_to_use, "_dp_blocktriangular"):
+                    v, _, _ = struct_to_use._dp_blocktriangular(edge_input, lengths, force_grad=True)
+                    return v
+                else:
+                    raise NotImplementedError("block_triangular not available")
+            elif backend == "binary_tree_sharded":
+                # Use CheckpointShardSemiring to reduce peak memory
+                ShardedSemiring = CheckpointShardSemiring(semiring_cls, max_size=10000)
+                struct_sharded = SemiMarkov(ShardedSemiring)
+                v, _ = struct_sharded.logpartition(edge_input, lengths=lengths, use_linear_scan=False)
+                return v
+            elif backend == "linear_scan_streaming":
+                v, _, _ = struct_to_use._dp_scan_streaming(edge_input, lengths, force_grad=True)
+                return v
+            else:
+                raise ValueError(f"Unknown backend: {backend}")
+
         # Warmup run (not recorded) to stabilize CUDA state
+        # IMPORTANT: Run the exact same computation as the timed run for accurate warmup
         if device.type == "cuda":
             edge_warmup = edge.clone().detach().requires_grad_(True)
             try:
-                if backend == "binary_tree":
-                    v_warm, _ = struct.logpartition(
-                        edge_warmup, lengths=lengths, use_linear_scan=False
-                    )
-                elif backend == "linear_scan":
-                    v_warm, _, _ = struct._dp_standard(edge_warmup, lengths, force_grad=True)
-                elif backend == "linear_scan_vectorized":
-                    v_warm, _, _ = struct._dp_standard_vectorized(
-                        edge_warmup, lengths, force_grad=True
-                    )
-                elif backend == "banded":
-                    v_warm, _, _ = struct.logpartition(
-                        edge_warmup,
-                        lengths=lengths,
-                        use_linear_scan=True,
-                        use_vectorized=True,
-                        use_banded=True,
-                        banded_perm="auto",
-                        banded_bw_ratio=0.6,
-                    )
-                elif backend == "block_triangular":
-                    if hasattr(struct, "_dp_blocktriangular"):
-                        v_warm, _, _ = struct._dp_blocktriangular(
-                            edge_warmup, lengths, force_grad=True
-                        )
-                elif backend == "binary_tree_sharded":
-                    # Use CheckpointShardSemiring to reduce peak memory
-                    ShardedLogSemiring = CheckpointShardSemiring(LogSemiring, max_size=10000)
-                    struct_sharded = SemiMarkov(ShardedLogSemiring)
-                    v_warm, _ = struct_sharded.logpartition(
-                        edge_warmup, lengths=lengths, use_linear_scan=False
-                    )
-                elif backend == "linear_scan_streaming":
-                    # True streaming scan with O(K*C) DP state
-                    v_warm, _, _ = struct._dp_scan_streaming(edge_warmup, lengths, force_grad=True)
-                v_warm.sum().backward()
+                v_warm = run_backend_forward(edge_warmup, struct)
+                # Warmup backward pass too if we're timing backward
+                if phase in ("backward", "both"):
+                    v_warm.sum().backward()
                 del edge_warmup, v_warm
             except Exception:
                 pass  # If warmup fails, actual run will catch it
@@ -320,52 +386,40 @@ def run_single_benchmark(
 
             gc.collect()
 
-            edge_run = edge.clone().detach().requires_grad_(True)
+            # Only need gradients if running backward pass
+            needs_grad = phase in ("backward", "both")
+            edge_run = edge.clone().detach().requires_grad_(needs_grad)
 
-            t0 = time.perf_counter()
+            # Phase-aware timing
+            if phase == "forward":
+                # Forward only - no backward pass
+                t0 = time.perf_counter()
+                v = run_backend_forward(edge_run, struct)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                loss = None
+            elif phase == "backward":
+                # Run forward (untimed), then time backward only
+                v = run_backend_forward(edge_run, struct)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                t0 = time.perf_counter()
+                loss = v.sum()
+                loss.backward()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            else:  # phase == "both"
+                # Time forward + backward together (original behavior)
+                t0 = time.perf_counter()
+                v = run_backend_forward(edge_run, struct)
+                loss = v.sum()
+                loss.backward()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-            # Run the appropriate backend
-            if backend == "binary_tree":
-                v, _ = struct.logpartition(edge_run, lengths=lengths, use_linear_scan=False)
-            elif backend == "linear_scan":
-                v, _, _ = struct._dp_standard(edge_run, lengths, force_grad=True)
-            elif backend == "linear_scan_vectorized":
-                v, _, _ = struct._dp_standard_vectorized(edge_run, lengths, force_grad=True)
-            elif backend == "banded":
-                v, _, _ = struct.logpartition(
-                    edge_run,
-                    lengths=lengths,
-                    use_linear_scan=True,
-                    use_vectorized=True,
-                    use_banded=True,
-                    banded_perm="auto",
-                    banded_bw_ratio=0.6,
-                )
-            elif backend == "block_triangular":
-                if hasattr(struct, "_dp_blocktriangular"):
-                    v, _, _ = struct._dp_blocktriangular(edge_run, lengths, force_grad=True)
-                else:
-                    raise NotImplementedError("block_triangular not available")
-            elif backend == "binary_tree_sharded":
-                # Use CheckpointShardSemiring to reduce peak memory at cost of time
-                # This is a "fair" tree baseline that doesn't suffer from O((KC)^3) peak
-                ShardedLogSemiring = CheckpointShardSemiring(LogSemiring, max_size=10000)
-                struct_sharded = SemiMarkov(ShardedLogSemiring)
-                v, _ = struct_sharded.logpartition(edge_run, lengths=lengths, use_linear_scan=False)
-            elif backend == "linear_scan_streaming":
-                # True streaming scan: O(K*C) DP state, matches paper's memory narrative
-                v, _, _ = struct._dp_scan_streaming(edge_run, lengths, force_grad=True)
-            else:
-                raise ValueError(f"Unknown backend: {backend}")
-
-            # Backward pass
-            loss = v.sum()
-            loss.backward()
-
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             times_ms.append(elapsed_ms)
 
             if device.type == "cuda":
@@ -373,7 +427,9 @@ def run_single_benchmark(
                 peak_reserved = max(peak_reserved, torch.cuda.max_memory_reserved(device))
 
             # Clean up (no empty_cache here - only between configs, not repeats)
-            del edge_run, v, loss
+            del edge_run, v
+            if loss is not None:
+                del loss
             gc.collect()
 
         # Compute statistics
@@ -459,7 +515,32 @@ def main():
         "--backends",
         type=str,
         default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,block_triangular",
-        help="Comma-separated list of backends. linear_scan_streaming has O(K*C) DP state. binary_tree_sharded uses CheckpointShardSemiring.",
+        help=(
+            "Comma-separated list of backends. Options: "
+            "linear_scan, linear_scan_vectorized, linear_scan_streaming, "
+            "binary_tree, binary_tree_sharded, block_triangular, "
+            "triton (GPU Triton kernel), triton_pytorch (PyTorch reference). "
+            "Note: triton/triton_pytorch only work with Log semiring."
+        ),
+    )
+    parser.add_argument(
+        "--semirings",
+        type=str,
+        default="Log",
+        help=(
+            "Comma-separated list of semirings. Options: Log, Max, Entropy. "
+            "Note: triton/triton_pytorch backends only support Log semiring."
+        ),
+    )
+    parser.add_argument(
+        "--phases",
+        type=str,
+        default="both",
+        help=(
+            "Comma-separated list of phases to time. Options: "
+            "forward (forward pass only), backward (backward pass only), "
+            "both (forward + backward together). Default: both"
+        ),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument(
@@ -481,21 +562,46 @@ def main():
     K_list = parse_int_list(args.K)
     C_list = parse_int_list(args.C)
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
+    semirings = [s.strip() for s in args.semirings.split(",") if s.strip()]
+    phases = [p.strip() for p in args.phases.split(",") if p.strip()]
+
+    # Validate semirings
+    for s in semirings:
+        if s not in SEMIRING_MAP:
+            print(f"WARNING: Unknown semiring '{s}', available: {list(SEMIRING_MAP.keys())}")
+
+    # Validate phases
+    valid_phases = {"forward", "backward", "both"}
+    for p in phases:
+        if p not in valid_phases:
+            print(f"WARNING: Unknown phase '{p}', available: {valid_phases}")
+
+    # Check Triton availability if needed
+    if any(b in ("triton", "triton_pytorch") for b in backends):
+        if not HAS_TRITON:
+            print("WARNING: Triton not available, triton backend will use PyTorch fallback")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(42)
 
     results: list[BenchmarkResult] = []
-    oom_history: dict[str, list[tuple[int, int, int]]] = {b: [] for b in backends}
+    # OOM history is tracked per (backend, semiring, phase) combination
+    oom_history: dict[str, list[tuple[int, int, int]]] = {}
+    for b in backends:
+        for s in semirings:
+            for p in phases:
+                oom_history[f"{b}_{s}_{p}"] = []
 
-    total_configs = len(T_list) * len(K_list) * len(C_list) * len(backends)
+    total_configs = len(T_list) * len(K_list) * len(C_list) * len(backends) * len(semirings) * len(phases)
     completed = 0
 
     print(f"Running {total_configs} configurations...")
     print(f"Device: {device}")
     print(f"T: {T_list}, K: {K_list}, C: {C_list}, B: {args.B}")
     print(f"Backends: {backends}")
+    print(f"Semirings: {semirings}")
+    print(f"Phases: {phases}")
     print(f"Repeats: {args.repeats}")
     print("-" * 80)
 
@@ -504,55 +610,92 @@ def main():
             for C in C_list:
                 KC = K * C
                 for backend in backends:
-                    completed += 1
+                    for semiring_name in semirings:
+                        for phase in phases:
+                            completed += 1
+                            oom_key = f"{backend}_{semiring_name}_{phase}"
 
-                    # Check if we should skip
-                    if args.skip_adjacent_oom:
-                        skip, reason = should_skip_config(
-                            T, K, C, backend, oom_history, args.max_memory_gb
-                        )
-                        if skip:
-                            print(
-                                f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, KC={KC}, {backend}: {reason}"
-                            )
-                            results.append(
-                                BenchmarkResult(
-                                    T=T,
-                                    K=K,
-                                    C=C,
-                                    B=args.B,
-                                    KC=KC,
-                                    backend=backend,
-                                    time_ms_median=float("nan"),
-                                    time_ms_iqr_low=float("nan"),
-                                    time_ms_iqr_high=float("nan"),
-                                    time_per_position_ms=float("nan"),
-                                    peak_allocated_gb=float("nan"),
-                                    peak_reserved_gb=float("nan"),
-                                    status="not_tested",
-                                    error_msg=reason,
+                            # Check backend/semiring compatibility
+                            if backend in LOG_SEMIRING_ONLY_BACKENDS and semiring_name != "Log":
+                                print(
+                                    f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: "
+                                    f"{backend} only supports Log semiring"
                                 )
+                                results.append(
+                                    BenchmarkResult(
+                                        T=T,
+                                        K=K,
+                                        C=C,
+                                        B=args.B,
+                                        KC=KC,
+                                        backend=backend,
+                                        semiring=semiring_name,
+                                        phase=phase,
+                                        time_ms_median=float("nan"),
+                                        time_ms_iqr_low=float("nan"),
+                                        time_ms_iqr_high=float("nan"),
+                                        time_per_position_ms=float("nan"),
+                                        peak_allocated_gb=float("nan"),
+                                        peak_reserved_gb=float("nan"),
+                                        status="not_supported",
+                                        error_msg=f"{backend} only supports Log semiring",
+                                    )
+                                )
+                                continue
+
+                            # Check if we should skip based on OOM history
+                            if args.skip_adjacent_oom:
+                                # Use backend-only key for memory estimation (semiring doesn't affect memory much)
+                                skip, reason = should_skip_config(
+                                    T, K, C, backend, {backend: oom_history.get(oom_key, [])}, args.max_memory_gb
+                                )
+                                if skip:
+                                    print(
+                                        f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: {reason}"
+                                    )
+                                    results.append(
+                                        BenchmarkResult(
+                                            T=T,
+                                            K=K,
+                                            C=C,
+                                            B=args.B,
+                                            KC=KC,
+                                            backend=backend,
+                                            semiring=semiring_name,
+                                            phase=phase,
+                                            time_ms_median=float("nan"),
+                                            time_ms_iqr_low=float("nan"),
+                                            time_ms_iqr_high=float("nan"),
+                                            time_per_position_ms=float("nan"),
+                                            peak_allocated_gb=float("nan"),
+                                            peak_reserved_gb=float("nan"),
+                                            status="not_tested",
+                                            error_msg=reason,
+                                        )
+                                    )
+                                    continue
+
+                            print(
+                                f"[{completed}/{total_configs}] T={T}, K={K}, C={C}, KC={KC}, {backend}/{semiring_name}/{phase}...",
+                                end=" ",
+                                flush=True,
                             )
-                            continue
 
-                    print(
-                        f"[{completed}/{total_configs}] T={T}, K={K}, C={C}, KC={KC}, {backend}...",
-                        end=" ",
-                        flush=True,
-                    )
+                            result = run_single_benchmark(
+                                T, K, C, args.B, backend, device, args.repeats,
+                                semiring_name=semiring_name, phase=phase
+                            )
+                            results.append(result)
 
-                    result = run_single_benchmark(T, K, C, args.B, backend, device, args.repeats)
-                    results.append(result)
-
-                    if result.status == "success":
-                        print(
-                            f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved"
-                        )
-                    elif result.status == "oom":
-                        print("OOM")
-                        oom_history[backend].append((T, K, C))
-                    else:
-                        print(f"{result.status}: {result.error_msg}")
+                            if result.status == "success":
+                                print(
+                                    f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved"
+                                )
+                            elif result.status == "oom":
+                                print("OOM")
+                                oom_history[oom_key].append((T, K, C))
+                            else:
+                                print(f"{result.status}: {result.error_msg}")
 
     # Save results
     # 1. Full CSV with all metrics
@@ -569,9 +712,15 @@ def main():
     heatmap_path = args.output_dir / "heatmap_data.json"
     heatmap_data = {}
     for r in results:
-        key = f"{r.backend}_T{r.T}"
+        key = f"{r.backend}_{r.semiring}_{r.phase}_T{r.T}"
         if key not in heatmap_data:
-            heatmap_data[key] = {"backend": r.backend, "T": r.T, "cells": []}
+            heatmap_data[key] = {
+                "backend": r.backend,
+                "semiring": r.semiring,
+                "phase": r.phase,
+                "T": r.T,
+                "cells": [],
+            }
         heatmap_data[key]["cells"].append(
             {
                 "K": r.K,
@@ -590,6 +739,8 @@ def main():
     breakdown_path = args.output_dir / "memory_breakdown.csv"
     breakdown_fields = [
         "backend",
+        "semiring",
+        "phase",
         "T",
         "K",
         "C",
@@ -609,6 +760,8 @@ def main():
             writer.writerow(
                 {
                     "backend": r.backend,
+                    "semiring": r.semiring,
+                    "phase": r.phase,
                     "T": r.T,
                     "K": r.K,
                     "C": r.C,
@@ -629,22 +782,31 @@ def main():
     print("SUMMARY")
     print("=" * 80)
     for backend in backends:
-        backend_results = [r for r in results if r.backend == backend]
-        success = sum(1 for r in backend_results if r.status == "success")
-        oom = sum(1 for r in backend_results if r.status == "oom")
-        skipped = sum(1 for r in backend_results if r.status == "not_tested")
+        for semiring_name in semirings:
+            for phase in phases:
+                key_results = [
+                    r for r in results
+                    if r.backend == backend and r.semiring == semiring_name and r.phase == phase
+                ]
+                if not key_results:
+                    continue
 
-        successful = [r for r in backend_results if r.status == "success"]
-        if successful:
-            max_kc = max(r.KC for r in successful)
-            max_mem = max(r.peak_allocated_gb for r in successful)
-        else:
-            max_kc = 0
-            max_mem = 0
+                success = sum(1 for r in key_results if r.status == "success")
+                oom = sum(1 for r in key_results if r.status == "oom")
+                skipped = sum(1 for r in key_results if r.status in ("not_tested", "not_supported"))
 
-        print(
-            f"{backend:25s}: {success:3d} success, {oom:3d} OOM, {skipped:3d} skipped | max KC={max_kc:4d}, max mem={max_mem:.2f}GB"
-        )
+                successful = [r for r in key_results if r.status == "success"]
+                if successful:
+                    max_kc = max(r.KC for r in successful)
+                    max_mem = max(r.peak_allocated_gb for r in successful)
+                else:
+                    max_kc = 0
+                    max_mem = 0
+
+                label = f"{backend}/{semiring_name}/{phase}"
+                print(
+                    f"{label:40s}: {success:3d} success, {oom:3d} OOM, {skipped:3d} skipped | max KC={max_kc:4d}, max mem={max_mem:.2f}GB"
+                )
 
 
 if __name__ == "__main__":
