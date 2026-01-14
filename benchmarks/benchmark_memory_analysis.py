@@ -692,13 +692,16 @@ def main():
     print(f"Triton use_compile: {args.use_compile}")
     print("-" * 80)
 
-    for T in T_list:
-        for K in K_list:
-            for C in C_list:
-                KC = K * C
-                for backend in backends:
-                    for semiring_name in semirings:
-                        for phase in phases:
+    for backend in backends:
+        for semiring_name in semirings:
+            # Reset caches once per backend/semiring pair to avoid state issues
+            if args.use_compile and backend in ("triton", "triton_pytorch", "triton_checkpointing"):
+                reset_compile_caches()
+            for phase in phases:
+                for T in T_list:
+                    for K in K_list:
+                        for C in C_list:
+                            KC = K * C
                             completed += 1
                             oom_key = f"{backend}_{semiring_name}_{phase}"
 
@@ -803,11 +806,6 @@ def main():
                                 end=" ",
                                 flush=True,
                             )
-
-                            # Reset caches for triton backends to avoid state issues
-                            # between different semiring configurations
-                            if backend in ("triton", "triton_pytorch", "triton_checkpointing"):
-                                reset_compile_caches()
 
                             result = run_single_benchmark(
                                 T,

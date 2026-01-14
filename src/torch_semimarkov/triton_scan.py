@@ -510,12 +510,6 @@ if HAS_TRITON:
         edge = edge.contiguous()
         lengths = lengths.contiguous()
 
-        # Verify CUDA tensors (helps debug "cpu tensor" errors)
-        if not edge.is_cuda:
-            raise ValueError(f"edge must be a CUDA tensor, got device={edge.device}")
-        if not lengths.is_cuda:
-            raise ValueError(f"lengths must be a CUDA tensor, got device={lengths.device}")
-
         # Allocate ring buffer with padded C (small, will be L2 cached)
         ring_buffer = torch.empty((batch, K, C_PAD), device=edge.device, dtype=edge.dtype)
 
