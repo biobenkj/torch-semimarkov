@@ -159,7 +159,9 @@ def semi_crf_forward_pytorch(edge, lengths, semiring="log"):
         head_idx = torch.tensor([head], device=device, dtype=torch.long)
         # Expand beta_n to match ring buffer shape for scatter
         beta_n_expanded = beta_n.unsqueeze(0)  # (1, batch, C)
-        beta_ring = beta_ring.scatter(0, head_idx.view(1, 1, 1).expand(1, batch, C), beta_n_expanded)
+        beta_ring = beta_ring.scatter(
+            0, head_idx.view(1, 1, 1).expand(1, batch, C), beta_n_expanded
+        )
 
     # Final partition: reduction over labels
     if semiring == "log":

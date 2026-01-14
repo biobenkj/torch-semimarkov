@@ -41,6 +41,7 @@ from torch_semimarkov.semirings import EntropySemiring, LogSemiring, MaxSemiring
 from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
 from torch_semimarkov.triton_scan import HAS_TRITON, semi_crf_triton_forward
 
+
 # Reset torch.compile caches to avoid state issues between configurations
 def reset_compile_caches():
     """Reset torch.compile and triton caches to avoid inter-configuration issues."""
@@ -51,10 +52,12 @@ def reset_compile_caches():
     # Also reset the module-level compiled function caches
     try:
         import torch_semimarkov.triton_scan as ts
+
         ts._compiled_forward_log = None
         ts._compiled_forward_max = None
     except Exception:
         pass
+
 
 # Mapping of semiring names to classes
 SEMIRING_MAP = {

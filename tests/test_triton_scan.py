@@ -241,9 +241,9 @@ def test_triton_log_kernel_cuda():
     # Compare with CPU reference
     ref = semi_crf_triton_forward(edge.cpu(), lengths.cpu(), semiring="log")
 
-    assert torch.allclose(result.cpu(), ref, atol=1e-5), (
-        f"CUDA/CPU mismatch: max diff {(result.cpu() - ref).abs().max()}"
-    )
+    assert torch.allclose(
+        result.cpu(), ref, atol=1e-5
+    ), f"CUDA/CPU mismatch: max diff {(result.cpu() - ref).abs().max()}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -265,9 +265,9 @@ def test_triton_max_kernel_cuda():
     # Compare with CPU reference
     ref = semi_crf_triton_forward(edge.cpu(), lengths.cpu(), semiring="max")
 
-    assert torch.allclose(result.cpu(), ref, atol=1e-5), (
-        f"CUDA/CPU mismatch: max diff {(result.cpu() - ref).abs().max()}"
-    )
+    assert torch.allclose(
+        result.cpu(), ref, atol=1e-5
+    ), f"CUDA/CPU mismatch: max diff {(result.cpu() - ref).abs().max()}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
