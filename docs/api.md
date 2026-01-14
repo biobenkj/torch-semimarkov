@@ -56,7 +56,7 @@ from torch_semimarkov.semirings.checkpoint import (
 )
 ```
 
-## Triton fused streaming scan (up to 45x speedup)
+## Triton fused streaming scan (~45x speedup)
 
 ```python
 from torch_semimarkov.triton_scan import semi_crf_triton_forward
@@ -73,7 +73,7 @@ def semi_crf_triton_forward(
     Compute Semi-Markov CRF forward scan with hybrid optimization.
 
     Uses a hybrid approach for optimal performance:
-    - Inference (requires_grad=False): Hand-written Triton kernel (~45x faster)
+    - Inference (requires_grad=False): Custom Triton kernel (~45x faster)
     - Training (requires_grad=True): torch.compile for efficient backward
 
     Returns:
@@ -85,7 +85,7 @@ def semi_crf_triton_forward(
 
 | Context | Execution Path |
 |---------|----------------|
-| `requires_grad=False` + CUDA | Hand-written Triton kernel |
+| `requires_grad=False` + CUDA | Custom Triton kernel |
 | `requires_grad=True` + CUDA | `torch.compile` (automatic backward) |
 | CPU or Triton unavailable | PyTorch reference |
 
@@ -94,7 +94,7 @@ def semi_crf_triton_forward(
 ```python
 from torch_semimarkov.triton_scan import semi_crf_triton_forward
 
-# GPU inference: fast hand-written Triton kernel
+# GPU inference: fast custom Triton kernel
 partition = semi_crf_triton_forward(edge.cuda(), lengths.cuda())
 
 # GPU training: torch.compile for efficient backward

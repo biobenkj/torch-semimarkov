@@ -123,7 +123,7 @@ python benchmarks/benchmark_memory_analysis.py \
 | `--no-use-compile` | Use gradient checkpointing instead of torch.compile |
 
 The `triton` backend uses a hybrid approach:
-- **Inference** (`--phases forward`): Hand-written Triton kernel (~45x faster)
+- **Inference** (`--phases forward`): Custom Triton kernel (~45x faster)
 - **Training** (`--phases backward,both`): `torch.compile` for efficient backward by default
 
 Use `triton_checkpointing` backend or `--no-use-compile` to compare against the older gradient checkpointing approach.

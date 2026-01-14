@@ -329,13 +329,13 @@ def run_single_benchmark(
             """Run forward pass for the specified backend, returning partition value.
 
             For triton backends, the execution path depends on edge_input.requires_grad:
-            - requires_grad=False (inference): Hand-written Triton kernel (~45x speedup)
+            - requires_grad=False (inference): Custom Triton kernel (~45x speedup)
             - requires_grad=True + use_compile=True: torch.compile for efficient backward
             - requires_grad=True + use_compile=False: Gradient checkpointing (recomputes forward)
             """
             if backend == "triton":
                 # Triton-accelerated scan (supports Log and Max semirings)
-                # Hybrid routing: hand-written kernel for inference, torch.compile for training
+                # Hybrid routing: custom kernel for inference, torch.compile for training
                 return semi_crf_triton_forward(
                     edge_input,
                     lengths,

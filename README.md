@@ -27,7 +27,7 @@ This makes Semi-Markov CRF inference practical for genome-scale annotation witho
 **torch-semimarkov** provides:
 
 - **Streaming scan** — $O(KC)$ memory, universally applicable across genomic parameter regimes
-- **Triton fused kernel** — optional GPU acceleration with up to 45× speedup
+- **Triton fused kernel** — optional GPU acceleration with ~45x speedup
 
 ## Why Semi-Markov CRFs in genomics contexts?
 
@@ -93,11 +93,11 @@ log_Z, _ = model.logpartition(edge, lengths=lengths)
 log_Z.sum().backward()
 ```
 
-### Triton Fused Kernel (up to 45x speedup)
+### Triton Fused Kernel (~45x speedup)
 
 The Triton kernel uses a hybrid approach for optimal performance:
 
-- **Inference** (`requires_grad=False`): Hand-written Triton kernel for maximum speed
+- **Inference** (`requires_grad=False`): Custom Triton kernel for maximum speed
 - **Training** (`requires_grad=True`): `torch.compile` for efficient automatic backward pass
 
 ```python
@@ -106,7 +106,7 @@ from torch_semimarkov.triton_scan import semi_crf_triton_forward
 edge = edge.cuda()
 lengths = lengths.cuda()
 
-# Inference: uses fast hand-written Triton kernel
+# Inference: uses fast custom Triton kernel
 partition = semi_crf_triton_forward(edge, lengths)
 
 # Training: uses torch.compile for efficient backward

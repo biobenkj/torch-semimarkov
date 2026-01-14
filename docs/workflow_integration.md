@@ -595,7 +595,7 @@ def extract_segments(labels):
    ```python
    from torch_semimarkov.triton_scan import semi_crf_triton_forward
 
-   # Inference: uses fast hand-written Triton kernel (~45x speedup)
+   # Inference: uses fast custom Triton kernel (~45x speedup)
    log_Z = semi_crf_triton_forward(edge.cuda(), lengths.cuda())
 
    # Training: uses torch.compile for efficient backward
@@ -608,7 +608,7 @@ def extract_segments(labels):
    ```
 
    The kernel automatically routes to the optimal path:
-   - **Inference** (`requires_grad=False`): Hand-written Triton kernel
+   - **Inference** (`requires_grad=False`): Custom Triton kernel
    - **Training** (`requires_grad=True`): `torch.compile` for automatic backward
 
 2. **Choose K carefully**: Memory and compute scale with K. Use empirical

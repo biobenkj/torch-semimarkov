@@ -26,12 +26,12 @@ Use `use_vectorized=True` when memory permits for 2-3x speedup over scalar scan.
 Tree-based methods can exhaust GPU memory for KC > 150 because of O((KC)^3)
 log-semiring temporaries.
 
-## Triton fused streaming kernel (up to 45x speedup)
+## Triton fused streaming kernel (~45x speedup)
 
 `torch_semimarkov.triton_scan.semi_crf_triton_forward` provides a fused O(T)
 streaming scan that keeps the K x C frontier in fast memory. It mirrors the
-streaming scan but collapses the loop into a single GPU kernel, yielding up to
-45x speedup compared to the vectorized PyTorch implementation.
+streaming scan but collapses the loop into a single GPU kernel, yielding
+~45x speedup compared to the vectorized PyTorch implementation.
 
 ### Hybrid inference/training approach
 
@@ -40,12 +40,12 @@ optimal execution path based on whether gradients are needed:
 
 | Context | Path | Description |
 |---------|------|-------------|
-| **Inference** (`requires_grad=False`) | Hand-written Triton kernel | Maximum speed (~45x faster) |
+| **Inference** (`requires_grad=False`) | Custom Triton kernel | Maximum speed (~45x faster) |
 | **Training** (`requires_grad=True`) | `torch.compile` | Efficient automatic backward pass |
 | **CPU fallback** | PyTorch reference | Always available |
 
 This gives you the best of both worlds:
-- Blazing fast inference with the hand-tuned kernel
+- Blazing fast inference with the custom kernel
 - Efficient training with automatic backward pass generation via `torch.compile`
 
 ### Supported semirings
@@ -71,7 +71,7 @@ semi_crf_triton_forward(
 ### Behavior
 
 - **Inference path**: When `edge.requires_grad=False` and CUDA is available,
-  uses the hand-written Triton kernel for maximum performance.
+  uses the custom Triton kernel for maximum performance.
 - **Training path**: When `edge.requires_grad=True`, uses `torch.compile` on
   the PyTorch implementation, which generates optimized Triton kernels for
   both forward AND backward passes automatically.
@@ -88,7 +88,7 @@ semi_crf_triton_forward(
 ```python
 from torch_semimarkov.triton_scan import semi_crf_triton_forward
 
-# GPU inference: uses fast hand-written Triton kernel
+# GPU inference: uses fast custom Triton kernel
 edge = edge.cuda()
 lengths = lengths.cuda()
 partition = semi_crf_triton_forward(edge, lengths)

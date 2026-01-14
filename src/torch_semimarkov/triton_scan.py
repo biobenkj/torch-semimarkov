@@ -6,13 +6,13 @@ a single GPU kernel, keeping the :math:`K \times C` frontier in fast memory.
 
 Three execution paths are provided, automatically selected based on context:
 
-1. **Hand-written Triton kernel** (GPU inference): Maximum performance (~45x faster),
+1. **Custom Triton kernel** (GPU inference): Maximum performance (~45x faster),
    used when ``requires_grad=False`` and CUDA is available.
 2. **torch.compile** (GPU training): Uses ``torch.compile`` to generate optimized
    Triton kernels for both forward AND backward passes automatically.
 3. **PyTorch reference** (CPU/fallback): Pure PyTorch implementation, always available.
 
-The hand-written Triton kernel uses a fused scan that:
+The custom Triton kernel uses a fused scan that:
 
 - Processes one batch element per thread block
 - Maintains the ring buffer in L1/L2 cache
@@ -23,14 +23,14 @@ path score) semirings are supported.
 
 .. note::
     The hybrid approach gives optimal performance for both inference and training:
-    blazing fast inference with the hand-tuned kernel, and efficient training with
+    blazing fast inference with the custom kernel, and efficient training with
     automatic backward pass generation via ``torch.compile``.
 
 Examples::
 
     >>> from torch_semimarkov.triton_scan import semi_crf_triton_forward
     >>> import torch
-    >>> # GPU inference: uses fast hand-written Triton kernel
+    >>> # GPU inference: uses fast custom Triton kernel
     >>> edge = torch.randn(4, 99, 8, 6, 6).cuda()
     >>> lengths = torch.full((4,), 100).cuda()
     >>> partition = semi_crf_triton_forward(edge, lengths)
@@ -475,9 +475,9 @@ if HAS_TRITON:
     def launch_triton_kernel(edge, lengths, semiring="log"):
         r"""launch_triton_kernel(edge, lengths, semiring="log") -> Tensor
 
-        Launch the hand-written Triton kernel with proper buffer allocation.
+        Launch the custom Triton kernel with proper buffer allocation.
 
-        This is the fast inference path that uses hand-tuned Triton kernels for
+        This is the fast inference path that uses custom Triton kernels for
         maximum performance. Called internally by :func:`semi_crf_triton_forward`
         when ``requires_grad=False`` and CUDA is available.
 
@@ -660,14 +660,14 @@ def semi_crf_triton_forward(
     Main entry point for the fused streaming scan. Uses a hybrid approach for
     optimal performance in both inference and training:
 
-    - **Inference** (no gradients): Uses the hand-written Triton kernel for maximum
+    - **Inference** (no gradients): Uses the custom Triton kernel for maximum
       speed (~45x faster than naive PyTorch).
     - **Training** (with gradients): Uses ``torch.compile`` on the PyTorch
       implementation, which generates optimized Triton kernels for both forward
       AND backward passes automatically.
 
     This hybrid approach gives you the best of both worlds: blazing fast inference
-    with the hand-tuned kernel, and efficient training with automatic backward
+    with the custom kernel, and efficient training with automatic backward
     pass generation.
 
     See :class:`~torch_semimarkov.SemiMarkov` for the full Semi-Markov CRF model
@@ -699,7 +699,7 @@ def semi_crf_triton_forward(
         >>> lengths = torch.full((4,), 100)
         >>> # CPU: uses PyTorch fallback
         >>> partition_cpu = semi_crf_triton_forward(edge, lengths)
-        >>> # GPU inference (no grad): uses fast hand-written Triton kernel
+        >>> # GPU inference (no grad): uses fast custom Triton kernel
         >>> partition_gpu = semi_crf_triton_forward(edge.cuda(), lengths.cuda())
         >>> # GPU training (with grad): uses torch.compile for efficient backward
         >>> edge_train = edge.cuda().requires_grad_(True)
@@ -732,7 +732,7 @@ def semi_crf_triton_forward(
             # Fallback: gradient checkpointing (recomputes forward during backward)
             return SemiCRFTritonForward.apply(edge, lengths, use_triton, semiring)
     else:
-        # Inference path: use fast hand-written Triton kernel
+        # Inference path: use fast custom Triton kernel
         if HAS_TRITON and use_triton and edge.is_cuda:
             return launch_triton_kernel(edge, lengths, semiring=semiring)
         else:
