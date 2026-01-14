@@ -28,7 +28,6 @@ import pandas as pd
 # Try to import plotting libraries (optional for headless analysis)
 try:
     import matplotlib.pyplot as plt
-    import matplotlib.ticker as ticker
 
     HAS_MATPLOTLIB = True
 except ImportError:
@@ -105,9 +104,7 @@ def compute_backward_forward_ratios(df: pd.DataFrame) -> pd.DataFrame:
     # Pivot to get forward and backward times side by side
     ratios = []
 
-    for (backend, semiring, T, K, C), group in df.groupby(
-        ["backend", "semiring", "T", "K", "C"]
-    ):
+    for (backend, semiring, T, K, C), group in df.groupby(["backend", "semiring", "T", "K", "C"]):
         fwd = group[group["phase"] == "forward"]["time_ms_median"].values
         bwd = group[group["phase"] == "backward"]["time_ms_median"].values
 
@@ -133,9 +130,7 @@ def compute_semiring_overhead(df: pd.DataFrame) -> pd.DataFrame:
     """Compute overhead of each semiring relative to LogSemiring."""
     overheads = []
 
-    for (backend, phase, T, K, C), group in df.groupby(
-        ["backend", "phase", "T", "K", "C"]
-    ):
+    for (backend, phase, T, K, C), group in df.groupby(["backend", "phase", "T", "K", "C"]):
         log_time = group[group["semiring"] == "Log"]["time_ms_median"].values
 
         if len(log_time) == 0:
@@ -228,9 +223,7 @@ def compute_baseline_ratios(df: pd.DataFrame, baseline: str) -> pd.DataFrame:
                 row["time_ms_median"] / baseline_time if baseline_time > 0 else float("nan")
             )
             memory_ratio = (
-                row["peak_allocated_gb"] / baseline_memory
-                if baseline_memory > 0
-                else float("nan")
+                row["peak_allocated_gb"] / baseline_memory if baseline_memory > 0 else float("nan")
             )
 
             ratios.append(
@@ -384,9 +377,12 @@ def plot_throughput(
     fig, ax = plt.subplots(figsize=(8, 6))
 
     for backend in subset["backend"].unique():
-        data = subset[subset["backend"] == backend].groupby("KC").agg(
-            {"positions_per_sec": "median"}
-        ).reset_index()
+        data = (
+            subset[subset["backend"] == backend]
+            .groupby("KC")
+            .agg({"positions_per_sec": "median"})
+            .reset_index()
+        )
         if len(data) > 1:
             ax.plot(
                 data["KC"],
@@ -434,7 +430,7 @@ def plot_backward_forward_ratio(
         means.append(data.mean())
         stds.append(data.std())
 
-    bars = ax.bar(
+    ax.bar(
         x,
         means,
         yerr=stds,
@@ -529,9 +525,12 @@ def plot_memory_efficiency(
     fig, ax = plt.subplots(figsize=(8, 6))
 
     for backend in subset["backend"].unique():
-        data = subset[subset["backend"] == backend].groupby("KC").agg(
-            {"memory_per_state_kb": "median"}
-        ).reset_index()
+        data = (
+            subset[subset["backend"] == backend]
+            .groupby("KC")
+            .agg({"memory_per_state_kb": "median"})
+            .reset_index()
+        )
         if len(data) > 1:
             ax.plot(
                 data["KC"],
@@ -576,9 +575,12 @@ def plot_time_ratio_to_baseline(
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for backend in subset["backend"].unique():
-        data = subset[subset["backend"] == backend].groupby("KC").agg(
-            {"time_ratio": "median"}
-        ).reset_index()
+        data = (
+            subset[subset["backend"] == backend]
+            .groupby("KC")
+            .agg({"time_ratio": "median"})
+            .reset_index()
+        )
         if len(data) > 1:
             ax.plot(
                 data["KC"],
@@ -590,7 +592,9 @@ def plot_time_ratio_to_baseline(
                 markersize=8,
             )
 
-    ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.7, linewidth=2, label=f"{baseline} (baseline)")
+    ax.axhline(
+        y=1.0, color="gray", linestyle="--", alpha=0.7, linewidth=2, label=f"{baseline} (baseline)"
+    )
     ax.set_xlabel("State Space Size (KC)", fontsize=12)
     ax.set_ylabel(f"Time Ratio (vs {baseline})", fontsize=12)
     ax.set_title(f"Time Ratio to Baseline ({semiring}, {phase})", fontsize=14)
@@ -599,9 +603,15 @@ def plot_time_ratio_to_baseline(
 
     # Add helper text
     ax.text(
-        0.98, 0.02, "< 1.0 = faster than baseline",
-        transform=ax.transAxes, ha="right", va="bottom",
-        fontsize=9, style="italic", color="gray"
+        0.98,
+        0.02,
+        "< 1.0 = faster than baseline",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        style="italic",
+        color="gray",
     )
 
     plt.tight_layout()
@@ -631,9 +641,12 @@ def plot_memory_ratio_to_baseline(
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for backend in subset["backend"].unique():
-        data = subset[subset["backend"] == backend].groupby("KC").agg(
-            {"memory_ratio": "median"}
-        ).reset_index()
+        data = (
+            subset[subset["backend"] == backend]
+            .groupby("KC")
+            .agg({"memory_ratio": "median"})
+            .reset_index()
+        )
         if len(data) > 1:
             ax.plot(
                 data["KC"],
@@ -645,7 +658,9 @@ def plot_memory_ratio_to_baseline(
                 markersize=8,
             )
 
-    ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.7, linewidth=2, label=f"{baseline} (baseline)")
+    ax.axhline(
+        y=1.0, color="gray", linestyle="--", alpha=0.7, linewidth=2, label=f"{baseline} (baseline)"
+    )
     ax.set_xlabel("State Space Size (KC)", fontsize=12)
     ax.set_ylabel(f"Memory Ratio (vs {baseline})", fontsize=12)
     ax.set_title(f"Memory Ratio to Baseline ({semiring}, {phase})", fontsize=14)
@@ -654,9 +669,15 @@ def plot_memory_ratio_to_baseline(
 
     # Add helper text
     ax.text(
-        0.98, 0.02, "< 1.0 = less memory than baseline",
-        transform=ax.transAxes, ha="right", va="bottom",
-        fontsize=9, style="italic", color="gray"
+        0.98,
+        0.02,
+        "< 1.0 = less memory than baseline",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        style="italic",
+        color="gray",
     )
 
     plt.tight_layout()
@@ -686,12 +707,7 @@ def plot_ratio_heatmap(
     ratio_col = "time_ratio" if metric == "time" else "memory_ratio"
 
     # Pivot to create heatmap data
-    pivot = subset.pivot_table(
-        values=ratio_col,
-        index="backend",
-        columns="KC",
-        aggfunc="median"
-    )
+    pivot = subset.pivot_table(values=ratio_col, index="backend", columns="KC", aggfunc="median")
 
     if pivot.empty:
         return
@@ -831,19 +847,19 @@ def main():
     print("Generating summary tables...")
     summary = generate_summary_table(df)
     summary.to_csv(args.output_dir / "summary_stats.csv", index=False)
-    print(f"  Saved summary_stats.csv")
+    print("  Saved summary_stats.csv")
 
     if len(ratios_df) > 0:
         ratios_df.to_csv(args.output_dir / "backward_forward_ratios.csv", index=False)
-        print(f"  Saved backward_forward_ratios.csv")
+        print("  Saved backward_forward_ratios.csv")
 
     if len(overhead_df) > 0:
         overhead_df.to_csv(args.output_dir / "semiring_overhead.csv", index=False)
-        print(f"  Saved semiring_overhead.csv")
+        print("  Saved semiring_overhead.csv")
 
     if len(crossover_df) > 0:
         crossover_df.to_csv(args.output_dir / "crossover_points.csv", index=False)
-        print(f"  Saved crossover_points.csv")
+        print("  Saved crossover_points.csv")
 
     if len(baseline_df) > 0:
         baseline_df.to_csv(args.output_dir / "baseline_ratios.csv", index=False)
@@ -877,10 +893,22 @@ def main():
                         baseline_df, args.baseline, args.output_dir, args.format, phase, semiring
                     )
                     plot_ratio_heatmap(
-                        baseline_df, args.baseline, args.output_dir, args.format, phase, semiring, "time"
+                        baseline_df,
+                        args.baseline,
+                        args.output_dir,
+                        args.format,
+                        phase,
+                        semiring,
+                        "time",
                     )
                     plot_ratio_heatmap(
-                        baseline_df, args.baseline, args.output_dir, args.format, phase, semiring, "memory"
+                        baseline_df,
+                        args.baseline,
+                        args.output_dir,
+                        args.format,
+                        phase,
+                        semiring,
+                        "memory",
                     )
 
             # Backward/forward ratio (per semiring)
@@ -901,9 +929,7 @@ def main():
 
     print("\nBackends by median throughput (positions/sec):")
     throughput_summary = (
-        df.groupby("backend")["positions_per_sec"]
-        .median()
-        .sort_values(ascending=False)
+        df.groupby("backend")["positions_per_sec"].median().sort_values(ascending=False)
     )
     for backend, throughput in throughput_summary.items():
         print(f"  {backend:30s}: {throughput/1e6:.2f}M pos/sec")

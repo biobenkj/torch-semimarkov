@@ -37,9 +37,9 @@ from pathlib import Path
 import torch
 
 from torch_semimarkov import SemiMarkov
-from torch_semimarkov.semirings import LogSemiring, MaxSemiring, EntropySemiring
+from torch_semimarkov.semirings import EntropySemiring, LogSemiring, MaxSemiring
 from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
-from torch_semimarkov.triton_scan import semi_crf_triton_forward, HAS_TRITON
+from torch_semimarkov.triton_scan import HAS_TRITON, semi_crf_triton_forward
 
 # Mapping of semiring names to classes
 SEMIRING_MAP = {
@@ -324,13 +324,17 @@ def run_single_benchmark(
                 # PyTorch reference for Triton (LogSemiring only)
                 return semi_crf_triton_forward(edge_input, lengths, use_triton=False)
             elif backend == "binary_tree":
-                v, _ = struct_to_use.logpartition(edge_input, lengths=lengths, use_linear_scan=False)
+                v, _ = struct_to_use.logpartition(
+                    edge_input, lengths=lengths, use_linear_scan=False
+                )
                 return v
             elif backend == "linear_scan":
                 v, _, _ = struct_to_use._dp_standard(edge_input, lengths, force_grad=True)
                 return v
             elif backend == "linear_scan_vectorized":
-                v, _, _ = struct_to_use._dp_standard_vectorized(edge_input, lengths, force_grad=True)
+                v, _, _ = struct_to_use._dp_standard_vectorized(
+                    edge_input, lengths, force_grad=True
+                )
                 return v
             elif backend == "banded":
                 v, _, _ = struct_to_use.logpartition(
@@ -345,7 +349,9 @@ def run_single_benchmark(
                 return v
             elif backend == "block_triangular":
                 if hasattr(struct_to_use, "_dp_blocktriangular"):
-                    v, _, _ = struct_to_use._dp_blocktriangular(edge_input, lengths, force_grad=True)
+                    v, _, _ = struct_to_use._dp_blocktriangular(
+                        edge_input, lengths, force_grad=True
+                    )
                     return v
                 else:
                     raise NotImplementedError("block_triangular not available")
@@ -353,7 +359,9 @@ def run_single_benchmark(
                 # Use CheckpointShardSemiring to reduce peak memory
                 ShardedSemiring = CheckpointShardSemiring(semiring_cls, max_size=10000)
                 struct_sharded = SemiMarkov(ShardedSemiring)
-                v, _ = struct_sharded.logpartition(edge_input, lengths=lengths, use_linear_scan=False)
+                v, _ = struct_sharded.logpartition(
+                    edge_input, lengths=lengths, use_linear_scan=False
+                )
                 return v
             elif backend == "linear_scan_streaming":
                 v, _, _ = struct_to_use._dp_scan_streaming(edge_input, lengths, force_grad=True)
@@ -593,7 +601,9 @@ def main():
             for p in phases:
                 oom_history[f"{b}_{s}_{p}"] = []
 
-    total_configs = len(T_list) * len(K_list) * len(C_list) * len(backends) * len(semirings) * len(phases)
+    total_configs = (
+        len(T_list) * len(K_list) * len(C_list) * len(backends) * len(semirings) * len(phases)
+    )
     completed = 0
 
     print(f"Running {total_configs} configurations...")
@@ -647,7 +657,12 @@ def main():
                             if args.skip_adjacent_oom:
                                 # Use backend-only key for memory estimation (semiring doesn't affect memory much)
                                 skip, reason = should_skip_config(
-                                    T, K, C, backend, {backend: oom_history.get(oom_key, [])}, args.max_memory_gb
+                                    T,
+                                    K,
+                                    C,
+                                    backend,
+                                    {backend: oom_history.get(oom_key, [])},
+                                    args.max_memory_gb,
                                 )
                                 if skip:
                                     print(
@@ -682,8 +697,15 @@ def main():
                             )
 
                             result = run_single_benchmark(
-                                T, K, C, args.B, backend, device, args.repeats,
-                                semiring_name=semiring_name, phase=phase
+                                T,
+                                K,
+                                C,
+                                args.B,
+                                backend,
+                                device,
+                                args.repeats,
+                                semiring_name=semiring_name,
+                                phase=phase,
                             )
                             results.append(result)
 
@@ -785,7 +807,8 @@ def main():
         for semiring_name in semirings:
             for phase in phases:
                 key_results = [
-                    r for r in results
+                    r
+                    for r in results
                     if r.backend == backend and r.semiring == semiring_name and r.phase == phase
                 ]
                 if not key_results:
