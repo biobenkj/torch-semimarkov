@@ -1,7 +1,10 @@
+import pytest
 import torch
 
-from torch_semimarkov.triton_scan import semi_crf_forward_pytorch, semi_crf_triton_forward
-
+from torch_semimarkov.triton_scan import (
+    semi_crf_forward_pytorch,
+    semi_crf_triton_forward,
+)
 
 # =============================================================================
 # Log Semiring Tests (existing)
@@ -140,8 +143,6 @@ def test_max_semiring_variable_lengths():
 
 def test_invalid_semiring_raises():
     """Test that invalid semiring name raises ValueError."""
-    import pytest
-
     edge = torch.randn(1, 4, 3, 2, 2)
     lengths = torch.tensor([5])
 

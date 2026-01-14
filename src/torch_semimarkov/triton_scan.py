@@ -119,7 +119,9 @@ def semi_crf_forward_pytorch(edge, lengths, semiring="log"):
 
         # First reduction: over c_prev (source labels)
         if semiring == "log":
-            scores = torch.logsumexp(beta_prev.unsqueeze(-2) + edge_slice, dim=-1)  # (batch, k_eff, C)
+            scores = torch.logsumexp(
+                beta_prev.unsqueeze(-2) + edge_slice, dim=-1
+            )  # (batch, k_eff, C)
         else:  # max semiring
             scores = torch.max(beta_prev.unsqueeze(-2) + edge_slice, dim=-1)[0]  # (batch, k_eff, C)
 
