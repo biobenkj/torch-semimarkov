@@ -808,18 +808,24 @@ if HAS_TRITON:
         # For each position in segment, we'll compute alpha and store it
         # We maintain a ring buffer of the last K alpha values
 
-        # Initialize ring buffer from checkpoint
-        # Ring stores alpha[pos] at slot (pos % K)
-        # At checkpoint position, ring contains alpha[seg_start-K+1], ..., alpha[seg_start]
+        # === FORWARD PASS: Recompute alpha values within segment ===
+        # This follows the same logic as triton_scan.py's working forward kernel.
+        #
+        # Key insight: we read alpha[t-k] from:
+        # - Checkpoint ring buffer if t-k < seg_start (positions computed before this segment)
+        # - Segment buffer if t-k >= seg_start (positions we just computed in this kernel)
+        #
+        # The checkpoint stores the ring buffer state AT seg_start, containing
+        # alpha values for positions [seg_start - K + 1, seg_start].
 
-        # Process positions from seg_start to seg_end-1
-        for t_local in tl.static_range(0, checkpoint_interval):
+        # Process all positions in segment
+        for t_local in tl.range(0, checkpoint_interval):
             t = seg_start + t_local
-            t_active = t < seg_end
+            active = t < seg_end
 
-            if t_active:
-                if t_local == 0:
-                    # First position: load from checkpoint
+            if active:
+                if t == seg_start:
+                    # First position: alpha[seg_start] is in the checkpoint
                     ring_slot = seg_start % K
                     alpha_t = tl.load(
                         ckpt_base + ckpt_idx * stride_rci + ring_slot * stride_rck + c_idx * stride_rcc,
@@ -827,39 +833,41 @@ if HAS_TRITON:
                         other=NEG_INF,
                     )
                 else:
-                    # Compute alpha[t] from previous alpha values via ring buffer
-                    # alpha[t] = logsumexp over k, c_src of: alpha[t-k] + edge[t-k, k, c_dest, c_src]
-
-                    # We need alpha[t-1], alpha[t-2], ..., alpha[t-K+1]
-                    # These are in the checkpoint ring (for early positions) or computed (for later)
-
+                    # Compute alpha[t] = logsumexp over k of contribution from alpha[t-k]
+                    # Same algorithm as triton_scan.py
                     alpha_t = tl.full([C_PAD], NEG_INF, dtype=DTYPE)
-                    k_max = tl.minimum(K - 1, t)
 
-                    for k in tl.static_range(1, K):
-                        k_active = k <= k_max
+                    for k in tl.range(1, K):
+                        # k is valid if k <= t and k <= K-1 (same as triton_scan.py)
+                        k_valid = (k <= t) & (k <= K - 1)
                         start_pos = t - k
-                        start_pos_safe = tl.where(k_active, start_pos, 0)
+
+                        # Compute safe index for loads (even though we mask, avoid UB)
+                        start_pos_safe = tl.maximum(start_pos, 0)
                         ring_slot = start_pos_safe % K
 
-                        use_ckpt = k_active & (start_pos < seg_start)
-                        use_seg = k_active & (start_pos >= seg_start)
+                        # Determine source: checkpoint (before segment) or segment buffer
+                        from_checkpoint = k_valid & (start_pos < seg_start)
+                        from_segment = k_valid & (start_pos >= seg_start)
 
-                        # Load alpha[start_pos] from checkpoint or previously computed
-                        alpha_prev_ckpt = tl.load(
+                        # Load alpha[start_pos] from appropriate source
+                        # Use separate loads with proper masks (Triton idiom)
+                        alpha_ckpt = tl.load(
                             ckpt_base + ckpt_idx * stride_rci + ring_slot * stride_rck + c_idx * stride_rcc,
-                            mask=use_ckpt & c_mask,
+                            mask=from_checkpoint & c_mask,
                             other=NEG_INF,
                         )
-                        local_start = tl.where(use_seg, start_pos_safe - seg_start, 0)
-                        alpha_prev_seg = tl.load(
-                            alpha_seg_base + local_start * stride_ast + c_idx * stride_asc,
-                            mask=use_seg & c_mask,
+                        local_idx = tl.maximum(start_pos - seg_start, 0)
+                        alpha_seg = tl.load(
+                            alpha_seg_base + local_idx * stride_ast + c_idx * stride_asc,
+                            mask=from_segment & c_mask,
                             other=NEG_INF,
                         )
-                        alpha_prev = tl.where(use_ckpt, alpha_prev_ckpt, alpha_prev_seg)
+                        # Combine: if from_checkpoint, use alpha_ckpt; else use alpha_seg
+                        # When both are false, both have NEG_INF which is correct
+                        alpha_prev = tl.where(from_checkpoint, alpha_ckpt, alpha_seg)
 
-                        # Load edge[start_pos, k, :, :]
+                        # Load edge[start_pos, k, :, :] - same pattern as triton_scan.py
                         edge_offset_2d = (
                             edge_base
                             + start_pos_safe * stride_et
@@ -869,27 +877,28 @@ if HAS_TRITON:
                         )
                         edge_block = tl.load(
                             edge_offset_2d,
-                            mask=k_active & c_mask_2d,
+                            mask=k_valid & c_mask_2d,
                             other=NEG_INF,
                         )
 
-                        # scores[c_dest, c_src] = alpha_prev[c_src] + edge[c_dest, c_src]
+                        # Compute scores - same as triton_scan.py
                         scores = alpha_prev[None, :] + edge_block  # [C_PAD, C_PAD]
                         scores = tl.where(c_mask_2d, scores, NEG_INF)
 
-                        # logsumexp over c_src (axis=1) to get [C_PAD]
-                        max_s = tl.max(scores, axis=1)
-                        contrib = max_s + tl.log(tl.sum(tl.exp(scores - max_s[:, None]), axis=1))
-                        contrib = tl.where(k_active & c_mask, contrib, NEG_INF)
-
-                        # Accumulate into alpha_t via logsumexp
-                        max_ab = tl.maximum(alpha_t, contrib)
-                        new_alpha = max_ab + tl.log(
-                            tl.exp(alpha_t - max_ab) + tl.exp(contrib - max_ab)
+                        # Logsumexp over source labels (axis=1) - same as triton_scan.py
+                        max_scores = tl.max(scores, axis=1)
+                        score_for_k = max_scores + tl.log(
+                            tl.sum(tl.exp(scores - max_scores[:, None]), axis=1)
                         )
-                        alpha_t = tl.where(k_active, new_alpha, alpha_t)
+                        score_for_k = tl.where(k_valid & c_mask, score_for_k, NEG_INF)
 
-                # Store alpha[t] to segment buffer
+                        # Accumulate into alpha_t - same as triton_scan.py
+                        max_ab = tl.maximum(alpha_t, score_for_k)
+                        alpha_t = max_ab + tl.log(
+                            tl.exp(alpha_t - max_ab) + tl.exp(score_for_k - max_ab)
+                        )
+
+                # Store alpha[t] to segment buffer for backward pass
                 tl.store(
                     alpha_seg_base + t_local * stride_ast + c_idx * stride_asc,
                     alpha_t,
@@ -986,15 +995,17 @@ if HAS_TRITON:
         # 2. Compute gradient using alpha, edge, beta, log_Z
         # 3. Compute new beta[t] and store to ring buffer
 
-        for t_offset in tl.static_range(0, checkpoint_interval):
+        # Use tl.range instead of tl.static_range to avoid compilation issues
+        for t_offset in tl.range(0, checkpoint_interval):
             t = (seg_end - 1) - t_offset
             t_active = (t >= seg_start) & (t < seq_len - 1)
 
             if t_active:
                 # Load alpha[t] from segment buffer
                 t_local = t - seg_start
+                t_local_safe = tl.maximum(t_local, 0)  # Ensure non-negative
                 alpha_t = tl.load(
-                    alpha_seg_base + t_local * stride_ast + c_idx * stride_asc,
+                    alpha_seg_base + t_local_safe * stride_ast + c_idx * stride_asc,
                     mask=c_mask,
                     other=NEG_INF,
                 )
@@ -1003,10 +1014,13 @@ if HAS_TRITON:
                 new_beta = tl.full([C_PAD], NEG_INF, dtype=DTYPE)
                 k_max = tl.minimum(K - 1, seq_len - 1 - t)
 
-                for k in tl.static_range(1, K):
+                # Safe t for edge indexing (ensure non-negative and in bounds)
+                t_safe = tl.minimum(tl.maximum(t, 0), T - 2)
+
+                for k in tl.range(1, K):
                     end_pos = t + k
                     k_active = (k <= k_max) & (end_pos < seq_len)
-                    end_pos_safe = tl.where(k_active, end_pos, 0)
+                    end_pos_safe = tl.minimum(tl.maximum(end_pos, 0), T - 1)
 
                     # Load beta[end_pos] from ring buffer
                     ring_k_idx = end_pos_safe % K
@@ -1019,7 +1033,7 @@ if HAS_TRITON:
                     # Load edge[t, k, :, :]
                     edge_offset_2d = (
                         edge_base
-                        + t * stride_et
+                        + t_safe * stride_et
                         + k * stride_ek
                         + c_dest * stride_ec1
                         + c_src * stride_ec2
@@ -1044,7 +1058,7 @@ if HAS_TRITON:
                     # Store gradient
                     grad_offset_2d = (
                         grad_base
-                        + t * stride_gt
+                        + t_safe * stride_gt
                         + k * stride_gk
                         + c_dest * stride_gc1
                         + c_src * stride_gc2
