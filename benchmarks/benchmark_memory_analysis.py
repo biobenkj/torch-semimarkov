@@ -29,12 +29,14 @@ import argparse
 import csv
 import gc
 import json
+import os
 import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+import torch._inductor.config as inductor_config
 
 from torch_semimarkov import SemiMarkov
 from torch_semimarkov.semirings import EntropySemiring, LogSemiring, MaxSemiring
@@ -110,6 +112,346 @@ class BenchmarkResult:
 
 def parse_int_list(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _evenly_spaced(values: list[int], count: int) -> list[int]:
+    if count <= 0:
+        return []
+    if count == 1:
+        return [values[0]]
+    n = len(values)
+    idxs = [round(i * (n - 1) / (count - 1)) for i in range(count)]
+    seen: set[int] = set()
+    sampled: list[int] = []
+    for idx in idxs:
+        if idx not in seen:
+            sampled.append(values[idx])
+            seen.add(idx)
+    if len(sampled) < count:
+        for idx in range(n):
+            if idx not in seen:
+                sampled.append(values[idx])
+                seen.add(idx)
+                if len(sampled) == count:
+                    break
+    return sampled
+
+
+def _choose_grid_counts(t_count: int, kc_count: int, max_points: int) -> tuple[int, int]:
+    best_t, best_kc = 1, 1
+    best_prod = 1
+    best_balance = float("inf")
+    for t_idx in range(1, t_count + 1):
+        kc_idx = min(kc_count, max_points // t_idx)
+        if kc_idx < 1:
+            continue
+        prod = t_idx * kc_idx
+        balance = abs((t_idx / t_count) - (kc_idx / kc_count))
+        if prod > best_prod or (prod == best_prod and balance < best_balance):
+            best_t, best_kc = t_idx, kc_idx
+            best_prod = prod
+            best_balance = balance
+    return best_t, best_kc
+
+
+def sample_configurations(
+    T_list: list[int],
+    K_list: list[int],
+    C_list: list[int],
+    B: int,
+    max_points: int,
+) -> list[tuple[int, int, int]]:
+    """Sample (T, K, C) configs by T and K*C, anchored at min/max BTKC."""
+    full_configs = [(T, K, C) for T in T_list for K in K_list for C in C_list]
+    if max_points <= 0 or max_points >= len(full_configs):
+        return full_configs
+
+    t_values = sorted(set(T_list))
+    kc_to_pairs: dict[int, list[tuple[int, int]]] = {}
+    for K in K_list:
+        for C in C_list:
+            kc_to_pairs.setdefault(K * C, []).append((K, C))
+    kc_values = sorted(kc_to_pairs.keys())
+
+    t_count = len(t_values)
+    kc_count = len(kc_values)
+    t_sample_count, kc_sample_count = _choose_grid_counts(t_count, kc_count, max_points)
+
+    t_samples = _evenly_spaced(t_values, t_sample_count)
+    kc_samples = _evenly_spaced(kc_values, kc_sample_count)
+
+    sampled_pairs: set[tuple[int, int]] = {(T, KC) for T in t_samples for KC in kc_samples}
+    sampled_pairs.add((t_values[0], kc_values[0]))
+    sampled_pairs.add((t_values[-1], kc_values[-1]))
+
+    if len(sampled_pairs) < max_points:
+        all_pairs = [(T, KC) for T in t_values for KC in kc_values]
+        all_pairs.sort(key=lambda pair: B * pair[0] * pair[1])
+        for pair in all_pairs:
+            if len(sampled_pairs) >= max_points:
+                break
+            sampled_pairs.add(pair)
+
+    t_index_map = {T: idx for idx, T in enumerate(t_values)}
+    kc_index_map = {KC: idx for idx, KC in enumerate(kc_values)}
+
+    configs: list[tuple[int, int, int]] = []
+    for T, KC in sorted(sampled_pairs, key=lambda pair: (pair[0], pair[1])):
+        pairs = kc_to_pairs[KC]
+        pair_idx = (t_index_map[T] + kc_index_map[KC]) % len(pairs)
+        K, C = pairs[pair_idx]
+        configs.append((T, K, C))
+
+    return configs
+
+
+# =============================================================================
+# Compile-Aware Sampling (reduces torch.compile overhead)
+# =============================================================================
+
+# Canonical shape buckets - these are the shapes we actually compile kernels for
+T_BUCKETS = [64, 128, 256, 512, 1024, 2048]
+KC_BUCKETS = [12, 24, 48, 72, 96, 144, 192, 288]
+
+
+def bucket_to_canonical_shape(T: int, K: int, C: int) -> tuple[int, int, int]:
+    """
+    Round (T, K, C) to canonical shapes that maximize compiled kernel reuse.
+
+    torch.compile generates specialized kernels per unique tensor shape.
+    By bucketing to canonical shapes, we reduce compilation from O(configs)
+    to O(buckets), typically 8-16 unique kernels instead of 50-100+.
+
+    Returns:
+        (T_canon, K_canon, C_canon) - the canonical shape to use for compilation
+    """
+    # Bucket T to nearest bucket >= T (or largest if T exceeds all)
+    T_canon = T_BUCKETS[-1]
+    for t_bucket in T_BUCKETS:
+        if t_bucket >= T:
+            T_canon = t_bucket
+            break
+
+    # Bucket K*C product
+    KC = K * C
+    KC_canon = KC_BUCKETS[-1]
+    for kc_bucket in KC_BUCKETS:
+        if kc_bucket >= KC:
+            KC_canon = kc_bucket
+            break
+
+    # Find K, C factors of KC_canon that are closest to original ratio
+    # Prefer keeping K close to original since it affects duration modeling
+    best_K, best_C = K, C
+    best_score = float("inf")
+    for k in range(1, KC_canon + 1):
+        if KC_canon % k == 0:
+            c = KC_canon // k
+            # Score: prefer K close to original, C close to original
+            score = abs(k - K) + abs(c - C) * 0.5
+            if score < best_score:
+                best_K, best_C = k, c
+                best_score = score
+
+    return T_canon, best_K, best_C
+
+
+def get_canonical_shapes(
+    T_list: list[int], K_list: list[int], C_list: list[int]
+) -> list[tuple[int, int, int]]:
+    """Get the set of unique canonical shapes for a parameter grid."""
+    seen: set[tuple[int, int, int]] = set()
+    canonical: list[tuple[int, int, int]] = []
+
+    for T in T_list:
+        for K in K_list:
+            for C in C_list:
+                canon = bucket_to_canonical_shape(T, K, C)
+                if canon not in seen:
+                    seen.add(canon)
+                    canonical.append(canon)
+
+    # Sort by memory footprint (T * K * C)
+    canonical.sort(key=lambda x: x[0] * x[1] * x[2])
+    return canonical
+
+
+def sample_compile_friendly(
+    T_list: list[int],
+    K_list: list[int],
+    C_list: list[int],
+    max_canonical_shapes: int = 8,
+    samples_per_shape: int = 2,
+) -> tuple[list[tuple[int, int, int]], dict[tuple[int, int, int], tuple[int, int, int]]]:
+    """
+    Sample configurations that minimize unique compiled shapes.
+
+    This is a two-phase approach:
+    1. Select a subset of canonical shapes (compile targets)
+    2. Sample actual configs that map to those canonical shapes
+
+    Args:
+        T_list: Sequence lengths to consider
+        K_list: Max durations to consider
+        C_list: Label counts to consider
+        max_canonical_shapes: Maximum unique shapes to compile
+        samples_per_shape: Actual configs to benchmark per canonical shape
+
+    Returns:
+        (sampled_configs, config_to_canonical_map)
+    """
+    # Build all configs and group by canonical shape
+    all_configs = [(T, K, C) for T in T_list for K in K_list for C in C_list]
+    shape_groups: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+
+    for cfg in all_configs:
+        canon = bucket_to_canonical_shape(*cfg)
+        shape_groups.setdefault(canon, []).append(cfg)
+
+    # Select canonical shapes with good coverage (evenly spaced by memory)
+    all_canonical = sorted(shape_groups.keys(), key=lambda s: s[0] * s[1] * s[2])
+
+    if len(all_canonical) <= max_canonical_shapes:
+        selected_canonical = all_canonical
+    else:
+        # Evenly spaced selection
+        selected_canonical = _evenly_spaced(all_canonical, max_canonical_shapes)
+
+    # Sample actual configs from each selected canonical group
+    sampled: list[tuple[int, int, int]] = []
+    config_to_canon: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+
+    for canon in selected_canonical:
+        group = shape_groups.get(canon, [])
+        # Sort group by actual size and take evenly spaced samples
+        group_sorted = sorted(group, key=lambda c: c[0] * c[1] * c[2])
+
+        if len(group_sorted) <= samples_per_shape:
+            selected = group_sorted
+        else:
+            selected = _evenly_spaced(group_sorted, samples_per_shape)
+
+        for cfg in selected:
+            sampled.append(cfg)
+            config_to_canon[cfg] = canon
+
+    return sampled, config_to_canon
+
+
+def setup_compile_cache(
+    output_dir: Path,
+    cache_dir: Path | None = None,
+    max_cache_size_gb: float = 10.0,
+) -> Path:
+    """
+    Configure persistent compilation cache to avoid recompilation across runs.
+
+    Args:
+        output_dir: Default location for cache if cache_dir not specified
+        cache_dir: Explicit cache directory (e.g., /tmp for HPC local scratch)
+        max_cache_size_gb: Maximum cache size in GB (default 10GB)
+
+    Returns the cache directory path.
+
+    HPC Notes:
+        - Use local scratch (e.g., /tmp, $TMPDIR, or node-local NVMe) for faster I/O
+        - On shared filesystems, compile cache can cause lock contention
+        - Set max_cache_size_gb based on available scratch space
+    """
+    if cache_dir is None:
+        cache_dir = output_dir / ".torch_compile_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Enable FX graph caching
+    inductor_config.fx_graph_cache = True
+    inductor_config.fx_graph_remote_cache = False  # Local only
+
+    # Set cache size limit (in bytes)
+    # This controls automatic cache eviction when size exceeds limit
+    try:
+        inductor_config.fx_graph_cache_size_limit = int(max_cache_size_gb * 1024**3)
+    except AttributeError:
+        # Older PyTorch versions may not have this config
+        pass
+
+    # Set cache directory via environment variable
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache_dir)
+
+    # Also set TRITON_CACHE_DIR for Triton kernel caching
+    triton_cache = cache_dir / "triton"
+    triton_cache.mkdir(exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = str(triton_cache)
+
+    return cache_dir
+
+
+def precompile_canonical_shapes(
+    canonical_shapes: list[tuple[int, int, int]],
+    device: torch.device,
+    backends: list[str],
+    semirings: list[str],
+    use_compile: bool = True,
+) -> None:
+    """
+    Pre-compile kernels for all canonical shapes before timing.
+
+    This separates compilation time from benchmark timing, giving more
+    accurate runtime measurements and avoiding compilation during timed runs.
+    """
+    from torch_semimarkov.triton_scan import semi_crf_triton_forward
+
+    triton_backends = {"triton", "triton_pytorch", "triton_checkpointing"}
+    active_triton_backends = [b for b in backends if b in triton_backends]
+
+    if not active_triton_backends or not use_compile:
+        return
+
+    print(f"\nPre-compiling {len(canonical_shapes)} canonical shapes...")
+    print(f"  Backends: {active_triton_backends}")
+    print("  This may take a few minutes on first run (cached afterward)\n")
+
+    for i, (T, K, C) in enumerate(canonical_shapes):
+        print(
+            f"  [{i+1}/{len(canonical_shapes)}] Shape T={T}, K={K}, C={C}...", end=" ", flush=True
+        )
+
+        for semiring_name in semirings:
+            if semiring_name not in TRITON_SUPPORTED_SEMIRINGS:
+                continue
+
+            triton_semiring = semiring_name.lower()
+
+            # Use B=1 for faster compilation (shape is what matters)
+            edge = torch.randn(1, T - 1, K, C, C, device=device, requires_grad=True)
+            lengths = torch.full((1,), T, dtype=torch.long, device=device)
+
+            for backend in active_triton_backends:
+                try:
+                    use_triton_kernel = backend in ("triton", "triton_checkpointing")
+                    backend_use_compile = use_compile and backend != "triton_checkpointing"
+
+                    # Forward pass (triggers compilation)
+                    v = semi_crf_triton_forward(
+                        edge,
+                        lengths,
+                        use_triton=use_triton_kernel,
+                        semiring=triton_semiring,
+                        use_compile=backend_use_compile,
+                    )
+                    # Backward pass (triggers backward kernel compilation)
+                    v.sum().backward()
+
+                except Exception as e:
+                    print(f"(warn: {backend}/{semiring_name}: {str(e)[:30]})", end=" ")
+
+            del edge, lengths
+            torch.cuda.empty_cache()
+
+        print("done")
+
+    print("\nPre-compilation complete. Starting benchmarks...\n")
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def bytes_to_gb(b: int) -> float:
@@ -430,7 +772,8 @@ def run_single_benchmark(
         # IMPORTANT: Run the exact same computation as the timed run for accurate warmup
         # For triton with torch.compile, this triggers the JIT compilation
         if device.type == "cuda":
-            edge_warmup = edge.clone().detach().requires_grad_(True)
+            warmup_needs_grad = phase in ("backward", "both")
+            edge_warmup = edge.clone().detach().requires_grad_(warmup_needs_grad)
             try:
                 v_warm = run_backend_forward(edge_warmup, struct, use_compile=use_compile)
                 # Warmup backward pass too if we're timing backward
@@ -578,6 +921,72 @@ def main():
     parser.add_argument("--B", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
+        "--sample-configs",
+        type=int,
+        default=0,
+        help=(
+            "Sample this many (T, K*C) configs from the full grid, anchored at "
+            "min/max BTKC. Use 0 to run the full grid. Ignored if --compile-friendly is set."
+        ),
+    )
+    parser.add_argument(
+        "--compile-friendly",
+        action="store_true",
+        default=False,
+        help=(
+            "Use compile-aware sampling to minimize torch.compile overhead. "
+            "Groups configs by canonical shapes and samples representative configs. "
+            "Much faster than full grid when using triton backends with --use-compile."
+        ),
+    )
+    parser.add_argument(
+        "--max-canonical-shapes",
+        type=int,
+        default=8,
+        help=(
+            "Maximum number of unique canonical shapes to compile when using "
+            "--compile-friendly. More shapes = better coverage but longer compile time. "
+            "Default: 8"
+        ),
+    )
+    parser.add_argument(
+        "--samples-per-shape",
+        type=int,
+        default=2,
+        help=(
+            "Number of actual configs to benchmark per canonical shape when using "
+            "--compile-friendly. Default: 2"
+        ),
+    )
+    parser.add_argument(
+        "--skip-precompile",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the pre-compilation warmup phase. Use this if you have a warm cache "
+            "or want to include compilation time in benchmark results."
+        ),
+    )
+    parser.add_argument(
+        "--compile-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for torch.compile and Triton kernel cache. "
+            "On HPC, use local scratch (e.g., /tmp, $TMPDIR) for faster I/O. "
+            "Default: --output-dir/.torch_compile_cache"
+        ),
+    )
+    parser.add_argument(
+        "--compile-cache-size-gb",
+        type=float,
+        default=10.0,
+        help=(
+            "Maximum compile cache size in GB. Older entries are evicted when exceeded. "
+            "Set based on available scratch space. Default: 10.0"
+        ),
+    )
+    parser.add_argument(
         "--backends",
         type=str,
         default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,block_triangular",
@@ -667,6 +1076,18 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Setup persistent compile cache for torch.compile
+    has_triton_backends = any(
+        b in ("triton", "triton_pytorch", "triton_checkpointing") for b in backends
+    )
+    if args.use_compile and has_triton_backends:
+        cache_dir = setup_compile_cache(
+            args.output_dir,
+            cache_dir=args.compile_cache_dir,
+            max_cache_size_gb=args.compile_cache_size_gb,
+        )
+        print(f"Compile cache: {cache_dir} (max {args.compile_cache_size_gb}GB)")
+
     torch.manual_seed(42)
 
     results: list[BenchmarkResult] = []
@@ -677,9 +1098,35 @@ def main():
             for p in phases:
                 oom_history[f"{b}_{s}_{p}"] = []
 
-    total_configs = (
-        len(T_list) * len(K_list) * len(C_list) * len(backends) * len(semirings) * len(phases)
-    )
+    full_config_count = len(T_list) * len(K_list) * len(C_list)
+
+    # Choose sampling strategy
+    config_to_canonical: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    canonical_shapes: list[tuple[int, int, int]] = []
+
+    if args.compile_friendly:
+        # Compile-aware sampling: minimize unique compiled shapes
+        configs, config_to_canonical = sample_compile_friendly(
+            T_list,
+            K_list,
+            C_list,
+            max_canonical_shapes=args.max_canonical_shapes,
+            samples_per_shape=args.samples_per_shape,
+        )
+        canonical_shapes = get_canonical_shapes(T_list, K_list, C_list)
+        # Filter to only shapes we're actually using
+        used_canonical = set(config_to_canonical.values())
+        canonical_shapes = [s for s in canonical_shapes if s in used_canonical]
+    elif args.sample_configs > 0:
+        # Legacy sampling: sample by T and K*C range
+        configs = sample_configurations(T_list, K_list, C_list, args.B, args.sample_configs)
+        canonical_shapes = get_canonical_shapes(T_list, K_list, C_list)
+    else:
+        # Full grid
+        configs = [(T, K, C) for T in T_list for K in K_list for C in C_list]
+        canonical_shapes = get_canonical_shapes(T_list, K_list, C_list)
+
+    total_configs = len(configs) * len(backends) * len(semirings) * len(phases)
     completed = 0
 
     print(f"Running {total_configs} configurations...")
@@ -690,146 +1137,165 @@ def main():
     print(f"Phases: {phases}")
     print(f"Repeats: {args.repeats}")
     print(f"Triton use_compile: {args.use_compile}")
+
+    if args.compile_friendly:
+        print(
+            f"Compile-friendly sampling: {len(configs)} configs mapping to "
+            f"{len(canonical_shapes)} canonical shapes"
+        )
+    elif args.sample_configs > 0 and len(configs) != full_config_count:
+        print(f"Sampling {len(configs)} of {full_config_count} T/K/C configs by T and K*C range")
+
+    if canonical_shapes:
+        print(f"Canonical shapes for compilation: {len(canonical_shapes)}")
+
     print("-" * 80)
+
+    # Pre-compile all canonical shapes before timing (separates compile time from runtime)
+    if args.use_compile and has_triton_backends and not args.skip_precompile and canonical_shapes:
+        precompile_canonical_shapes(canonical_shapes, device, backends, semirings, use_compile=True)
 
     for backend in backends:
         for semiring_name in semirings:
-            # Reset caches once per backend/semiring pair to avoid state issues
-            if args.use_compile and backend in ("triton", "triton_pytorch", "triton_checkpointing"):
+            # Only reset caches if NOT using compile-friendly mode
+            # (compile-friendly pre-compiles everything upfront)
+            if (
+                args.use_compile
+                and backend in ("triton", "triton_pytorch", "triton_checkpointing")
+                and not args.compile_friendly
+            ):
                 reset_compile_caches()
             for phase in phases:
-                for T in T_list:
-                    for K in K_list:
-                        for C in C_list:
-                            KC = K * C
-                            completed += 1
-                            oom_key = f"{backend}_{semiring_name}_{phase}"
+                for T, K, C in configs:
+                    KC = K * C
+                    completed += 1
+                    oom_key = f"{backend}_{semiring_name}_{phase}"
 
-                            # Check backend/semiring compatibility
-                            if backend in LOG_SEMIRING_ONLY_BACKENDS and semiring_name != "Log":
-                                print(
-                                    f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: "
-                                    f"{backend} only supports Log semiring"
-                                )
-                                results.append(
-                                    BenchmarkResult(
-                                        T=T,
-                                        K=K,
-                                        C=C,
-                                        B=args.B,
-                                        KC=KC,
-                                        backend=backend,
-                                        semiring=semiring_name,
-                                        phase=phase,
-                                        time_ms_median=float("nan"),
-                                        time_ms_iqr_low=float("nan"),
-                                        time_ms_iqr_high=float("nan"),
-                                        time_per_position_ms=float("nan"),
-                                        peak_allocated_gb=float("nan"),
-                                        peak_reserved_gb=float("nan"),
-                                        status="not_supported",
-                                        error_msg=f"{backend} only supports Log semiring",
-                                    )
-                                )
-                                continue
-
-                            # Check triton backend semiring compatibility (Log, Max only)
-                            if (
-                                backend in ("triton", "triton_pytorch", "triton_checkpointing")
-                                and semiring_name not in TRITON_SUPPORTED_SEMIRINGS
-                            ):
-                                print(
-                                    f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: "
-                                    f"{backend} only supports Log/Max semirings"
-                                )
-                                results.append(
-                                    BenchmarkResult(
-                                        T=T,
-                                        K=K,
-                                        C=C,
-                                        B=args.B,
-                                        KC=KC,
-                                        backend=backend,
-                                        semiring=semiring_name,
-                                        phase=phase,
-                                        time_ms_median=float("nan"),
-                                        time_ms_iqr_low=float("nan"),
-                                        time_ms_iqr_high=float("nan"),
-                                        time_per_position_ms=float("nan"),
-                                        peak_allocated_gb=float("nan"),
-                                        peak_reserved_gb=float("nan"),
-                                        status="not_supported",
-                                        error_msg=f"{backend} only supports Log/Max semirings",
-                                    )
-                                )
-                                continue
-
-                            # Check if we should skip based on OOM history
-                            if args.skip_adjacent_oom:
-                                # Use backend-only key for memory estimation (semiring doesn't affect memory much)
-                                skip, reason = should_skip_config(
-                                    T,
-                                    K,
-                                    C,
-                                    backend,
-                                    {backend: oom_history.get(oom_key, [])},
-                                    args.max_memory_gb,
-                                )
-                                if skip:
-                                    print(
-                                        f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: {reason}"
-                                    )
-                                    results.append(
-                                        BenchmarkResult(
-                                            T=T,
-                                            K=K,
-                                            C=C,
-                                            B=args.B,
-                                            KC=KC,
-                                            backend=backend,
-                                            semiring=semiring_name,
-                                            phase=phase,
-                                            time_ms_median=float("nan"),
-                                            time_ms_iqr_low=float("nan"),
-                                            time_ms_iqr_high=float("nan"),
-                                            time_per_position_ms=float("nan"),
-                                            peak_allocated_gb=float("nan"),
-                                            peak_reserved_gb=float("nan"),
-                                            status="not_tested",
-                                            error_msg=reason,
-                                        )
-                                    )
-                                    continue
-
-                            print(
-                                f"[{completed}/{total_configs}] T={T}, K={K}, C={C}, KC={KC}, {backend}/{semiring_name}/{phase}...",
-                                end=" ",
-                                flush=True,
-                            )
-
-                            result = run_single_benchmark(
-                                T,
-                                K,
-                                C,
-                                args.B,
-                                backend,
-                                device,
-                                args.repeats,
-                                semiring_name=semiring_name,
+                    # Check backend/semiring compatibility
+                    if backend in LOG_SEMIRING_ONLY_BACKENDS and semiring_name != "Log":
+                        print(
+                            f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: "
+                            f"{backend} only supports Log semiring"
+                        )
+                        results.append(
+                            BenchmarkResult(
+                                T=T,
+                                K=K,
+                                C=C,
+                                B=args.B,
+                                KC=KC,
+                                backend=backend,
+                                semiring=semiring_name,
                                 phase=phase,
-                                use_compile=args.use_compile,
+                                time_ms_median=float("nan"),
+                                time_ms_iqr_low=float("nan"),
+                                time_ms_iqr_high=float("nan"),
+                                time_per_position_ms=float("nan"),
+                                peak_allocated_gb=float("nan"),
+                                peak_reserved_gb=float("nan"),
+                                status="not_supported",
+                                error_msg=f"{backend} only supports Log semiring",
                             )
-                            results.append(result)
+                        )
+                        continue
 
-                            if result.status == "success":
-                                print(
-                                    f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved"
+                    # Check triton backend semiring compatibility (Log, Max only)
+                    if (
+                        backend in ("triton", "triton_pytorch", "triton_checkpointing")
+                        and semiring_name not in TRITON_SUPPORTED_SEMIRINGS
+                    ):
+                        print(
+                            f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: "
+                            f"{backend} only supports Log/Max semirings"
+                        )
+                        results.append(
+                            BenchmarkResult(
+                                T=T,
+                                K=K,
+                                C=C,
+                                B=args.B,
+                                KC=KC,
+                                backend=backend,
+                                semiring=semiring_name,
+                                phase=phase,
+                                time_ms_median=float("nan"),
+                                time_ms_iqr_low=float("nan"),
+                                time_ms_iqr_high=float("nan"),
+                                time_per_position_ms=float("nan"),
+                                peak_allocated_gb=float("nan"),
+                                peak_reserved_gb=float("nan"),
+                                status="not_supported",
+                                error_msg=f"{backend} only supports Log/Max semirings",
+                            )
+                        )
+                        continue
+
+                    # Check if we should skip based on OOM history
+                    if args.skip_adjacent_oom:
+                        # Use backend-only key for memory estimation (semiring doesn't affect memory much)
+                        skip, reason = should_skip_config(
+                            T,
+                            K,
+                            C,
+                            backend,
+                            {backend: oom_history.get(oom_key, [])},
+                            args.max_memory_gb,
+                        )
+                        if skip:
+                            print(
+                                f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, {backend}/{semiring_name}/{phase}: {reason}"
+                            )
+                            results.append(
+                                BenchmarkResult(
+                                    T=T,
+                                    K=K,
+                                    C=C,
+                                    B=args.B,
+                                    KC=KC,
+                                    backend=backend,
+                                    semiring=semiring_name,
+                                    phase=phase,
+                                    time_ms_median=float("nan"),
+                                    time_ms_iqr_low=float("nan"),
+                                    time_ms_iqr_high=float("nan"),
+                                    time_per_position_ms=float("nan"),
+                                    peak_allocated_gb=float("nan"),
+                                    peak_reserved_gb=float("nan"),
+                                    status="not_tested",
+                                    error_msg=reason,
                                 )
-                            elif result.status == "oom":
-                                print("OOM")
-                                oom_history[oom_key].append((T, K, C))
-                            else:
-                                print(f"{result.status}: {result.error_msg}")
+                            )
+                            continue
+
+                    print(
+                        f"[{completed}/{total_configs}] T={T}, K={K}, C={C}, KC={KC}, {backend}/{semiring_name}/{phase}...",
+                        end=" ",
+                        flush=True,
+                    )
+
+                    result = run_single_benchmark(
+                        T,
+                        K,
+                        C,
+                        args.B,
+                        backend,
+                        device,
+                        args.repeats,
+                        semiring_name=semiring_name,
+                        phase=phase,
+                        use_compile=args.use_compile,
+                    )
+                    results.append(result)
+
+                    if result.status == "success":
+                        print(
+                            f"OK: {result.time_ms_median:.1f}ms, {result.peak_allocated_gb:.3f}GB allocated, {result.peak_reserved_gb:.3f}GB reserved"
+                        )
+                    elif result.status == "oom":
+                        print("OOM")
+                        oom_history[oom_key].append((T, K, C))
+                    else:
+                        print(f"{result.status}: {result.error_msg}")
 
     # Save results
     # 1. Full CSV with all metrics
