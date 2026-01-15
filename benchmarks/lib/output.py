@@ -132,9 +132,7 @@ def print_summary(
 
                 success = sum(1 for r in key_results if r.status == "success")
                 oom = sum(1 for r in key_results if r.status == "oom")
-                skipped = sum(
-                    1 for r in key_results if r.status in ("not_tested", "not_supported")
-                )
+                skipped = sum(1 for r in key_results if r.status in ("not_tested", "not_supported"))
 
                 successful = [r for r in key_results if r.status == "success"]
                 if successful:
