@@ -21,6 +21,7 @@ def _timeout_handler(signum, frame):
     """Signal handler for compilation timeout."""
     raise CompileTimeoutError("Compilation timed out")
 
+
 # Semirings supported by triton backends
 TRITON_SUPPORTED_SEMIRINGS = {"Log", "Max"}
 
