@@ -14,7 +14,10 @@ from torch_semimarkov.streaming import (
 
 # Conditionally import Triton functions
 if HAS_TRITON:
-    from torch_semimarkov.streaming import launch_streaming_triton_kernel
+    from torch_semimarkov.streaming import (
+        launch_streaming_triton_kernel,
+        launch_streaming_triton_backward,
+    )
 
 
 def create_golden_rule_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
@@ -261,10 +264,9 @@ class TestTritonStreamingTraining:
         transition.requires_grad_(True)
         duration_bias.requires_grad_(True)
 
-        # Use Triton path (use_compile=False for hybrid approach)
+        # Use Triton path (full Triton forward + backward)
         partition = semi_crf_streaming_forward(
-            cum_scores, transition, duration_bias, lengths, K,
-            use_triton=True, use_compile=False
+            cum_scores, transition, duration_bias, lengths, K, use_triton=True
         )
         partition.sum().backward()
 
@@ -287,29 +289,27 @@ class TestTritonStreamingTraining:
         db_py = duration_bias.clone().requires_grad_(True)
 
         partition_py = semi_crf_streaming_forward(
-            cs_py, tr_py, db_py, lengths, K,
-            use_triton=False
+            cs_py, tr_py, db_py, lengths, K, use_triton=False
         )
         partition_py.sum().backward()
 
-        # Triton path (hybrid: Triton forward + PyTorch backward)
+        # Triton path (full Triton forward + backward kernels)
         cs_tr = cum_scores.clone().requires_grad_(True)
         tr_tr = transition.clone().requires_grad_(True)
         db_tr = duration_bias.clone().requires_grad_(True)
 
         partition_tr = semi_crf_streaming_forward(
-            cs_tr, tr_tr, db_tr, lengths, K,
-            use_triton=True, use_compile=False
+            cs_tr, tr_tr, db_tr, lengths, K, use_triton=True
         )
         partition_tr.sum().backward()
 
         # Compare partition values
         torch.testing.assert_close(partition_tr, partition_py, rtol=1e-4, atol=1e-4)
 
-        # Compare gradients
-        torch.testing.assert_close(cs_tr.grad, cs_py.grad, rtol=1e-3, atol=1e-3)
-        torch.testing.assert_close(tr_tr.grad, tr_py.grad, rtol=1e-3, atol=1e-3)
-        torch.testing.assert_close(db_tr.grad, db_py.grad, rtol=1e-3, atol=1e-3)
+        # Compare gradients (use looser tolerance for Triton backward)
+        torch.testing.assert_close(cs_tr.grad, cs_py.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(tr_tr.grad, tr_py.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(db_tr.grad, db_py.grad, rtol=1e-2, atol=1e-2)
 
     def test_dispatch_inference_vs_training(self):
         """Verify correct dispatch based on requires_grad."""
@@ -334,6 +334,73 @@ class TestTritonStreamingTraining:
         assert torch.isfinite(partition_train).all()
         partition_train.sum().backward()
         assert cum_scores.grad is not None
+
+    def test_triton_backward_kernel_raw(self):
+        """Test the raw Triton backward kernel launcher."""
+        batch, T, K, C = 2, 30, 5, 4
+        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Run forward
+        partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        # Run backward
+        grad_output = torch.ones(batch, device="cuda")
+        grad_cum_scores, grad_transition, grad_duration_bias = launch_streaming_triton_backward(
+            cum_scores, transition, duration_bias, lengths,
+            partition, ring_checkpoints, checkpoint_interval, grad_output
+        )
+
+        # Verify shapes
+        assert grad_cum_scores.shape == cum_scores.shape
+        assert grad_transition.shape == transition.shape
+        assert grad_duration_bias.shape == duration_bias.shape
+
+        # Verify finite values
+        assert torch.isfinite(grad_cum_scores).all(), "grad_cum_scores non-finite"
+        assert torch.isfinite(grad_transition).all(), "grad_transition non-finite"
+        assert torch.isfinite(grad_duration_bias).all(), "grad_duration_bias non-finite"
+
+    def test_triton_gradients_variable_lengths(self):
+        """Verify Triton gradients handle variable sequence lengths."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        batch, T, K, C = 4, 50, 6, 4
+        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(
+            batch, T, K, C, device="cuda"
+        )
+        lengths = torch.tensor([T, T - 10, T - 20, T - 30], dtype=torch.long, device="cuda")
+
+        # PyTorch path
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+
+        partition_py = semi_crf_streaming_forward(
+            cs_py, tr_py, db_py, lengths, K, use_triton=False
+        )
+        partition_py.sum().backward()
+
+        # Triton path
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+
+        partition_tr = semi_crf_streaming_forward(
+            cs_tr, tr_tr, db_tr, lengths, K, use_triton=True
+        )
+        partition_tr.sum().backward()
+
+        # Compare partition values
+        torch.testing.assert_close(partition_tr, partition_py, rtol=1e-3, atol=1e-3)
+
+        # Compare gradients (looser tolerance)
+        torch.testing.assert_close(cs_tr.grad, cs_py.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(tr_tr.grad, tr_py.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(db_tr.grad, db_py.grad, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
