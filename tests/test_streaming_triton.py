@@ -245,6 +245,99 @@ class TestTritonStreamingKernel:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
+class TestTritonStreamingTraining:
+    """Test the Triton streaming kernel in training mode (with gradients)."""
+
+    def test_triton_forward_with_gradients(self):
+        """Verify Triton forward works when gradients are needed."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        batch, T, K, C = 2, 50, 6, 4
+        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        cum_scores.requires_grad_(True)
+        transition.requires_grad_(True)
+        duration_bias.requires_grad_(True)
+
+        # Use Triton path (use_compile=False for hybrid approach)
+        partition = semi_crf_streaming_forward(
+            cum_scores, transition, duration_bias, lengths, K,
+            use_triton=True, use_compile=False
+        )
+        partition.sum().backward()
+
+        assert torch.isfinite(cum_scores.grad).all(), "cum_scores grad non-finite"
+        assert torch.isfinite(transition.grad).all(), "transition grad non-finite"
+        assert torch.isfinite(duration_bias.grad).all(), "duration_bias grad non-finite"
+
+    def test_triton_gradients_match_pytorch(self):
+        """Verify Triton path gradients match PyTorch reference."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        batch, T, K, C = 2, 30, 5, 4
+        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch path
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+
+        partition_py = semi_crf_streaming_forward(
+            cs_py, tr_py, db_py, lengths, K,
+            use_triton=False
+        )
+        partition_py.sum().backward()
+
+        # Triton path (hybrid: Triton forward + PyTorch backward)
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+
+        partition_tr = semi_crf_streaming_forward(
+            cs_tr, tr_tr, db_tr, lengths, K,
+            use_triton=True, use_compile=False
+        )
+        partition_tr.sum().backward()
+
+        # Compare partition values
+        torch.testing.assert_close(partition_tr, partition_py, rtol=1e-4, atol=1e-4)
+
+        # Compare gradients
+        torch.testing.assert_close(cs_tr.grad, cs_py.grad, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(tr_tr.grad, tr_py.grad, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(db_tr.grad, db_py.grad, rtol=1e-3, atol=1e-3)
+
+    def test_dispatch_inference_vs_training(self):
+        """Verify correct dispatch based on requires_grad."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        batch, T, K, C = 2, 50, 6, 4
+        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Inference (no grad) - should use Triton kernel
+        partition_inf = semi_crf_streaming_forward(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+        assert torch.isfinite(partition_inf).all()
+
+        # Training (with grad)
+        cum_scores.requires_grad_(True)
+        partition_train = semi_crf_streaming_forward(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+        assert torch.isfinite(partition_train).all()
+        partition_train.sum().backward()
+        assert cum_scores.grad is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
 class TestTritonStreamingBenchmark:
     """Benchmark tests for Triton streaming kernel."""
 
