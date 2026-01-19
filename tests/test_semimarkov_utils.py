@@ -11,7 +11,7 @@ def test_sum_matches_logpartition():
     lengths = torch.full((batch,), T, dtype=torch.long)
 
     sm = SemiMarkov(LogSemiring)
-    v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+    v, _, _ = sm.logpartition(edge, lengths=lengths)
     total = sm.sum(edge, lengths=lengths)
 
     assert torch.allclose(total, LogSemiring.unconvert(v))
@@ -259,7 +259,7 @@ class TestMarginalsCorrectness:
         marginals = sm.marginals(edge.detach(), lengths=lengths)
 
         # Compute gradient manually
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
         v.sum().backward()
         grad = edge.grad
 

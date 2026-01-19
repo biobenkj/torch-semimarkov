@@ -254,7 +254,7 @@ class TestHSMMIntegration:
 
         sm = SemiMarkov(LogSemiring)
         lengths = torch.full((batch,), N, dtype=torch.long)
-        v, potentials, _ = sm.logpartition(edge_potentials, lengths=lengths, use_linear_scan=True)
+        v, potentials, _ = sm.logpartition(edge_potentials, lengths=lengths)
 
         # v has shape (ssize, batch) where ssize is semiring size (1 for LogSemiring)
         assert v.shape[-1] == batch
@@ -274,7 +274,7 @@ class TestHSMMIntegration:
 
         sm = SemiMarkov(LogSemiring)
         lengths = torch.full((batch,), N, dtype=torch.long)
-        v, _, _ = sm.logpartition(edge_potentials, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge_potentials, lengths=lengths)
 
         loss = v.sum()
         loss.backward()
@@ -307,6 +307,6 @@ class TestHSMMIntegration:
 
         sm = SemiMarkov(LogSemiring)
         lengths = torch.full((batch,), N, dtype=torch.long)
-        v, _, _ = sm.logpartition(edge_potentials, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge_potentials, lengths=lengths)
 
         assert torch.isfinite(v).all()

@@ -147,7 +147,7 @@ class _Struct:
             >>> marginals.shape
             torch.Size([2, 99, 8, 4, 4])
         """
-        v, edges = self.logpartition(logpotentials, lengths=lengths, force_grad=True, **kwargs)
+        v, edges, _ = self.logpartition(logpotentials, lengths=lengths, force_grad=True, **kwargs)
         if _raw:
             all_m = []
             for k in range(v.shape[0]):

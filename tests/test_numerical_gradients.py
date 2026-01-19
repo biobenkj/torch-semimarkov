@@ -59,12 +59,12 @@ class TestNumericalGradients:
         sm = SemiMarkov(LogSemiring)
 
         def forward_func(e):
-            v, _, _ = sm.logpartition(e, lengths=lengths, use_linear_scan=True)
+            v, _, _ = sm.logpartition(e, lengths=lengths)
             return v.sum()
 
         # Analytical gradient
         edge_grad = edge.clone().requires_grad_(True)
-        v, _, _ = sm.logpartition(edge_grad, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge_grad, lengths=lengths)
         v.sum().backward()
         analytical_grad = edge_grad.grad.clone()
 
@@ -91,12 +91,12 @@ class TestNumericalGradients:
         sm = SemiMarkov(LogSemiring)
 
         def forward_func(e):
-            v, _, _ = sm.logpartition(e, lengths=lengths, use_linear_scan=True)
+            v, _, _ = sm.logpartition(e, lengths=lengths)
             return v.sum()
 
         # Analytical gradient
         edge_grad = edge.clone().requires_grad_(True)
-        v, _, _ = sm.logpartition(edge_grad, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge_grad, lengths=lengths)
         v.sum().backward()
         analytical_grad = edge_grad.grad.clone()
 
@@ -117,12 +117,12 @@ class TestNumericalGradients:
         sm = SemiMarkov(LogSemiring)
 
         def forward_func(e):
-            v, _, _ = sm.logpartition(e, lengths=lengths, use_linear_scan=True)
+            v, _, _ = sm.logpartition(e, lengths=lengths)
             return v.sum()
 
         # Analytical gradient
         edge_grad = edge.clone().requires_grad_(True)
-        v, _, _ = sm.logpartition(edge_grad, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge_grad, lengths=lengths)
         v.sum().backward()
         analytical_grad = edge_grad.grad.clone()
 
@@ -207,7 +207,7 @@ class TestMarginalGradients:
         marginals = sm.marginals(edge.detach(), lengths=lengths)
 
         # Manually compute gradient using autograd
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
         v.sum().backward()
         manual_grad = edge.grad
 
@@ -237,7 +237,7 @@ class TestHessianComputation:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         # First backward
         (grad,) = torch.autograd.grad(v.sum(), edge, create_graph=True)
@@ -260,7 +260,7 @@ class TestHessianComputation:
 
         def grad_func(e):
             e = e.clone().requires_grad_(True)
-            v, _, _ = sm.logpartition(e, lengths=lengths, use_linear_scan=True)
+            v, _, _ = sm.logpartition(e, lengths=lengths)
             v.sum().backward()
             return e.grad.sum()
 
@@ -280,7 +280,7 @@ class TestHessianComputation:
 
         # Analytical Hessian via double backward
         edge_grad = edge.clone().requires_grad_(True)
-        v, _, _ = sm.logpartition(edge_grad, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge_grad, lengths=lengths)
         (grad,) = torch.autograd.grad(v.sum(), edge_grad, create_graph=True)
         (hessian_row,) = torch.autograd.grad(grad.sum(), edge_grad)
         analytical_hessian = hessian_row[idx]

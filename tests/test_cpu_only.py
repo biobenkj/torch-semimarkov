@@ -33,13 +33,13 @@ class TestCPUOnlyOperation:
         assert lengths.device.type == "cpu"
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert v.device.type == "cpu"
         assert torch.isfinite(v).all()
 
-    def test_all_backends_work_on_cpu(self):
-        """All DP backends operate correctly on CPU."""
+    def test_streaming_scan_on_cpu(self):
+        """Streaming scan operates correctly on CPU."""
         batch, T, K, C = 2, 6, 3, 2
         torch.manual_seed(42)
         edge = torch.randn(batch, T - 1, K, C, C)
@@ -47,37 +47,8 @@ class TestCPUOnlyOperation:
 
         sm = SemiMarkov(LogSemiring)
 
-        # Standard (non-vectorized)
-        v1, _, _ = sm._dp_standard(edge.clone(), lengths)
-        assert v1.device.type == "cpu"
-
-        # Vectorized
-        v2, _, _ = sm._dp_standard_vectorized(edge.clone(), lengths)
-        assert v2.device.type == "cpu"
-
-        # Streaming
-        v3, _, _ = sm._dp_scan_streaming(edge.clone(), lengths)
-        assert v3.device.type == "cpu"
-
-        # All should match
-        assert torch.allclose(v1, v2, atol=1e-5)
-        assert torch.allclose(v1, v3, atol=1e-5)
-
-    def test_banded_path_on_cpu(self):
-        """Banded path works on CPU."""
-        batch, T, K, C = 2, 8, 4, 2
-        edge = torch.randn(batch, T - 1, K, C, C)
-        lengths = torch.full((batch,), T, dtype=torch.long)
-
-        sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(
-            edge,
-            lengths=lengths,
-            use_banded=True,
-            banded_perm="auto",
-            banded_bw_ratio=1.1,
-        )
-
+        # Streaming (only backend)
+        v, _, _ = sm._dp_scan_streaming(edge.clone(), lengths)
         assert v.device.type == "cpu"
         assert torch.isfinite(v).all()
 
@@ -123,7 +94,7 @@ class TestCPUOnlyOperation:
         lengths = torch.full((batch,), T, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
         v.sum().backward()
 
         assert edge.grad is not None
@@ -143,8 +114,8 @@ class TestCPUConsistency:
 
         sm = SemiMarkov(LogSemiring)
 
-        v1, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
-        v2, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v1, _, _ = sm.logpartition(edge, lengths=lengths)
+        v2, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert torch.equal(v1, v2)
 
@@ -159,13 +130,13 @@ class TestCPUConsistency:
 
         # First run
         edge1 = edge_base.clone().requires_grad_(True)
-        v1, _, _ = sm.logpartition(edge1, lengths=lengths, use_linear_scan=True)
+        v1, _, _ = sm.logpartition(edge1, lengths=lengths)
         v1.sum().backward()
         grad1 = edge1.grad.clone()
 
         # Second run
         edge2 = edge_base.clone().requires_grad_(True)
-        v2, _, _ = sm.logpartition(edge2, lengths=lengths, use_linear_scan=True)
+        v2, _, _ = sm.logpartition(edge2, lengths=lengths)
         v2.sum().backward()
         grad2 = edge2.grad.clone()
 
@@ -182,7 +153,7 @@ class TestCPUDocumentation:
         lengths = torch.full((batch,), T, dtype=torch.long, device=cpu_device)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert v.device == cpu_device
 
@@ -198,7 +169,7 @@ class TestCPUDocumentation:
 
         # Run inference (use linear scan to get consistent 3-tuple return)
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         # Verify success
         assert torch.isfinite(v).all()

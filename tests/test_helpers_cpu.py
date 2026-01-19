@@ -36,8 +36,8 @@ def test_raw_sum_and_marginals_shapes():
     lengths = torch.full((batch,), T, dtype=torch.long)
     struct = SemiMarkov(LogSemiring)
 
-    v_raw = struct.sum(edge, lengths=lengths, _raw=True, use_linear_scan=True)
+    v_raw = struct.sum(edge, lengths=lengths, _raw=True)
     assert v_raw.shape == (1, batch)
 
-    marg_raw = struct.marginals(edge, lengths=lengths, _raw=True, use_linear_scan=False)
+    marg_raw = struct.marginals(edge, lengths=lengths, _raw=True)
     assert marg_raw.shape == (1, batch, T - 1, K, C, C)

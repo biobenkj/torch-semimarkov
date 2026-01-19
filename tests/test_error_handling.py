@@ -23,7 +23,7 @@ class TestInvalidDimensions:
 
         sm = SemiMarkov(LogSemiring)
         with pytest.raises(AssertionError, match="Transition shape"):
-            sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+            sm.logpartition(edge, lengths=lengths)
 
     def test_wrong_edge_ndim(self):
         """Edge potentials must be 5D tensor."""
@@ -34,7 +34,7 @@ class TestInvalidDimensions:
 
         sm = SemiMarkov(LogSemiring)
         with pytest.raises((ValueError, RuntimeError, IndexError)):
-            sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+            sm.logpartition(edge, lengths=lengths)
 
 
 class TestLengthValidation:
@@ -49,7 +49,7 @@ class TestLengthValidation:
 
         sm = SemiMarkov(LogSemiring)
         with pytest.raises(AssertionError, match="Length longer than edge scores"):
-            sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+            sm.logpartition(edge, lengths=lengths)
 
     def test_max_length_must_equal_n(self):
         """At least one sequence must have length equal to N."""
@@ -60,7 +60,7 @@ class TestLengthValidation:
 
         sm = SemiMarkov(LogSemiring)
         with pytest.raises(AssertionError, match="At least one in batch must be length N"):
-            sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+            sm.logpartition(edge, lengths=lengths)
 
     def test_valid_variable_lengths(self):
         """Variable lengths work when max length equals N."""
@@ -71,7 +71,7 @@ class TestLengthValidation:
 
         sm = SemiMarkov(LogSemiring)
         # Should not raise
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
         assert torch.isfinite(v).all()
 
 
@@ -86,7 +86,7 @@ class TestNumericalEdgeCases:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         # NaN should propagate to at least the first batch item
         assert torch.isnan(v[..., 0]).any()
@@ -102,7 +102,7 @@ class TestNumericalEdgeCases:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         # Should still produce finite results (other paths available)
         # Note: if ALL paths are masked, result will be -inf
@@ -115,7 +115,7 @@ class TestNumericalEdgeCases:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         # Should be finite (log-space arithmetic handles large values)
         assert torch.isfinite(v).all()
@@ -127,7 +127,7 @@ class TestNumericalEdgeCases:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert torch.isfinite(v).all()
 
@@ -142,7 +142,7 @@ class TestMinimalConfigurations:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert v.shape[-1] == batch
         assert torch.isfinite(v).all()
@@ -154,7 +154,7 @@ class TestMinimalConfigurations:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert torch.isfinite(v).all()
 
@@ -165,7 +165,7 @@ class TestMinimalConfigurations:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert torch.isfinite(v).all()
 
@@ -176,7 +176,7 @@ class TestMinimalConfigurations:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert torch.isfinite(v).all()
 
@@ -187,16 +187,16 @@ class TestMinimalConfigurations:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         assert torch.isfinite(v).all()
 
 
-class TestBackendConsistencyEdgeCases:
-    """Test that different backends handle edge cases consistently."""
+class TestStreamingEdgeCases:
+    """Test that streaming backend handles edge cases correctly."""
 
-    def test_all_backends_handle_short_sequence(self):
-        """All backends produce same result for short sequences."""
+    def test_streaming_handles_short_sequence(self):
+        """Streaming produces finite results for short sequences."""
         batch, N, K, C = 2, 4, 3, 2
         torch.manual_seed(42)
         edge = torch.randn(batch, N - 1, K, C, C)
@@ -204,17 +204,12 @@ class TestBackendConsistencyEdgeCases:
 
         sm = SemiMarkov(LogSemiring)
 
-        # Get results from different backends
         v_streaming, _, _ = sm._dp_scan_streaming(edge.clone(), lengths)
-        v_vectorized, _, _ = sm._dp_standard_vectorized(edge.clone(), lengths)
-        v_standard, _, _ = sm._dp_standard(edge.clone(), lengths)
 
-        # All should match
-        assert torch.allclose(v_streaming, v_vectorized, atol=1e-5)
-        assert torch.allclose(v_streaming, v_standard, atol=1e-5)
+        assert torch.isfinite(v_streaming).all()
 
-    def test_all_backends_handle_variable_lengths(self):
-        """All backends produce same result for variable lengths."""
+    def test_streaming_handles_variable_lengths(self):
+        """Streaming produces finite results for variable lengths."""
         batch, N, K, C = 3, 8, 4, 2
         torch.manual_seed(123)
         edge = torch.randn(batch, N - 1, K, C, C)
@@ -223,11 +218,8 @@ class TestBackendConsistencyEdgeCases:
         sm = SemiMarkov(LogSemiring)
 
         v_streaming, _, _ = sm._dp_scan_streaming(edge.clone(), lengths)
-        v_vectorized, _, _ = sm._dp_standard_vectorized(edge.clone(), lengths)
-        v_standard, _, _ = sm._dp_standard(edge.clone(), lengths)
 
-        assert torch.allclose(v_streaming, v_vectorized, atol=1e-5)
-        assert torch.allclose(v_streaming, v_standard, atol=1e-5)
+        assert torch.isfinite(v_streaming).all()
 
 
 class TestGradientEdgeCases:
@@ -245,7 +237,7 @@ class TestGradientEdgeCases:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
         v.sum().backward()
 
         # Gradient should exist and be finite where potentials were finite
@@ -261,7 +253,7 @@ class TestGradientEdgeCases:
         lengths = torch.full((batch,), N, dtype=torch.long)
 
         sm = SemiMarkov(LogSemiring)
-        v, _, _ = sm.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        v, _, _ = sm.logpartition(edge, lengths=lengths)
 
         # Should complete without error
         assert torch.isfinite(v).all()

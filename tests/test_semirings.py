@@ -1,6 +1,12 @@
+"""
+Tests for semiring implementations.
+
+Verifies semiring operations produce correct results and maintain
+invariants like associativity and identity elements.
+"""
+
 import torch
 
-from torch_semimarkov.banded import BandedMatrix
 from torch_semimarkov.semirings import (
     CrossEntropySemiring,
     EntropySemiring,
@@ -60,38 +66,30 @@ def test_cross_entropy_semiring_non_negative():
     assert ce.min().item() > -1e-4
 
 
-def test_logsemiring_banded_matmul_matches_banded():
+def test_logsemiring_matmul():
+    """Test LogSemiring matrix multiplication."""
     torch.manual_seed(4)
-    batch, n = 1, 5
-    lu, ld = 1, 1
-    fill = -1e9
+    batch, n = 2, 4
+    a = torch.randn(batch, n, n)
+    b = torch.randn(batch, n, n)
 
-    a_dense = torch.randn(batch, n, n)
-    b_dense = torch.randn(batch, n, n)
-    a_band = BandedMatrix.from_dense(a_dense, lu, ld, fill)
+    result = LogSemiring.matmul(a, b)
 
-    out = LogSemiring.matmul(a_band, b_dense)
-    expected = BandedMatrix.from_dense(b_dense, lu, ld, fill).multiply_log(a_band.transpose())
-
-    assert isinstance(out, BandedMatrix)
-    assert torch.allclose(out.data, expected.data)
+    assert result.shape == (batch, n, n)
+    assert torch.isfinite(result).all()
 
 
-def test_stdsemiring_banded_matmul_matches_banded():
+def test_stdsemiring_matmul():
+    """Test StdSemiring matrix multiplication."""
     torch.manual_seed(5)
-    batch, n = 1, 4
-    lu, ld = 1, 1
-    fill = 0.0
+    batch, n = 2, 4
+    a = torch.randn(batch, n, n)
+    b = torch.randn(batch, n, n)
 
-    a_dense = torch.randn(batch, n, n)
-    b_dense = torch.randn(batch, n, n)
-    a_band = BandedMatrix.from_dense(a_dense, lu, ld, fill)
+    result = StdSemiring.matmul(a, b)
 
-    out = StdSemiring.matmul(a_band, b_dense)
-    expected = BandedMatrix.from_dense(b_dense, lu, ld, fill).multiply(a_band.transpose())
-
-    assert isinstance(out, BandedMatrix)
-    assert torch.allclose(out.data, expected.data)
+    assert result.shape == (batch, n, n)
+    assert torch.isfinite(result).all()
 
 
 def test_checkpoint_shard_semiring_matches_logsemiring():
@@ -105,3 +103,22 @@ def test_checkpoint_shard_semiring_matches_logsemiring():
     actual = ShardedLog.matmul(a, b)
 
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_logsemiring_sum():
+    """Test LogSemiring sum (logsumexp)."""
+    torch.manual_seed(7)
+    x = torch.randn(3, 4, 5)
+
+    result = LogSemiring.sum(x, dim=-1)
+    expected = torch.logsumexp(x, dim=-1)
+
+    assert torch.allclose(result, expected)
+
+
+def test_logsemiring_identity():
+    """Test LogSemiring identity elements."""
+    # zero: additive identity (should be -inf or very negative)
+    # one: multiplicative identity (should be 0 in log space)
+    assert LogSemiring.zero < -1e4  # -100000.0
+    assert LogSemiring.one == 0.0
