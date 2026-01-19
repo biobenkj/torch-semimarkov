@@ -1,9 +1,51 @@
-r"""Fused streaming Semi-Markov CRF forward scan implementations.
+r"""Fused Semi-Markov CRF forward scan with pre-computed edge potentials.
 
-This module provides optimized implementations of the streaming forward scan
-for Semi-Markov CRFs. The key optimization is fusing the O(N) loop into
-a single GPU kernel, keeping the :math:`K \times C` frontier in fast memory.
+This module provides optimized implementations of the forward scan for Semi-Markov
+CRFs when edge potentials are **pre-computed and materialized in GPU memory**.
 
+.. important::
+    **When to use this module vs. streaming API:**
+
+    Use ``triton_scan`` (this module) when:
+        - Edge tensor fits in GPU memory
+        - Edge potentials are pre-computed (e.g., from a neural network)
+        - Moderate sequence lengths (typically T < 10K)
+
+    Use ``streaming`` module when:
+        - Edge tensor is too large to materialize (T > 10K, large K)
+        - Edges follow the "Golden Rule" structure (content + transition)
+        - Very long sequences (T = 100K - 400K+)
+
+    **Memory comparison:**
+
+    +-----------------------+------------------+-------------------+
+    | Scenario              | edge tensor size | cum_scores size   |
+    +=======================+==================+===================+
+    | T=1K, K=32, C=24      | 18 MB            | 96 KB             |
+    +-----------------------+------------------+-------------------+
+    | T=10K, K=100, C=24    | 5.5 GB           | 960 KB            |
+    +-----------------------+------------------+-------------------+
+    | T=400K, K=3K, C=24    | **2.76 TB**      | 38 MB             |
+    +-----------------------+------------------+-------------------+
+
+    For the T=400K case, the edge tensor cannot fit in memory. Use the
+    :mod:`~torch_semimarkov.streaming` module instead, which computes edges
+    on-the-fly from O(T×C) cumulative scores.
+
+API
+---
+This module takes a **pre-computed edge tensor**::
+
+    edge = model(x)  # shape: (batch, T-1, K, C, C) - must fit in GPU memory!
+    partition = semi_crf_triton_forward(edge, lengths)
+
+The streaming module takes **cumulative scores** and computes edges on-the-fly::
+
+    cum_scores = cumsum(projected, dim=1)  # shape: (batch, T+1, C) - much smaller!
+    partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
+
+Implementation
+--------------
 Three execution paths are provided, automatically selected based on context:
 
 1. **Custom Triton kernel** (GPU inference): Maximum performance (~45x faster),
@@ -40,6 +82,11 @@ Examples::
     >>> partition.sum().backward()
     >>> # Viterbi (max semiring) for best path score
     >>> viterbi = semi_crf_triton_forward(edge, lengths, semiring="max")
+
+See Also
+--------
+:mod:`torch_semimarkov.streaming` : For sequences where edge tensor is too large
+:class:`torch_semimarkov.SemiMarkov` : High-level API with marginals and sampling
 """
 
 import torch
