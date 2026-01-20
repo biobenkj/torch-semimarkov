@@ -146,6 +146,16 @@ if HAS_TRITON:
             p *= 2
         return p
 
+    # Autotune configurations for forward kernel (Phase 3 optimization)
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=2, num_stages=2),
+            triton.Config({}, num_warps=4, num_stages=2),
+            triton.Config({}, num_warps=4, num_stages=3),
+            triton.Config({}, num_warps=8, num_stages=2),
+        ],
+        key=['T', 'K', 'C_PAD'],
+    )
     @triton.jit
     def semi_crf_streaming_scan_kernel(
         # Inputs
@@ -382,6 +392,16 @@ if HAS_TRITON:
         # Store result
         tl.store(out_ptr + batch_idx, partition)
 
+    # Autotune configurations for max semiring forward kernel (Phase 3 optimization)
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=2, num_stages=2),
+            triton.Config({}, num_warps=4, num_stages=2),
+            triton.Config({}, num_warps=4, num_stages=3),
+            triton.Config({}, num_warps=8, num_stages=2),
+        ],
+        key=['T', 'K', 'C_PAD'],
+    )
     @triton.jit
     def semi_crf_streaming_scan_kernel_max(
         # Same signature as log kernel
@@ -551,6 +571,19 @@ if HAS_TRITON:
 
         tl.store(out_ptr + batch_idx, partition)
 
+    # Autotune configurations for backward kernel (Phase 3 optimization)
+    # Vary num_warps to find optimal parallelism for different workloads.
+    # Block dimensions are determined by C_PAD, so we only tune execution params.
+    @triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=2, num_stages=2),
+            triton.Config({}, num_warps=4, num_stages=2),
+            triton.Config({}, num_warps=4, num_stages=3),
+            triton.Config({}, num_warps=8, num_stages=2),
+            triton.Config({}, num_warps=8, num_stages=3),
+        ],
+        key=['T', 'K', 'C_PAD'],  # Retune when these dimensions change
+    )
     @triton.jit
     def semi_crf_streaming_backward_kernel(
         # Inputs (from forward)
@@ -613,7 +646,19 @@ if HAS_TRITON:
         2. Compute beta backward while accumulating gradients
 
         Marginal probability: P(segment) = exp(alpha + edge + beta - log_Z)
-        Gradient accumulation uses atomic operations for shared parameters.
+
+        Phase 3 Optimizations:
+        ----------------------
+        - **grad_transition**: Uses register-based local accumulation. Instead of
+          O(batch * T * K) atomic operations to the same C×C memory locations,
+          each program accumulates locally and writes once at the end, reducing
+          atomic contention to O(batch).
+
+        - **grad_duration_bias**: Still uses atomic adds, but contention is lower
+          since each k value writes to different memory locations. Contention is
+          O(batch * T) per (k, c) element, not O(batch * T * K).
+
+        - **grad_cum_scores**: Uses atomic adds (per-batch tensor with low contention).
 
         Gradient Scaling Semantics (IMPORTANT):
         ---------------------------------------
@@ -656,6 +701,11 @@ if HAS_TRITON:
         seq_len = tl.load(lengths_ptr + batch_idx)
         log_Z = tl.load(log_Z_ptr + batch_idx)
         grad_out = tl.load(grad_output_ptr + batch_idx)
+
+        # === LOCAL GRADIENT ACCUMULATORS (Phase 3 optimization) ===
+        # Accumulate shared parameter gradients locally, write once at end.
+        # This reduces atomic contention from O(T*K) to O(1) per program.
+        grad_tr_local = tl.zeros([C_PAD, C_PAD], dtype=tl.float32)
 
         # Base pointers
         cum_scores_base = cum_scores_ptr + batch_idx * stride_cs_b
@@ -874,13 +924,11 @@ if HAS_TRITON:
                                     mask=c_mask,
                                 )
 
-                                # grad_transition: use 2D atomic add (unscaled marginal)
+                                # grad_transition: accumulate locally (Phase 3 optimization)
                                 # marginal is (C_dst, C_src), grad_transition[c_src, c_dst] += marginal[c_dst, c_src]
                                 marginal_T = tl.trans(marginal)  # (C_src, C_dst) = (C_PAD, C_PAD)
-                                # Compute 2D offsets: grad_transition[row, col] at row * stride_tr_src + col * stride_tr_dst
-                                # c_dst_idx is (C_PAD, 1) serving as row indices, c_src_idx is (1, C_PAD) as col indices
-                                tr_offsets = c_dst_idx * stride_tr_src + c_src_idx * stride_tr_dst
-                                tl.atomic_add(grad_transition_ptr + tr_offsets, marginal_T, mask=c_mask_2d)
+                                # Local accumulation instead of atomic add - write once at kernel end
+                                grad_tr_local += marginal_T
 
                                 # grad_duration_bias[k, c_dst] += sum over c_src (unscaled)
                                 tl.atomic_add(
@@ -914,6 +962,16 @@ if HAS_TRITON:
                             new_beta,
                             mask=c_mask,
                         )
+
+        # === FINAL WRITE: Accumulated shared gradients (Phase 3 optimization) ===
+        # Write locally accumulated grad_transition with a single atomic add per program.
+        # This reduces atomic contention from O(batch * T * K) to O(batch).
+        tr_offsets = c_dst_idx * stride_tr_src + c_src_idx * stride_tr_dst
+        tl.atomic_add(
+            grad_transition_ptr + tr_offsets,
+            grad_tr_local,
+            mask=c_mask_2d,
+        )
 
     def launch_streaming_triton_backward(
         cum_scores: torch.Tensor,

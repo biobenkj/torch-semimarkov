@@ -540,30 +540,60 @@ grad_transition = sum_{b,t,k}(marginal[b,t,k] * grad_output[b])
 
 ---
 
-### Phase 3: Performance Optimizations [NEXT]
+### Phase 3: Performance Optimizations [IN PROGRESS]
 
-**Status**: 🔲 Not Started
+**Status**: ✅ Core optimizations complete, pending HPC validation
 
 **Goal**: Optimize Triton kernels for maximum throughput.
 
-**Tasks**:
-- [ ] **Shared memory reduction for atomic adds**: Currently using global memory atomics
-      for transition and duration_bias gradients. Should use warp-level or block-level
-      reduction in shared memory before a single atomic add.
-- [ ] **Split streaming.py**: File is large (~1700 lines). Consider splitting into:
-  - `streaming_pytorch.py` - PyTorch reference implementations
-  - `streaming_triton.py` - Triton kernels
-  - `streaming.py` - Main API and autograd functions
-- [ ] **Autotune kernel configurations**: Add `@triton.autotune` for block sizes
-- [ ] **Profile memory bandwidth**: Ensure we're hitting theoretical peak
-- [ ] **Benchmark at scale**: Test with T=100K+, K=1000+, C=24
+**Completed Tasks**:
+- [x] **Register-based local accumulation for grad_transition**: Replaced O(batch×T×K)
+      atomic operations with local accumulation + single final atomic write per program.
+      This was the primary bottleneck (all operations competing for C×C = 576 elements).
+- [x] **Autotune kernel configurations**: Added `@triton.autotune` decorators to all
+      three Triton kernels (forward log, forward max, backward) with configurations
+      varying `num_warps` (2, 4, 8) and `num_stages` (2, 3).
+- [x] **Scale benchmarks created**: `benchmarks/benchmark_streaming_backward.py` and
+      `benchmarks/benchmark_streaming_scale.py` for testing at T=100K+, K=1000+.
 
-**Optimization priorities** (from colleague review):
-1. Atomic adds on global memory are a bottleneck for large batch sizes
-2. Consider accumulating transition gradients in registers/shared memory per-thread,
-   then doing a single reduction at the end
+**Deferred Tasks** (pending validation):
+- [ ] **Split streaming.py**: File is ~1700 lines. Deferred to post-validation to avoid
+      introducing regressions before HPC testing.
+- [ ] **Profile memory bandwidth**: Benchmark at scale first to measure actual gains.
 
-**Estimated effort**: 2-3 days
+**Implementation Details**:
+
+The primary optimization targets `grad_transition` atomic contention:
+
+```python
+# BEFORE (Phase 2b): O(batch × T × K) atomic operations per element
+for t, k in all_positions:
+    tl.atomic_add(grad_transition_ptr + tr_offsets, marginal_T, mask=c_mask_2d)
+
+# AFTER (Phase 3): O(batch) atomic operations per element
+grad_tr_local = tl.zeros([C_PAD, C_PAD], dtype=tl.float32)  # Local accumulator
+for t, k in all_positions:
+    grad_tr_local += marginal_T  # Register-only, no memory traffic
+# Single write at end
+tl.atomic_add(grad_transition_ptr + tr_offsets, grad_tr_local, mask=c_mask_2d)
+```
+
+**grad_duration_bias**: Kept using atomic adds because contention is K-fold lower
+(each k value writes to different rows). May optimize in future if benchmarks show need.
+
+**Expected Performance Improvement**: 2-5x backward kernel speedup at scale.
+
+**Validation Commands**:
+```bash
+# Correctness tests
+python3 -m pytest tests/test_streaming_triton.py::TestTritonStreamingTraining -xvs
+
+# Backward benchmark (small to large scale)
+python3 benchmarks/benchmark_streaming_backward.py
+
+# Scale benchmark (T=100K+)
+python3 benchmarks/benchmark_streaming_scale.py
+```
 
 ---
 
@@ -880,14 +910,14 @@ benchmarks/
 | 1 | PyTorch reference streaming | 2-3 days | ✅ COMPLETED |
 | 2 | Triton forward kernel | 3-4 days | ✅ COMPLETED |
 | 2b | Triton backward kernel | 4-5 days | ✅ COMPLETED |
-| 3 | Performance optimizations | 2-3 days | 🔲 Next |
+| 3 | Performance optimizations | 2-3 days | ✅ Core complete (pending HPC validation) |
 | 4 | Duration-dependent scoring | 2 days | 🔲 Pending |
 | 5 | Integration layer | 2-3 days | 🔲 Pending |
 | 6 | Testing and validation | 2-3 days | 🔲 Pending |
 
-**Progress: ~60% complete (Phases 1, 2, 2b done)**
+**Progress: ~70% complete (Phases 1, 2, 2b, 3 core done)**
 
-**Remaining effort: ~9-11 days**
+**Remaining effort: ~7-9 days**
 
 ---
 
@@ -911,15 +941,20 @@ benchmarks/
 2. ✅ ~~Start Phase 1: PyTorch reference implementation~~
 3. ✅ ~~Phase 2: Triton forward kernel~~
 4. ✅ ~~Phase 2b: Triton backward kernel~~
-5. **Run full test suite on HPC** to verify backward kernel correctness
-6. **Phase 3: Performance optimizations** (shared memory reduction for atomics)
-7. Profile at scale (T=100K+) to identify remaining bottlenecks
+5. ✅ ~~Phase 3: Performance optimizations~~ (core complete)
+6. **Run full test suite on HPC** to verify optimized kernel correctness
+7. **Run scale benchmarks** (`benchmark_streaming_scale.py`) to measure performance gains
 8. Phase 4-6: Enhanced features and integration
 
 ---
 
 ## Changelog
 
+- **2025-01-20**: Completed Phase 3 core optimizations:
+  - Register-based local accumulation for `grad_transition` (reduces atomic contention from O(batch×T×K) to O(batch))
+  - Added `@triton.autotune` to all kernels (forward log, forward max, backward)
+  - Created scale benchmarks: `benchmark_streaming_backward.py`, `benchmark_streaming_scale.py`
+  - Deferred file splitting to post-HPC validation
 - **2025-01-19**: Completed Phase 2b (Triton backward kernel). Fixed critical gradient scaling bug
   that caused factor-of-2 error for shared parameters. All tests passing locally (pending HPC verification).
 - **2025-01-18**: Completed Phases 1 and 2. PyTorch reference and Triton forward kernel working.
@@ -928,5 +963,5 @@ benchmarks/
 ---
 
 *Created: 2025-01-18*
-*Last Updated: 2025-01-19*
+*Last Updated: 2025-01-20*
 *Target: torch-semimarkov v2.0 with streaming edge API*
