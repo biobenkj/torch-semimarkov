@@ -349,7 +349,7 @@ class TestTritonStreamingTraining:
 
         # Run backward
         grad_output = torch.ones(batch, device="cuda")
-        grad_cum_scores, grad_transition, grad_duration_bias = launch_streaming_triton_backward(
+        grad_cum_scores, grad_transition, grad_duration_bias, _, _ = launch_streaming_triton_backward(
             cum_scores, transition, duration_bias, lengths,
             partition, ring_checkpoints, checkpoint_interval, grad_output
         )
