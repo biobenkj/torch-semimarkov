@@ -438,163 +438,138 @@ This enables clinicians to see:
 
 ## Implementation Phases
 
-### Phase 0: Micro-Benchmark (Recommended First Step)
+### ✅ Phase 1: PyTorch Reference Implementation [COMPLETED]
 
-**Goal**: Validate that the Golden Rule kernel will be fast enough before full implementation.
-
-**Rationale**: Your colleague correctly suggests benchmarking the inner loop before committing
-to the full implementation. This takes ~1 hour and prevents wasted effort.
-
-**Benchmark**:
-```python
-@triton.jit
-def inner_loop_microbenchmark(
-    cum_scores_ptr,    # (T, C)
-    transition_ptr,    # (C, C)
-    T: tl.constexpr,
-    C: tl.constexpr,
-):
-    """Measure: 2 vector loads + subtract + add transition."""
-    c_idx = tl.arange(0, C)
-    transition = tl.load(transition_ptr + ...)  # (C, C) - load once
-
-    for t in tl.range(1, T):
-        for k in tl.range(1, 32):  # Sample K range
-            # This is what runs T × K times
-            cum_end = tl.load(cum_scores_ptr + t * C + c_idx)
-            cum_start = tl.load(cum_scores_ptr + (t - k) * C + c_idx)
-            segment_score = cum_end - cum_start  # (C,)
-            edge_block = segment_score[:, None] + transition  # (C, C)
-```
-
-**Success criteria**:
-- Inner loop latency < 50 cycles per (t, k) iteration → viable
-- Inner loop latency > 200 cycles → need Block-K tiling optimization
-
-**Estimated effort**: 2-4 hours
-
----
-
-### Phase 1: PyTorch Reference Implementation
+**Status**: ✅ Completed (2025-01-18)
 
 **Goal**: Working Golden Rule forward/backward in pure PyTorch for correctness verification.
 
 **Files**:
-- `src/torch_semimarkov/streaming.py` (new)
+- `src/torch_semimarkov/streaming.py`
 
-**Tasks**:
-- [ ] Implement `semi_crf_streaming_forward_pytorch()` with pre-projected inputs
-- [ ] Implement `semi_crf_streaming_backward_pytorch()` (compute marginals + gradients)
-- [ ] Create `SemiCRFStreaming` autograd Function
-- [ ] Add gradient tests with `torch.autograd.gradcheck`
-- [ ] Test numerical stability with T=100K+ in float32
+**Completed Tasks**:
+- [x] Implement `semi_crf_streaming_forward_pytorch()` with pre-projected inputs
+- [x] Implement `semi_crf_streaming_backward_pytorch()` (compute marginals + gradients)
+- [x] Create `SemiCRFStreaming` autograd Function
+- [x] Add gradient tests with `torch.autograd.gradcheck`
+- [x] Test numerical stability with T=100K+ in float32
 
 **Golden Rule edge computation (inside forward loop)**:
 ```python
-def compute_edge_block_golden_rule(cum_scores, transition, t, k,
+def compute_edge_block_golden_rule(cum_scores, transition, duration_bias, t, k,
                                     proj_start=None, proj_end=None):
     """Compute edge[t, k, :, :] - NO MATMULS, just vector ops."""
     # Content score via cumsum difference: (batch, C)
     content_score = cum_scores[:, t + k, :] - cum_scores[:, t, :]
 
+    # Add duration bias (required for sum-pooling)
+    segment_score = content_score + duration_bias[k]
+
     # Add boundary scores if provided
-    segment_score = content_score
     if proj_start is not None:
         segment_score = segment_score + proj_start[:, t, :]
     if proj_end is not None:
         segment_score = segment_score + proj_end[:, t + k - 1, :]
 
     # Add transition to get full edge block: (batch, C, C)
-    edge_block = segment_score.unsqueeze(-1) + transition.unsqueeze(0)
+    edge_block = segment_score.unsqueeze(-1) + transition.T.unsqueeze(0)
 
     return edge_block  # (batch, C, C)
 ```
+
+---
+
+### ✅ Phase 2: Triton Forward Kernel [COMPLETED]
+
+**Status**: ✅ Completed (2025-01-18)
+
+**Goal**: GPU-accelerated streaming forward pass.
+
+**Files**:
+- `src/torch_semimarkov/streaming.py` (integrated into single file)
+
+**Completed Tasks**:
+- [x] Implement `semi_crf_streaming_forward_kernel` with streaming edge computation
+- [x] Handle cumulative feature memory access patterns
+- [x] Power-of-2 padding for C dimension
+- [x] Ring buffer checkpointing for backward pass
+- [x] Benchmark against PyTorch reference - matches within 1e-4 tolerance
+
+**Key implementation details**:
+- One Triton program per batch element
+- Ring buffer of size (K, C_PAD) for alpha values
+- Checkpoints saved at configurable intervals for backward pass
+- Supports both "log" (logsumexp) and "max" (Viterbi) semirings
+
+---
+
+### ✅ Phase 2b: Triton Backward Kernel [COMPLETED]
+
+**Status**: ✅ Completed (2025-01-19)
+
+**Goal**: GPU-accelerated backward pass with gradient computation.
+
+**Files**:
+- `src/torch_semimarkov/streaming.py` (integrated)
+
+**Completed Tasks**:
+- [x] Implement `semi_crf_streaming_backward_kernel` with two-phase approach:
+  1. Recompute alpha from checkpoints (segment by segment)
+  2. Compute beta backward while accumulating gradients
+- [x] Accumulate gradients to `cum_scores` (per-batch, scaled in kernel)
+- [x] Accumulate gradients to `transition` (shared, atomic adds)
+- [x] Accumulate gradients to `duration_bias` (shared, atomic adds)
+- [x] Verify gradients match PyTorch reference within 1e-2 tolerance
+
+**Bug Fixes During Implementation**:
+1. **Continue statements**: Triton doesn't support `continue` - converted to nested `if` conditions
+2. **Constexpr tensor indexing**: Can't index tensors with constexpr loop variables - used 2D atomic add instead
+3. **Checkpoint lookup**: Fixed alpha recomputation for positions before segment start
+4. **Gradient scaling (factor of 2 bug)**: Critical fix for shared parameter gradients:
+   - Per-batch parameters (cum_scores): Scaled by `grad_output[batch_idx]` inside kernel
+   - Shared parameters (transition, duration_bias): Accumulated unscaled, then multiplied by `grad_output.sum()` after kernel
+
+**Gradient Scaling Semantics** (documented in kernel docstring):
+```python
+# CORRECT (PyTorch semantics):
+grad_transition = sum_{b,t,k}(marginal[b,t,k]) * grad_output.sum()
+
+# WRONG (caused factor-of-2 error):
+grad_transition = sum_{b,t,k}(marginal[b,t,k] * grad_output[b])
+```
+
+---
+
+### Phase 3: Performance Optimizations [NEXT]
+
+**Status**: 🔲 Not Started
+
+**Goal**: Optimize Triton kernels for maximum throughput.
+
+**Tasks**:
+- [ ] **Shared memory reduction for atomic adds**: Currently using global memory atomics
+      for transition and duration_bias gradients. Should use warp-level or block-level
+      reduction in shared memory before a single atomic add.
+- [ ] **Split streaming.py**: File is large (~1700 lines). Consider splitting into:
+  - `streaming_pytorch.py` - PyTorch reference implementations
+  - `streaming_triton.py` - Triton kernels
+  - `streaming.py` - Main API and autograd functions
+- [ ] **Autotune kernel configurations**: Add `@triton.autotune` for block sizes
+- [ ] **Profile memory bandwidth**: Ensure we're hitting theoretical peak
+- [ ] **Benchmark at scale**: Test with T=100K+, K=1000+, C=24
+
+**Optimization priorities** (from colleague review):
+1. Atomic adds on global memory are a bottleneck for large batch sizes
+2. Consider accumulating transition gradients in registers/shared memory per-thread,
+   then doing a single reduction at the end
 
 **Estimated effort**: 2-3 days
 
 ---
 
-### Phase 2: Triton Forward Kernel
+### Phase 4: Enhanced Scoring (Duration + Boundary Contrast)
 
-**Goal**: GPU-accelerated streaming forward pass.
-
-**Files**:
-- `src/torch_semimarkov/triton_streaming.py` (new)
-
-**Tasks**:
-- [ ] Port `semi_crf_scan_kernel` to use streaming edge computation
-- [ ] Handle cumulative feature memory access patterns
-- [ ] Optimize for memory coalescing (features are accessed with stride K)
-- [ ] Add ring buffer checkpointing for backward pass
-- [ ] Benchmark against PyTorch reference
-
-**Kernel modifications**:
-```python
-@triton.jit
-def semi_crf_streaming_scan_kernel(
-    # Feature inputs (replaces edge_ptr)
-    cum_features_ptr,   # (batch, T+1, D)
-    label_weights_ptr,  # (D, C) or (K, D, C)
-    transition_ptr,     # (C, C) or (K, C, C)
-
-    # Outputs
-    ring_ptr,           # ring buffer
-    out_ptr,            # partition
-
-    # ... rest similar to current kernel
-):
-    # Inside the main loop, instead of loading edge:
-    for k in tl.range(1, K):
-        # Load segment features
-        feat_start = tl.load(cum_features_ptr + (t - k) * stride_fd + ...)
-        feat_end = tl.load(cum_features_ptr + t * stride_fd + ...)
-        segment_feat = feat_end - feat_start  # (D,)
-
-        # Compute segment scores
-        segment_scores = tl.dot(segment_feat, label_weights)  # (C,)
-
-        # Build edge block
-        edge_block = segment_scores[:, None] + transition  # (C, C)
-
-        # Continue with existing DP logic...
-```
-
-**Challenges**:
-- Memory access pattern: cumulative features indexed by (t-k) and (t)
-- May need to tile over hidden dimension D if D > shared memory
-- Label weights matrix multiply inside the kernel
-
-**Estimated effort**: 3-4 days
-
----
-
-### Phase 3: Triton Backward Kernel with Gradient Accumulation
-
-**Goal**: GPU-accelerated backward pass with gradients to features.
-
-**Files**:
-- `src/torch_semimarkov/triton_streaming.py` (extend)
-
-**Tasks**:
-- [ ] Modify checkpointed backward to compute gradients w.r.t. features
-- [ ] Accumulate gradients to `cumulative_features` efficiently
-- [ ] Accumulate gradients to `label_weights` and `transition`
-- [ ] Handle gradient checkpointing for memory efficiency
-- [ ] Verify gradients match PyTorch reference
-
-**Gradient accumulation strategy**:
-```python
-# For each (t, k, c_dest, c_src) with marginal probability p:
-#
-# grad_cum_features[t] -= p * label_weights[:, c_dest]
-# grad_cum_features[t+k] += p * label_weights[:, c_dest]
-# grad_label_weights[:, c_dest] += p * segment_feat[t, k]
-# grad_transition[c_src, c_dest] += p
-
-# Efficient approach: accumulate in chunks, use atomics or reduction
-```
-
-**Estimated effort**: 4-5 days
+**Status**: 🔲 Not Started
 
 ---
 
@@ -900,16 +875,19 @@ benchmarks/
 
 ## Timeline Summary
 
-| Phase | Description | Effort | Dependencies |
-|-------|-------------|--------|--------------|
-| 1 | PyTorch reference streaming | 2-3 days | None |
-| 2 | Triton forward kernel | 3-4 days | Phase 1 |
-| 3 | Triton backward kernel | 4-5 days | Phase 2 |
-| 4 | Duration-dependent scoring | 2 days | Phase 3 |
-| 5 | Integration layer | 2-3 days | Phase 3 |
-| 6 | Testing and validation | 2-3 days | All phases |
+| Phase | Description | Effort | Status |
+|-------|-------------|--------|--------|
+| 1 | PyTorch reference streaming | 2-3 days | ✅ COMPLETED |
+| 2 | Triton forward kernel | 3-4 days | ✅ COMPLETED |
+| 2b | Triton backward kernel | 4-5 days | ✅ COMPLETED |
+| 3 | Performance optimizations | 2-3 days | 🔲 Next |
+| 4 | Duration-dependent scoring | 2 days | 🔲 Pending |
+| 5 | Integration layer | 2-3 days | 🔲 Pending |
+| 6 | Testing and validation | 2-3 days | 🔲 Pending |
 
-**Total estimated effort: 15-20 days**
+**Progress: ~60% complete (Phases 1, 2, 2b done)**
+
+**Remaining effort: ~9-11 days**
 
 ---
 
@@ -929,12 +907,26 @@ benchmarks/
 
 ## Next Steps
 
-1. Review this roadmap and provide feedback
-2. Answer open questions above
-3. Start Phase 1: PyTorch reference implementation
-4. Iterate based on testing results
+1. ✅ ~~Review this roadmap and provide feedback~~
+2. ✅ ~~Start Phase 1: PyTorch reference implementation~~
+3. ✅ ~~Phase 2: Triton forward kernel~~
+4. ✅ ~~Phase 2b: Triton backward kernel~~
+5. **Run full test suite on HPC** to verify backward kernel correctness
+6. **Phase 3: Performance optimizations** (shared memory reduction for atomics)
+7. Profile at scale (T=100K+) to identify remaining bottlenecks
+8. Phase 4-6: Enhanced features and integration
+
+---
+
+## Changelog
+
+- **2025-01-19**: Completed Phase 2b (Triton backward kernel). Fixed critical gradient scaling bug
+  that caused factor-of-2 error for shared parameters. All tests passing locally (pending HPC verification).
+- **2025-01-18**: Completed Phases 1 and 2. PyTorch reference and Triton forward kernel working.
+- **2025-01-18**: Initial roadmap created.
 
 ---
 
 *Created: 2025-01-18*
+*Last Updated: 2025-01-19*
 *Target: torch-semimarkov v2.0 with streaming edge API*

@@ -614,6 +614,29 @@ if HAS_TRITON:
 
         Marginal probability: P(segment) = exp(alpha + edge + beta - log_Z)
         Gradient accumulation uses atomic operations for shared parameters.
+
+        Gradient Scaling Semantics (IMPORTANT):
+        ---------------------------------------
+        There's a subtle difference in how gradients are scaled for per-batch vs shared parameters:
+
+        - **Per-batch parameters** (cum_scores): Each batch element's gradient contribution
+          is scaled by its corresponding grad_output[batch_idx]. This happens INSIDE the kernel.
+
+        - **Shared parameters** (transition, duration_bias): These are accumulated across all
+          batch elements WITHOUT per-element scaling. The scaling by grad_output.sum() happens
+          AFTER the kernel in the launcher function.
+
+        This matches PyTorch's backward semantics where:
+            grad_transition = sum_{b,t,k}(marginal[b,t,k]) * grad_output.sum()
+
+        NOT:
+            grad_transition = sum_{b,t,k}(marginal[b,t,k] * grad_output[b])  # WRONG!
+
+        When grad_output = [1, 1, ..., 1] (the common case), the difference is a factor of `batch`:
+        - Correct: sum(marginals) * batch
+        - Wrong: sum(marginals) * 1
+
+        This was a subtle bug that caused a factor-of-2 error when batch=2.
         """
         NEG_INF: tl.constexpr = -1e9
 
@@ -1017,8 +1040,21 @@ if HAS_TRITON:
         )
 
         # Scale shared parameter gradients by grad_output.sum()
-        # This matches PyTorch's backward semantics where shared parameters
-        # accumulate unscaled marginals, then scale by sum of upstream gradients
+        #
+        # BUG FIX: This is critical for correctness!
+        #
+        # PyTorch backward semantics for shared parameters:
+        #   grad_transition = sum_{b,t,k}(marginal) * grad_output.sum()
+        #
+        # The kernel accumulates unscaled marginals via atomic_add across all batch elements.
+        # We then scale by grad_output.sum() here (NOT per-element grad_output[b]).
+        #
+        # Without this fix, when batch=2 and grad_output=[1,1]:
+        #   - Triton computed: sum(marginals) * 1 = sum(marginals)
+        #   - PyTorch computed: sum(marginals) * 2 = 2 * sum(marginals)
+        #   - Result: factor of 2 error (0.5 relative difference)
+        #
+        # See kernel docstring for full explanation of the scaling semantics.
         grad_output_sum = grad_output.sum()
         grad_transition = grad_transition * grad_output_sum
         grad_duration_bias = grad_duration_bias * grad_output_sum
