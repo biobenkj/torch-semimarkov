@@ -122,7 +122,8 @@ if HAS_TRITON:
 
         # Initialize ring buffer: alpha[0, :] = 0.0, rest = NEG_INF
         # Ring buffer layout: ring[k, c] where k = position % K
-        for k_init in tl.static_range(0, K):
+        # Note: Use tl.range (not static_range) to avoid compile-time explosion for large K
+        for k_init in tl.range(0, K):
             val = tl.where(k_init == 0, 0.0, NEG_INF)
             init_vals = tl.where(c_mask, val, NEG_INF)
             tl.store(
@@ -132,7 +133,7 @@ if HAS_TRITON:
             )
 
         # Save initial ring buffer state as checkpoint 0
-        for k_init in tl.static_range(0, K):
+        for k_init in tl.range(0, K):
             val = tl.where(k_init == 0, 0.0, NEG_INF)
             init_vals = tl.where(c_mask, val, NEG_INF)
             tl.store(
@@ -242,7 +243,7 @@ if HAS_TRITON:
             ckpt_idx = t // CHECKPOINT_INTERVAL
             if should_checkpoint:
                 # Save entire ring buffer to checkpoint
-                for k_save in tl.static_range(0, K):
+                for k_save in tl.range(0, K):
                     ring_val = tl.load(
                         ring_base + k_save * stride_ring_k + c_idx * stride_ring_c,
                         mask=c_mask,
@@ -335,7 +336,8 @@ if HAS_TRITON:
         )
 
         # Initialize ring buffer
-        for k_init in tl.static_range(0, K):
+        # Note: Use tl.range (not static_range) to avoid compile-time explosion for large K
+        for k_init in tl.range(0, K):
             val = tl.where(k_init == 0, 0.0, NEG_INF)
             init_vals = tl.where(c_mask, val, NEG_INF)
             tl.store(
@@ -345,7 +347,7 @@ if HAS_TRITON:
             )
 
         # Save initial checkpoint
-        for k_init in tl.static_range(0, K):
+        for k_init in tl.range(0, K):
             val = tl.where(k_init == 0, 0.0, NEG_INF)
             init_vals = tl.where(c_mask, val, NEG_INF)
             tl.store(
@@ -418,7 +420,7 @@ if HAS_TRITON:
             should_checkpoint = (t % CHECKPOINT_INTERVAL) == 0
             ckpt_idx = t // CHECKPOINT_INTERVAL
             if should_checkpoint:
-                for k_save in tl.static_range(0, K):
+                for k_save in tl.range(0, K):
                     ring_val = tl.load(
                         ring_base + k_save * stride_ring_k + c_idx * stride_ring_c,
                         mask=c_mask,

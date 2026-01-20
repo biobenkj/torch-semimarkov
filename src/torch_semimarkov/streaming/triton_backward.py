@@ -158,7 +158,8 @@ if HAS_TRITON:
         # Initialize beta ring buffer at final positions
         final_pos = seq_len - 1
         final_ring_idx = final_pos % K
-        for k_init in tl.static_range(0, K):
+        # Note: Use tl.range (not static_range) to avoid compile-time explosion for large K
+        for k_init in tl.range(0, K):
             is_final = k_init == final_ring_idx
             init_val = tl.where(is_final & c_mask, 0.0, NEG_INF)
             tl.store(
@@ -182,7 +183,7 @@ if HAS_TRITON:
                 # Then recompute forward through the segment
 
                 # Initialize alpha from checkpoint (stores ring buffer state at seg_start)
-                for k_slot in tl.static_range(0, K):
+                for k_slot in tl.range(0, K):
                     alpha_val = tl.load(
                         ring_ckpt_base + ckpt_idx * stride_ckpt_n +
                         k_slot * stride_ckpt_k + c_idx * stride_ckpt_c,
@@ -206,7 +207,7 @@ if HAS_TRITON:
                         alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
                         # Loop over valid durations
-                        for k in tl.static_range(1, K):
+                        for k in tl.range(1, K):
                             start_pos = t - k
                             # Only process valid start positions
                             if start_pos >= 0:
@@ -291,7 +292,7 @@ if HAS_TRITON:
                         # Compute beta[t] and gradients
                         new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-                        for k in tl.static_range(1, K):
+                        for k in tl.range(1, K):
                             end_pos = t + k
                             # Only process valid end positions
                             if end_pos <= seq_len - 1 and end_pos <= T - 1:
