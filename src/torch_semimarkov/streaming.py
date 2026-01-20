@@ -828,27 +828,30 @@ if HAS_TRITON:
                                 marginal = tl.exp(log_marginal)  # (C_PAD, C_PAD)
                                 marginal = tl.where(c_mask_2d, marginal, 0.0)
 
-                                # Scale by upstream gradient
-                                marginal = marginal * grad_out
-
                                 # === Accumulate gradients ===
+                                # Note: For shared parameters (transition, duration_bias), we accumulate
+                                # unscaled marginals. The scaling by grad_output.sum() is done after the
+                                # kernel to match PyTorch's backward semantics.
+                                # For per-batch parameters (cum_scores), we scale by grad_out here.
 
                                 # grad_cum_scores: positive at end_pos, negative at t
+                                # Scale by upstream gradient for per-batch tensor
                                 marginal_sum_src = tl.sum(marginal, axis=1)  # sum over c_src -> (C_PAD,)
                                 marginal_sum_src = tl.where(c_mask, marginal_sum_src, 0.0)
+                                marginal_sum_src_scaled = marginal_sum_src * grad_out
 
                                 tl.atomic_add(
                                     grad_cs_base + end_pos * stride_gcs_t + c_idx * stride_gcs_c,
-                                    marginal_sum_src,
+                                    marginal_sum_src_scaled,
                                     mask=c_mask,
                                 )
                                 tl.atomic_add(
                                     grad_cs_base + t * stride_gcs_t + c_idx * stride_gcs_c,
-                                    -marginal_sum_src,
+                                    -marginal_sum_src_scaled,
                                     mask=c_mask,
                                 )
 
-                                # grad_transition: use 2D atomic add
+                                # grad_transition: use 2D atomic add (unscaled marginal)
                                 # marginal is (C_dst, C_src), grad_transition[c_src, c_dst] += marginal[c_dst, c_src]
                                 marginal_T = tl.trans(marginal)  # (C_src, C_dst) = (C_PAD, C_PAD)
                                 # Compute 2D offsets: grad_transition[row, col] at row * stride_tr_src + col * stride_tr_dst
@@ -856,7 +859,7 @@ if HAS_TRITON:
                                 tr_offsets = c_dst_idx * stride_tr_src + c_src_idx * stride_tr_dst
                                 tl.atomic_add(grad_transition_ptr + tr_offsets, marginal_T, mask=c_mask_2d)
 
-                                # grad_duration_bias[k, c_dst] += sum over c_src
+                                # grad_duration_bias[k, c_dst] += sum over c_src (unscaled)
                                 tl.atomic_add(
                                     grad_duration_bias_ptr + k * stride_db_k + c_idx * stride_db_c,
                                     marginal_sum_src,
@@ -1012,6 +1015,13 @@ if HAS_TRITON:
             stride_gcs_t,
             stride_gcs_c,
         )
+
+        # Scale shared parameter gradients by grad_output.sum()
+        # This matches PyTorch's backward semantics where shared parameters
+        # accumulate unscaled marginals, then scale by sum of upstream gradients
+        grad_output_sum = grad_output.sum()
+        grad_transition = grad_transition * grad_output_sum
+        grad_duration_bias = grad_duration_bias * grad_output_sum
 
         return grad_cum_scores, grad_transition, grad_duration_bias
 
