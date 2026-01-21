@@ -1085,6 +1085,155 @@ class TestGradientScalingBugFix:
         )
 
 
+class TestTritonBackwardDebug:
+    """Debug tests to diagnose Triton vs PyTorch gradient mismatches."""
+
+    def test_triton_backward_debug_minimal(self):
+        """Minimal debug test with tiny config to compare gradient values."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        # Tiny config for easy debugging
+        batch, T, K, C = 1, 5, 2, 2
+        torch.manual_seed(42)
+
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch path
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+
+        partition_py = semi_crf_streaming_forward(
+            cs_py, tr_py, db_py, lengths, K, use_triton=False
+        )
+        partition_py.sum().backward()
+
+        # Triton path
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+
+        partition_tr = semi_crf_streaming_forward(
+            cs_tr, tr_tr, db_tr, lengths, K, use_triton=True
+        )
+        partition_tr.sum().backward()
+
+        # Print detailed comparison
+        print("\n" + "=" * 60)
+        print("TRITON BACKWARD GRADIENT DEBUG")
+        print("=" * 60)
+        print(f"Config: batch={batch}, T={T}, K={K}, C={C}")
+        print(f"Forward values match: {torch.allclose(partition_py, partition_tr)}")
+        print(f"  PyTorch partition: {partition_py.item():.6f}")
+        print(f"  Triton partition:  {partition_tr.item():.6f}")
+
+        print("\n--- grad_cum_scores comparison ---")
+        print(f"PyTorch:\n{cs_py.grad.squeeze()}")
+        print(f"\nTriton:\n{cs_tr.grad.squeeze()}")
+        print(f"\nDiff (Triton - PyTorch):\n{(cs_tr.grad - cs_py.grad).squeeze()}")
+        print(f"\nMax abs diff: {(cs_tr.grad - cs_py.grad).abs().max().item():.6f}")
+
+        print("\n--- grad_transition comparison ---")
+        print(f"PyTorch:\n{tr_py.grad}")
+        print(f"\nTriton:\n{tr_tr.grad}")
+        print(f"\nDiff (Triton - PyTorch):\n{tr_tr.grad - tr_py.grad}")
+        print(f"\nMax abs diff: {(tr_tr.grad - tr_py.grad).abs().max().item():.6f}")
+
+        print("\n--- grad_duration_bias comparison ---")
+        print(f"PyTorch:\n{db_py.grad}")
+        print(f"\nTriton:\n{db_tr.grad}")
+        print(f"\nDiff (Triton - PyTorch):\n{db_tr.grad - db_py.grad}")
+        print(f"\nMax abs diff: {(db_tr.grad - db_py.grad).abs().max().item():.6f}")
+
+        # Check if gradients match (this will fail, but shows the actual values)
+        cs_match = torch.allclose(cs_tr.grad, cs_py.grad, rtol=1e-2, atol=1e-2)
+        tr_match = torch.allclose(tr_tr.grad, tr_py.grad, rtol=1e-2, atol=1e-2)
+        db_match = torch.allclose(db_tr.grad, db_py.grad, rtol=1e-2, atol=1e-2)
+
+        print("\n--- Summary ---")
+        print(f"cum_scores grad match: {cs_match}")
+        print(f"transition grad match: {tr_match}")
+        print(f"duration_bias grad match: {db_match}")
+        print("=" * 60)
+
+        # Don't assert - this is for debugging only
+        if not (cs_match and tr_match and db_match):
+            print("\nWARNING: Gradients don't match! Use output above to diagnose.")
+
+    def test_triton_backward_debug_larger(self):
+        """Larger debug test matching the actual failing test config."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        # Same config as test_triton_gradients_match_pytorch
+        batch, T, K, C = 2, 30, 5, 4
+        torch.manual_seed(42)
+
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch path
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+
+        partition_py = semi_crf_streaming_forward(
+            cs_py, tr_py, db_py, lengths, K, use_triton=False
+        )
+        partition_py.sum().backward()
+
+        # Triton path
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+
+        partition_tr = semi_crf_streaming_forward(
+            cs_tr, tr_tr, db_tr, lengths, K, use_triton=True
+        )
+        partition_tr.sum().backward()
+
+        # Statistical summary
+        cs_diff = (cs_tr.grad - cs_py.grad).abs()
+        tr_diff = (tr_tr.grad - tr_py.grad).abs()
+        db_diff = (db_tr.grad - db_py.grad).abs()
+
+        print("\n" + "=" * 60)
+        print("TRITON BACKWARD GRADIENT DEBUG (LARGER)")
+        print("=" * 60)
+        print(f"Config: batch={batch}, T={T}, K={K}, C={C}")
+        print(f"Forward values match: {torch.allclose(partition_py, partition_tr)}")
+
+        print("\n--- grad_cum_scores statistics ---")
+        print(f"Shape: {cs_py.grad.shape}")
+        print(f"Max abs diff: {cs_diff.max().item():.6f}")
+        print(f"Mean abs diff: {cs_diff.mean().item():.6f}")
+        print(f"Num mismatched (>0.01): {(cs_diff > 0.01).sum().item()} / {cs_diff.numel()}")
+
+        # Show first few mismatched positions
+        mismatch_mask = cs_diff > 0.01
+        if mismatch_mask.any():
+            idxs = torch.nonzero(mismatch_mask)[:5]
+            print("First 5 mismatched positions:")
+            for idx in idxs:
+                b, t, c = idx.tolist()
+                print(f"  [{b},{t},{c}]: PyTorch={cs_py.grad[b,t,c]:.4f}, Triton={cs_tr.grad[b,t,c]:.4f}, diff={cs_diff[b,t,c]:.4f}")
+
+        print("\n--- grad_transition statistics ---")
+        print(f"Shape: {tr_py.grad.shape}")
+        print(f"Max abs diff: {tr_diff.max().item():.6f}")
+        print(f"Mean abs diff: {tr_diff.mean().item():.6f}")
+        print(f"Num mismatched (>0.01): {(tr_diff > 0.01).sum().item()} / {tr_diff.numel()}")
+
+        print("\n--- grad_duration_bias statistics ---")
+        print(f"Shape: {db_py.grad.shape}")
+        print(f"Max abs diff: {db_diff.max().item():.6f}")
+        print(f"Mean abs diff: {db_diff.mean().item():.6f}")
+        print(f"Num mismatched (>0.01): {(db_diff > 0.01).sum().item()} / {db_diff.numel()}")
+        print("=" * 60)
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("CUDA not available, skipping tests")

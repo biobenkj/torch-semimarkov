@@ -56,7 +56,7 @@ def test_max_semiring_pytorch_matches_semimarkov():
 
     # Reference: SemiMarkov with MaxSemiring
     model = SemiMarkov(MaxSemiring)
-    ref, _ = model.logpartition(edge, lengths=lengths)
+    ref, _, _ = model.logpartition(edge, lengths=lengths)
 
     # Test: triton_scan with max semiring
     out = semi_crf_forward_pytorch(edge, lengths, semiring="max")
