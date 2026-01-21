@@ -19,17 +19,18 @@ import time
 
 import torch
 
+from torch_semimarkov.backward import (
+    semi_crf_backward_beta,
+    semi_crf_compute_marginals,
+    semi_crf_forward_with_alpha,
+)
+
 # Import the checkpointed implementations
 from torch_semimarkov.checkpointed import (
     _compute_checkpoint_interval,
-    semi_crf_forward_with_ring_checkpoints,
     semi_crf_backward_from_ring_checkpoints,
+    semi_crf_forward_with_ring_checkpoints,
     semi_crf_triton_checkpointed_backward,
-)
-from torch_semimarkov.backward import (
-    semi_crf_forward_with_alpha,
-    semi_crf_backward_beta,
-    semi_crf_compute_marginals,
 )
 
 
@@ -125,8 +126,12 @@ def test_memory_estimates():
         mem = estimate_memory(T, K, C, batch)
         print(f"\n{name}: T={T:,}, K={K:,}, C={C}, batch={batch}")
         print(f"  Full α storage:     {mem['full_alpha_mb']:>10.2f} MB")
-        print(f"  Old √T checkpoints: {mem['old_ckpt_mb']:>10.2f} MB ({mem['old_num_ckpts']} ckpts, interval={mem['old_interval']})")
-        print(f"  New √(TK) ckpts:    {mem['new_ckpt_mb']:>10.2f} MB ({mem['new_num_ckpts']} ckpts, interval={mem['new_interval']})")
+        print(
+            f"  Old √T checkpoints: {mem['old_ckpt_mb']:>10.2f} MB ({mem['old_num_ckpts']} ckpts, interval={mem['old_interval']})"
+        )
+        print(
+            f"  New √(TK) ckpts:    {mem['new_ckpt_mb']:>10.2f} MB ({mem['new_num_ckpts']} ckpts, interval={mem['new_interval']})"
+        )
         print(f"  Segment buffer:     {mem['segment_mb']:>10.2f} MB")
         print(f"  Beta ring:          {mem['beta_ring_mb']:>10.2f} MB")
         print(f"  NEW TOTAL:          {mem['new_total_mb']:>10.2f} MB")
@@ -306,11 +311,11 @@ def test_scale_memory(device="cuda"):
             print(f"    Actual checkpoint memory: {ring_ckpts.numel() * 4 / (1024*1024):.1f} MB")
             print(f"    Memory after forward: {mem_after_fwd - mem_edge:.1f} MB")
             print(f"    Peak memory: {mem_peak:.1f} MB")
-            print(f"    Result: PASS")
+            print("    Result: PASS")
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"    OOM at T={T}: {e}")
-                print(f"    Result: FAIL (OOM)")
+                print("    Result: FAIL (OOM)")
                 return False
             raise
 
@@ -385,7 +390,7 @@ def test_scale_gradient(device="cuda"):
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 print(f"    OOM: {e}")
-                print(f"    Result: FAIL (OOM)")
+                print("    Result: FAIL (OOM)")
                 all_pass = False
             else:
                 raise
@@ -419,7 +424,7 @@ def test_full_scale(device="cuda"):
 
     # Show estimates
     estimated = estimate_memory(T, K, C, batch)
-    print(f"  Estimated memory breakdown:")
+    print("  Estimated memory breakdown:")
     print(f"    Checkpoints: {estimated['new_ckpt_mb']:.1f} MB")
     print(f"    Segment buffer: {estimated['segment_mb']:.1f} MB")
     print(f"    Beta ring: {estimated['beta_ring_mb']:.1f} MB")
@@ -457,9 +462,7 @@ def test_full_scale(device="cuda"):
         print(f"  Memory after edge: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
 
         # Forward only (backward would need gradients which doubles memory)
-        partition, ring_ckpts, interval = semi_crf_forward_with_ring_checkpoints(
-            edge, lengths
-        )
+        partition, ring_ckpts, interval = semi_crf_forward_with_ring_checkpoints(edge, lengths)
 
         t_fwd = time.time()
         print(f"  Forward completed in {t_fwd - t_create:.1f}s")
@@ -467,13 +470,13 @@ def test_full_scale(device="cuda"):
         print(f"  Ring checkpoints shape: {ring_ckpts.shape}")
         print(f"  Checkpoint memory: {ring_ckpts.numel() * 4 / (1024**2):.1f} MB")
         print(f"  Peak memory: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
-        print(f"  Result: PASS")
+        print("  Result: PASS")
         return True
 
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print(f"  OOM: {e}")
-            print(f"  Result: FAIL (OOM)")
+            print("  Result: FAIL (OOM)")
             return False
         raise
 

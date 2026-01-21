@@ -28,9 +28,9 @@ For production use with long sequences, use the checkpointed implementations
 in checkpointed.py which have much better memory characteristics.
 """
 
-import torch
-from typing import Tuple, Optional
+from typing import Optional
 
+import torch
 
 NEG_INF = -1e9
 
@@ -62,7 +62,7 @@ def semi_crf_forward_with_alpha(
     edge: torch.Tensor,
     lengths: torch.Tensor,
     semiring: str = "log",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Forward pass that returns both partition and all alpha values.
 
     This is a modified version of the forward pass that stores all intermediate
@@ -247,9 +247,7 @@ def semi_crf_backward_beta(
             beta_t = torch.max(scores_over_dest, dim=1)[0]
 
         # Only update active positions
-        beta[:, t, :] = torch.where(
-            active_mask.view(batch, 1), beta_t, beta[:, t, :]
-        )
+        beta[:, t, :] = torch.where(active_mask.view(batch, 1), beta_t, beta[:, t, :])
 
     return beta
 
@@ -283,7 +281,6 @@ def semi_crf_compute_marginals(
     """
     batch, T_minus_1, K, C, _ = edge.shape
     T = T_minus_1 + 1
-    device = edge.device
 
     # Initialize marginals to 0
     marginals = torch.zeros_like(edge)
@@ -334,7 +331,7 @@ def semi_crf_backward_pytorch(
     edge: torch.Tensor,
     lengths: torch.Tensor,
     semiring: str = "log",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Complete backward pass: compute partition and gradients.
 
     This is the main entry point for the PyTorch reference backward.
@@ -384,9 +381,7 @@ class SemiCRFBackward(torch.autograd.Function):
         semiring: str = "log",
     ) -> torch.Tensor:
         # Compute forward pass and store values for backward
-        partition, alpha = semi_crf_forward_with_alpha(
-            edge.detach(), lengths, semiring
-        )
+        partition, alpha = semi_crf_forward_with_alpha(edge.detach(), lengths, semiring)
 
         # Save for backward
         ctx.save_for_backward(edge, lengths, alpha, partition)
@@ -395,9 +390,7 @@ class SemiCRFBackward(torch.autograd.Function):
         return partition
 
     @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> Tuple[Optional[torch.Tensor], None, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[Optional[torch.Tensor], None, None]:
         edge, lengths, alpha, partition = ctx.saved_tensors
         semiring = ctx.semiring
 

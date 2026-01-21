@@ -31,12 +31,13 @@ Implementations
 """
 
 import math
+from typing import Optional
+
 import torch
-from typing import Tuple, Optional
 
 from .backward import (
-    NEG_INF,
     HAS_TRITON,
+    NEG_INF,
     _next_power_of_2,
 )
 
@@ -87,7 +88,7 @@ def semi_crf_forward_with_ring_checkpoints(
     lengths: torch.Tensor,
     checkpoint_interval: Optional[int] = None,
     semiring: str = "log",
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     r"""Forward pass that saves ring buffer state at checkpoint intervals.
 
     This saves the entire ring buffer (K × C values) at each checkpoint,
@@ -142,7 +143,7 @@ def semi_crf_forward_with_ring_checkpoints(
     final_positions = lengths - 1
 
     # Handle sequences of length 1
-    len_1_mask = (lengths == 1)
+    len_1_mask = lengths == 1
     if len_1_mask.any():
         final_alpha[len_1_mask] = 0.0
 
@@ -188,7 +189,7 @@ def semi_crf_forward_with_ring_checkpoints(
                     )
 
         # Track final alpha
-        is_final = (t == final_positions)
+        is_final = t == final_positions
         if is_final.any():
             final_alpha = torch.where(is_final.view(batch, 1), alpha_t, final_alpha)
 
@@ -395,9 +396,7 @@ class SemiCRFOptimizedCheckpointedBackward(torch.autograd.Function):
         return partition
 
     @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> Tuple[Optional[torch.Tensor], None, None, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[Optional[torch.Tensor], None, None, None]:
         edge, lengths, ring_checkpoints, partition = ctx.saved_tensors
         checkpoint_interval = ctx.checkpoint_interval
         semiring = ctx.semiring
@@ -436,9 +435,7 @@ def semi_crf_optimized_checkpointed_backward(
     Returns:
         partition: Log partition function of shape (batch,).
     """
-    return SemiCRFOptimizedCheckpointedBackward.apply(
-        edge, lengths, checkpoint_interval, semiring
-    )
+    return SemiCRFOptimizedCheckpointedBackward.apply(edge, lengths, checkpoint_interval, semiring)
 
 
 # =============================================================================
@@ -532,7 +529,10 @@ if HAS_TRITON:
                     # First position: alpha[seg_start] is in the checkpoint
                     ring_slot = seg_start % K
                     alpha_t = tl.load(
-                        ckpt_base + ckpt_idx * stride_rci + ring_slot * stride_rck + c_idx * stride_rcc,
+                        ckpt_base
+                        + ckpt_idx * stride_rci
+                        + ring_slot * stride_rck
+                        + c_idx * stride_rcc,
                         mask=c_mask,
                         other=NEG_INF,
                     )
@@ -554,7 +554,10 @@ if HAS_TRITON:
 
                         # Load alpha[start_pos] from appropriate source
                         alpha_ckpt = tl.load(
-                            ckpt_base + ckpt_idx * stride_rci + ring_slot * stride_rck + c_idx * stride_rcc,
+                            ckpt_base
+                            + ckpt_idx * stride_rci
+                            + ring_slot * stride_rck
+                            + c_idx * stride_rcc,
                             mask=from_checkpoint & c_mask,
                             other=NEG_INF,
                         )
@@ -738,12 +741,7 @@ if HAS_TRITON:
                     )
 
                     # === Gradient computation ===
-                    log_marginal = (
-                        alpha_t[None, :]
-                        + edge_block
-                        + beta_end[:, None]
-                        - log_Z
-                    )
+                    log_marginal = alpha_t[None, :] + edge_block + beta_end[:, None] - log_Z
                     marginal = tl.exp(log_marginal)
                     marginal = tl.where(k_active & c_mask_2d, marginal, 0.0)
 
@@ -840,9 +838,7 @@ if HAS_TRITON:
         )
 
         # Allocate beta ring buffer (persists across segment kernels)
-        beta_ring = torch.full(
-            (batch, K, C_PAD), NEG_INF, device=edge.device, dtype=edge.dtype
-        )
+        beta_ring = torch.full((batch, K, C_PAD), NEG_INF, device=edge.device, dtype=edge.dtype)
 
         # Initialize beta at final positions
         for b in range(batch):
@@ -969,9 +965,7 @@ class SemiCRFTritonCheckpointedBackward(torch.autograd.Function):
         return partition
 
     @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> Tuple[Optional[torch.Tensor], None, None, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[Optional[torch.Tensor], None, None, None]:
         edge, lengths, ring_checkpoints, partition = ctx.saved_tensors
         checkpoint_interval = ctx.checkpoint_interval
         semiring = ctx.semiring
@@ -1020,6 +1014,4 @@ def semi_crf_triton_checkpointed_backward(
     Returns:
         partition: Log partition function of shape (batch,).
     """
-    return SemiCRFTritonCheckpointedBackward.apply(
-        edge, lengths, checkpoint_interval, semiring
-    )
+    return SemiCRFTritonCheckpointedBackward.apply(edge, lengths, checkpoint_interval, semiring)
