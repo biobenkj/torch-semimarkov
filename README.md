@@ -10,7 +10,7 @@ Efficient Semi-Markov CRF Inference using PyTorch and Triton
 [![CI](https://github.com/biobenkj/torch-semimarkov/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/biobenkj/torch-semimarkov/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/biobenkj/torch-semimarkov/branch/main/graph/badge.svg)](https://codecov.io/gh/biobenkj/torch-semimarkov)
 
-[Install](#installation) | [Quick Start](#quick-start) | [Docs](docs/) | [Examples](#quick-start) | [GitHub](https://github.com/biobenkj/torch-semimarkov)
+[Install](#installation) | [Quick Start](#quick-start) | [Docs](docs/) | [Examples](examples/) | [GitHub](https://github.com/biobenkj/torch-semimarkov)
 
 </div>
 
@@ -69,29 +69,33 @@ pip install triton
 
 ```python
 import torch
-from torch_semimarkov import SemiMarkov
-from torch_semimarkov.semirings import LogSemiring
+from torch_semimarkov import SemiMarkovCRFHead
 
-# Parameters
-batch_size = 4
-seq_length = 1000   # T
-max_duration = 16   # K
-num_classes = 6     # C
+# Create CRF head (integrates with any encoder)
+crf = SemiMarkovCRFHead(
+    num_classes=24,      # C: number of segment labels
+    max_duration=100,    # K: maximum segment length
+    hidden_dim=512       # matches encoder output
+)
 
-# Create model
-model = SemiMarkov(LogSemiring)
+# Encoder output (from Mamba, Transformer, CNN, etc.)
+batch, T = 4, 1000
+hidden_states = torch.randn(batch, T, 512)
+lengths = torch.full((batch,), T)
 
-# Edge potentials: (batch, T-1, K, C, C)
-edge = torch.randn(batch_size, seq_length - 1, max_duration, num_classes, num_classes)
-lengths = torch.full((batch_size,), seq_length)
+# Training: compute NLL loss
+labels = torch.randint(0, 24, (batch, T))
+loss = crf.compute_loss(hidden_states, lengths, labels)
+loss.backward()
 
-# Forward pass (partition function)
-# Uses streaming scan by default: O(KC) memory
-log_Z, _ = model.logpartition(edge, lengths=lengths)
-
-# Backward pass for gradients
-log_Z.sum().backward()
+# Inference: partition function or Viterbi decoding
+log_Z = crf(hidden_states, lengths)['partition']
+viterbi_score = crf.decode(hidden_states, lengths)
 ```
+
+Works with PyTorch Lightning and DDP out of the box—see [examples/lightning_integration.py](examples/lightning_integration.py).
+
+For the low-level API with explicit edge tensors and semiring control, see the [API reference](docs/api.md).
 
 ### Triton Fused Kernel (~45x speedup)
 
@@ -122,7 +126,8 @@ viterbi_score = semi_crf_triton_forward(edge, lengths, semiring="max")
 
 - [Integration guide](docs/workflow_integration.md) — how to use torch-semimarkov with BERT, Mamba, CNNs, and other encoders
 - [Parameter guide: T, K, C](docs/parameter_guide.md) — understanding sequence length, duration, and state dimensions
-- [Semirings guide](docs/semirings.md) - context and intuition for semirings used in torch-semimarkov
+- [Semirings guide](docs/semirings.md) — context and intuition for semirings used in torch-semimarkov
+- [Uncertainty and focused learning](docs/uncertainty_and_focused_learning.md) — boundary confidence, active learning, and clinical applications
 - [Backends and Triton kernel](docs/backends.md) — algorithm selection and GPU acceleration
 - [API reference](docs/api.md) — detailed API documentation
 - [Benchmarking](docs/benchmarks.md) — performance measurement

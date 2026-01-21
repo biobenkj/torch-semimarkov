@@ -1,14 +1,23 @@
-"""Uncertainty quantification for Semi-Markov CRF.
+r"""Uncertainty quantification for Semi-Markov CRF.
 
-This module provides uncertainty quantification methods for the SemiMarkovCRFHead,
-enabling clinical applications where boundary confidence is critical.
+This module provides uncertainty quantification methods for the
+:class:`~torch_semimarkov.nn.SemiMarkovCRFHead`, enabling clinical applications
+where boundary confidence is critical.
 
 Two approaches are supported:
-1. **Streaming-compatible (T >= 10K)**: Uses gradient-based marginals from backward pass
-2. **Exact (T < 10K)**: Uses SemiMarkov.marginals() and EntropySemiring with pre-computed edges
 
-Key insight: The gradient of log Z w.r.t. cumulative scores gives marginal information
-via the forward-backward algorithm. This works with the streaming API for any sequence length.
+1. **Streaming-compatible** (:math:`T \geq 10K`): Uses gradient-based marginals
+   from backward pass
+2. **Exact** (:math:`T < 10K`): Uses :meth:`SemiMarkov.marginals` and
+   :class:`~torch_semimarkov.semirings.EntropySemiring` with pre-computed edges
+
+Key insight: The gradient of :math:`\log Z` w.r.t. cumulative scores gives marginal
+information via the forward-backward algorithm. This works with the streaming API
+for any sequence length.
+
+See Also:
+    :class:`UncertaintySemiMarkovCRFHead`: CRF head with uncertainty methods
+    :class:`UncertaintyMixin`: Mixin class providing uncertainty methods
 """
 
 from typing import Optional
@@ -21,17 +30,23 @@ from .streaming import semi_crf_streaming_forward
 
 
 class UncertaintyMixin:
-    """Mixin providing uncertainty quantification for SemiMarkovCRFHead.
+    r"""Mixin providing uncertainty quantification for SemiMarkovCRFHead.
 
-    Uses gradient-based marginals for streaming API compatibility (T >= 10K).
+    Uses gradient-based marginals for streaming API compatibility (:math:`T \geq 10K`).
     Falls back to exact methods for short sequences when edges fit in memory.
 
-    Methods:
-        compute_boundary_marginals: P(boundary at position t) for each position
-        compute_position_marginals: Per-position label distributions
-        compute_entropy_streaming: Approximate entropy from marginal distribution
-        compute_entropy_exact: Exact entropy via EntropySemiring (T < 10K only)
-        compute_loss_uncertainty_weighted: Uncertainty-weighted NLL loss
+    This mixin provides the following methods:
+
+    - :meth:`compute_boundary_marginals`: :math:`P(\text{boundary at position } t)` for each position
+    - :meth:`compute_position_marginals`: Per-position label distributions
+    - :meth:`compute_entropy_streaming`: Approximate entropy from marginal distribution
+    - :meth:`compute_entropy_exact`: Exact entropy via :class:`~torch_semimarkov.semirings.EntropySemiring`
+      (:math:`T < 10K` only)
+    - :meth:`compute_loss_uncertainty_weighted`: Uncertainty-weighted NLL loss
+
+    .. note::
+        Classes using this mixin must have ``projection``, ``transition``,
+        ``duration_bias``, ``num_classes``, and ``max_duration`` attributes.
     """
 
     def compute_boundary_marginals(
@@ -41,23 +56,29 @@ class UncertaintyMixin:
         use_streaming: bool = True,
         normalize: bool = True,
     ) -> Tensor:
-        """Compute P(boundary at position t) for each position.
+        r"""compute_boundary_marginals(hidden_states, lengths, use_streaming=True, normalize=True) -> Tensor
 
-        For streaming mode (T >= 10K): Uses gradient of log Z w.r.t. cum_scores
-        For exact mode (T < 10K): Uses SemiMarkov.marginals() if edges fit in memory
+        Compute :math:`P(\text{boundary at position } t)` for each position.
+
+        For streaming mode (:math:`T \geq 10K`): Uses gradient of :math:`\log Z` w.r.t.
+        cumulative scores. For exact mode (:math:`T < 10K`): Uses
+        :meth:`SemiMarkov.marginals` if edges fit in memory.
 
         The gradient of the log partition function w.r.t. the cumulative scores
         encodes information about which positions contribute to the partition,
         which correlates with boundary probability.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
-            use_streaming: If True, use streaming gradient-based method.
-            normalize: If True, normalize to [0, 1] range.
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            use_streaming (bool, optional): If ``True``, use streaming gradient-based method.
+                Default: ``True``
+            normalize (bool, optional): If ``True``, normalize to :math:`[0, 1]` range.
+                Default: ``True``
 
         Returns:
-            Tensor of shape (batch, T) with boundary probabilities.
+            Tensor: Boundary probabilities of shape :math:`(\text{batch}, T)`.
         """
         if use_streaming:
             return self._compute_boundary_marginals_streaming(hidden_states, lengths, normalize)
@@ -70,10 +91,19 @@ class UncertaintyMixin:
         lengths: Tensor,
         normalize: bool = True,
     ) -> Tensor:
-        """Compute boundary marginals via streaming gradient method.
+        r"""Compute boundary marginals via streaming gradient method.
 
-        Uses the fact that grad(log Z) / grad(cum_scores) encodes marginal
+        Uses the fact that :math:`\nabla_{\text{cum\_scores}} \log Z` encodes marginal
         information from the forward-backward algorithm.
+
+        Args:
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            normalize (bool, optional): If ``True``, normalize to :math:`[0, 1]`. Default: ``True``
+
+        Returns:
+            Tensor: Boundary signal of shape :math:`(\text{batch}, T)`.
         """
         batch, T, _ = hidden_states.shape
 
@@ -134,10 +164,21 @@ class UncertaintyMixin:
         lengths: Tensor,
         normalize: bool = True,
     ) -> Tensor:
-        """Compute boundary marginals via exact edge marginals (T < 10K).
+        r"""Compute boundary marginals via exact edge marginals (:math:`T < 10K`).
 
-        Uses SemiMarkov.marginals() which requires materializing edge tensor.
-        Will OOM for large T - use streaming method instead.
+        Uses :meth:`SemiMarkov.marginals` which requires materializing edge tensor.
+
+        Args:
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            normalize (bool, optional): If ``True``, normalize to :math:`[0, 1]`. Default: ``True``
+
+        Returns:
+            Tensor: Boundary probabilities of shape :math:`(\text{batch}, T)`.
+
+        .. warning::
+            Will OOM for large T - use streaming method instead.
         """
         from .semimarkov import SemiMarkov
         from .semirings import LogSemiring
@@ -174,9 +215,17 @@ class UncertaintyMixin:
         return boundary_probs
 
     def _build_edge_tensor(self, scores: Tensor, lengths: Tensor) -> Tensor:
-        """Build edge tensor from scores (for exact marginals).
+        r"""Build edge tensor from scores (for exact marginals).
 
-        WARNING: This is O(T*K*C^2) memory and will OOM for large T!
+        Args:
+            scores (Tensor): Projected scores of shape :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+
+        Returns:
+            Tensor: Edge potentials of shape :math:`(\text{batch}, T-1, K, C, C)`.
+
+        .. warning::
+            This is :math:`O(T \times K \times C^2)` memory and will OOM for large T!
         """
         batch, T, C = scores.shape
         K = self.max_duration
@@ -209,17 +258,20 @@ class UncertaintyMixin:
         hidden_states: Tensor,
         lengths: Tensor,
     ) -> Tensor:
-        """Compute per-position label marginals P(label=c at position t).
+        r"""compute_position_marginals(hidden_states, lengths) -> Tensor
 
-        Uses gradient of log Z w.r.t. projected scores to get per-position
+        Compute per-position label marginals :math:`P(\text{label}=c \text{ at position } t)`.
+
+        Uses gradient of :math:`\log Z` w.r.t. projected scores to get per-position
         label distribution.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
 
         Returns:
-            Tensor of shape (batch, T, C) with label probabilities per position.
+            Tensor: Label probabilities of shape :math:`(\text{batch}, T, C)`.
         """
         batch, T, _ = hidden_states.shape
 
@@ -273,18 +325,25 @@ class UncertaintyMixin:
         hidden_states: Tensor,
         lengths: Tensor,
     ) -> Tensor:
-        """Approximate entropy from marginal distribution.
+        r"""compute_entropy_streaming(hidden_states, lengths) -> Tensor
 
-        For very long sequences where EntropySemiring isn't available.
-        Computes H ≈ -sum(P(boundary_t) * log(P(boundary_t))) as a proxy
-        for segmentation uncertainty.
+        Approximate entropy from marginal distribution.
+
+        For very long sequences where :class:`~torch_semimarkov.semirings.EntropySemiring`
+        isn't available. Computes:
+
+        .. math::
+            H \approx -\sum_t P(\text{boundary}_t) \log P(\text{boundary}_t)
+
+        as a proxy for segmentation uncertainty.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
 
         Returns:
-            Tensor of shape (batch,) with entropy estimates.
+            Tensor: Entropy estimates of shape :math:`(\text{batch},)`.
         """
         # Get boundary marginals
         boundary_probs = self.compute_boundary_marginals(
@@ -306,19 +365,28 @@ class UncertaintyMixin:
         hidden_states: Tensor,
         lengths: Tensor,
     ) -> Tensor:
-        """Compute exact entropy via EntropySemiring (T < 10K only).
+        r"""compute_entropy_exact(hidden_states, lengths) -> Tensor
 
-        Requires materializing edge tensor - will OOM for T > 10K!
+        Compute exact entropy via :class:`~torch_semimarkov.semirings.EntropySemiring` (:math:`T < 10K` only).
+
+        Computes the exact Shannon entropy of the segmentation distribution:
+
+        .. math::
+            H(P) = -\sum_y P(y) \log P(y)
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
 
         Returns:
-            Tensor of shape (batch,) with exact entropy values.
+            Tensor: Exact entropy values of shape :math:`(\text{batch},)`.
 
         Raises:
             MemoryError: If T is too large and edge tensor doesn't fit in memory.
+
+        .. warning::
+            Requires materializing edge tensor - will OOM for :math:`T > 10K`!
         """
         from .semimarkov import SemiMarkov
         from .semirings import EntropySemiring
@@ -350,23 +418,38 @@ class UncertaintyMixin:
         use_triton: bool = False,
         reduction: str = "mean",
     ) -> Tensor:
-        """Compute loss weighted by uncertainty for focused learning.
+        r"""compute_loss_uncertainty_weighted(hidden_states, lengths, labels, uncertainty_weight=1.0, focus_mode="high_uncertainty", use_triton=False, reduction="mean") -> Tensor
+
+        Compute loss weighted by uncertainty for focused learning.
 
         Enables active learning by weighting the NLL loss by uncertainty:
-        - "high_uncertainty": Higher weight on uncertain regions
-        - "boundary_regions": Higher weight on boundary positions
+
+        - ``"high_uncertainty"``: Higher weight on uncertain regions
+        - ``"boundary_regions"``: Higher weight on boundary positions
+
+        The weighted loss is:
+
+        .. math::
+            \mathcal{L}_{\text{weighted}} = (1 + \lambda \cdot u) \cdot \text{NLL}
+
+        where :math:`\lambda` is the uncertainty weight and :math:`u` is the
+        uncertainty measure.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
-            labels: Per-position labels of shape (batch, T).
-            uncertainty_weight: Scaling factor for uncertainty weighting.
-            focus_mode: "high_uncertainty" or "boundary_regions"
-            use_triton: Whether to use Triton kernels.
-            reduction: 'mean', 'sum', or 'none'.
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            labels (Tensor): Per-position labels of shape :math:`(\text{batch}, T)`.
+            uncertainty_weight (float, optional): Scaling factor :math:`\lambda` for
+                uncertainty weighting. Default: ``1.0``
+            focus_mode (str, optional): Uncertainty mode: ``"high_uncertainty"`` or
+                ``"boundary_regions"``. Default: ``"high_uncertainty"``
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``False``
+            reduction (str, optional): Reduction mode: ``"mean"``, ``"sum"``, or ``"none"``.
+                Default: ``"mean"``
 
         Returns:
-            Weighted NLL loss.
+            Tensor: Weighted NLL loss.
         """
         # First pass: compute uncertainty (no gradients needed)
         with torch.no_grad():
@@ -408,12 +491,26 @@ class UncertaintyMixin:
 
 
 class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
-    """SemiMarkovCRFHead with uncertainty quantification methods.
+    r"""SemiMarkovCRFHead with uncertainty quantification methods.
 
-    Combines the base SemiMarkovCRFHead functionality with UncertaintyMixin
-    methods for clinical applications requiring boundary confidence estimates.
+    Combines the base :class:`~torch_semimarkov.nn.SemiMarkovCRFHead` functionality
+    with :class:`UncertaintyMixin` methods for clinical applications requiring
+    boundary confidence estimates.
 
-    Example::
+    Args:
+        num_classes (int): Number of label classes (C).
+        max_duration (int): Maximum segment duration (K).
+        hidden_dim (int, optional): If provided, adds a projection layer from
+            ``hidden_dim`` to ``num_classes``. Default: ``None``
+        init_scale (float, optional): Scale for parameter initialization.
+            Default: ``0.1``
+
+    Attributes:
+        transition (Parameter): Label transition scores of shape :math:`(C, C)`.
+        duration_bias (Parameter): Duration-specific bias of shape :math:`(K, C)`.
+        projection (Linear or None): Optional projection from encoder hidden dim.
+
+    Examples::
 
         >>> model = UncertaintySemiMarkovCRFHead(num_classes=24, max_duration=100, hidden_dim=512)
         >>> hidden = encoder(x)  # (batch, T, 512)
@@ -427,6 +524,10 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         >>>
         >>> # Boundary marginals (for clinical decision support)
         >>> boundary_probs = model.compute_boundary_marginals(hidden, lengths)
+
+    See Also:
+        :class:`~torch_semimarkov.nn.SemiMarkovCRFHead`: Base CRF head without uncertainty
+        :class:`UncertaintyMixin`: Mixin providing uncertainty methods
     """
 
     def __init__(
@@ -436,14 +537,6 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         hidden_dim: Optional[int] = None,
         init_scale: float = 0.1,
     ):
-        """Initialize UncertaintySemiMarkovCRFHead.
-
-        Args:
-            num_classes: Number of label classes (C).
-            max_duration: Maximum segment duration (K).
-            hidden_dim: If provided, adds a projection layer from hidden_dim to num_classes.
-            init_scale: Scale for parameter initialization.
-        """
         nn.Module.__init__(self)
 
         self.num_classes = num_classes
@@ -465,16 +558,21 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         lengths: Tensor,
         use_triton: bool = True,
     ) -> dict:
-        """Compute partition function from encoder hidden states.
+        r"""forward(hidden_states, lengths, use_triton=True) -> dict
+
+        Compute partition function from encoder hidden states.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) if projection
-                is enabled, or (batch, T, num_classes) if projection is None.
-            lengths: Sequence lengths of shape (batch,).
-            use_triton: Whether to use Triton kernels.
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                if projection is enabled, or :math:`(\text{batch}, T, C)` if projection is ``None``.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``True``
 
         Returns:
-            Dictionary with 'partition' and 'cum_scores'.
+            dict: Dictionary containing:
+
+            - **partition** (Tensor): Log partition function of shape :math:`(\text{batch},)`.
+            - **cum_scores** (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`.
         """
         batch, T, _ = hidden_states.shape
 
@@ -511,17 +609,29 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         use_triton: bool = True,
         reduction: str = "mean",
     ) -> Tensor:
-        """Compute negative log-likelihood loss.
+        r"""compute_loss(hidden_states, lengths, labels, use_triton=True, reduction="mean") -> Tensor
+
+        Compute negative log-likelihood loss.
+
+        The NLL loss is computed as:
+
+        .. math::
+            \text{NLL} = \log Z - \text{score}(y^*)
+
+        where :math:`Z` is the partition function and :math:`y^*` is the gold segmentation.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
-            labels: Per-position labels of shape (batch, T).
-            use_triton: Whether to use Triton kernels.
-            reduction: 'mean', 'sum', or 'none'.
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            labels (Tensor): Per-position labels of shape :math:`(\text{batch}, T)`.
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``True``
+            reduction (str, optional): Reduction mode: ``"mean"``, ``"sum"``, or ``"none"``.
+                Default: ``"mean"``
 
         Returns:
-            NLL loss.
+            Tensor: NLL loss. Scalar if reduction is ``"mean"`` or ``"sum"``,
+            shape :math:`(\text{batch},)` if ``"none"``.
         """
         result = self.forward(hidden_states, lengths, use_triton)
         partition = result["partition"]
@@ -545,10 +655,20 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         labels: Tensor,
         lengths: Tensor,
     ) -> Tensor:
-        """Score the gold segmentation.
+        r"""Score the gold segmentation.
 
         Extracts segments from per-position labels and computes:
-            score = sum(content_scores) + sum(duration_biases) + sum(transitions)
+
+        .. math::
+            \text{score} = \sum_i \text{content}_i + \sum_i \text{duration\_bias}_i + \sum_i \text{transition}_i
+
+        Args:
+            cum_scores (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`.
+            labels (Tensor): Per-position labels of shape :math:`(\text{batch}, T)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+
+        Returns:
+            Tensor: Gold sequence scores of shape :math:`(\text{batch},)`.
         """
         batch = cum_scores.shape[0]
         device = cum_scores.device
@@ -598,9 +718,21 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         lengths: Tensor,
         use_triton: bool = True,
     ) -> Tensor:
-        """Decode best segmentation using Viterbi algorithm.
+        r"""decode(hidden_states, lengths, use_triton=True) -> Tensor
 
-        Returns the best score (max over all segmentations).
+        Decode best segmentation using Viterbi algorithm.
+
+        Computes the maximum score over all valid segmentations using the
+        max semiring (Viterbi decoding).
+
+        Args:
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``True``
+
+        Returns:
+            Tensor: Best score (max over all segmentations) of shape :math:`(\text{batch},)`.
         """
         batch, T, _ = hidden_states.shape
 

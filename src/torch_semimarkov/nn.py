@@ -1,25 +1,31 @@
-"""Neural network modules for Semi-Markov CRF.
+r"""Neural network modules for Semi-Markov CRF.
 
-This module provides nn.Module wrappers around the streaming Semi-CRF kernels,
-making them easy to integrate with PyTorch Lightning and other training frameworks.
+This module provides :class:`torch.nn.Module` wrappers around the streaming Semi-CRF
+kernels, making them easy to integrate with PyTorch Lightning and other training
+frameworks.
 
 Classes:
-    SemiMarkovCRFHead: Basic CRF head for sequence labeling.
-    UncertaintySemiMarkovCRFHead: Extended CRF head with uncertainty quantification
-        methods for clinical applications. See :mod:`torch_semimarkov.uncertainty`.
+    :class:`SemiMarkovCRFHead`: Basic CRF head for sequence labeling.
+    :class:`UncertaintySemiMarkovCRFHead`: Extended CRF head with uncertainty
+        quantification methods for clinical applications.
 
 For clinical applications requiring boundary uncertainty or focused learning,
 use :class:`UncertaintySemiMarkovCRFHead` which provides:
-    - ``compute_boundary_marginals()``: P(boundary at position t)
-    - ``compute_position_marginals()``: P(label=c at position t)
-    - ``compute_entropy_streaming()``: Approximate entropy for uncertainty
-    - ``compute_loss_uncertainty_weighted()``: Uncertainty-weighted loss for active learning
 
-Example::
+- :meth:`~UncertaintyMixin.compute_boundary_marginals`: :math:`P(\text{boundary at position } t)`
+- :meth:`~UncertaintyMixin.compute_position_marginals`: :math:`P(\text{label}=c \text{ at position } t)`
+- :meth:`~UncertaintyMixin.compute_entropy_streaming`: Approximate entropy for uncertainty
+- :meth:`~UncertaintyMixin.compute_loss_uncertainty_weighted`: Uncertainty-weighted loss for active learning
+
+Examples::
 
     >>> from torch_semimarkov import UncertaintySemiMarkovCRFHead
     >>> model = UncertaintySemiMarkovCRFHead(num_classes=5, max_duration=100, hidden_dim=64)
     >>> boundary_probs = model.compute_boundary_marginals(hidden, lengths)
+
+See Also:
+    :mod:`torch_semimarkov.uncertainty`: Uncertainty quantification module
+    :func:`~torch_semimarkov.streaming.semi_crf_streaming_forward`: Streaming API
 """
 
 from typing import Optional
@@ -37,24 +43,32 @@ __all__ = ["SemiMarkovCRFHead", "UncertaintyMixin", "UncertaintySemiMarkovCRFHea
 
 
 class SemiMarkovCRFHead(nn.Module):
-    """CRF head for Semi-Markov sequence labeling.
+    r"""CRF head for Semi-Markov sequence labeling.
 
-    Wraps Triton streaming kernels in a simple nn.Module with learnable
-    transition and duration parameters. Compatible with DDP - gradients
-    sync automatically via standard PyTorch mechanisms.
+    Wraps Triton streaming kernels in a simple :class:`torch.nn.Module` with learnable
+    transition and duration parameters. Compatible with DDP - gradients sync
+    automatically via standard PyTorch mechanisms.
 
     The module computes:
-        - Partition function Z via streaming forward algorithm
-        - Gold sequence score for NLL loss computation
-        - Memory: O(KC) independent of sequence length T
+
+    - Partition function :math:`Z` via streaming forward algorithm
+    - Gold sequence score for NLL loss computation
+    - Memory: :math:`O(KC)` independent of sequence length :math:`T`
 
     Args:
-        num_classes: Number of label classes (C).
-        max_duration: Maximum segment duration (K).
-        hidden_dim: If provided, adds a projection layer from hidden_dim to num_classes.
-        init_scale: Scale for parameter initialization. Default: 0.1.
+        num_classes (int): Number of label classes (C).
+        max_duration (int): Maximum segment duration (K).
+        hidden_dim (int, optional): If provided, adds a projection layer from
+            ``hidden_dim`` to ``num_classes``. Default: ``None``
+        init_scale (float, optional): Scale for parameter initialization.
+            Default: ``0.1``
 
-    Example::
+    Attributes:
+        transition (Parameter): Label transition scores of shape :math:`(C, C)`.
+        duration_bias (Parameter): Duration-specific bias of shape :math:`(K, C)`.
+        projection (Linear or None): Optional projection from encoder hidden dim.
+
+    Examples::
 
         >>> import torch
         >>> from torch_semimarkov import SemiMarkovCRFHead
@@ -76,9 +90,13 @@ class SemiMarkovCRFHead(nn.Module):
         >>> loss = crf.compute_loss(hidden_states, lengths, labels)
         >>> loss.backward()
 
-    Note:
+    .. note::
         For numerical stability at T > 100K, all computations are done in float32.
         When using with PyTorch Lightning, set ``precision=32`` in the trainer.
+
+    See Also:
+        :class:`UncertaintySemiMarkovCRFHead`: Extended version with uncertainty methods
+        :func:`~torch_semimarkov.streaming.semi_crf_streaming_forward`: Underlying API
     """
 
     def __init__(
@@ -108,18 +126,22 @@ class SemiMarkovCRFHead(nn.Module):
         lengths: Tensor,
         use_triton: bool = True,
     ) -> dict:
-        """Compute partition function from encoder hidden states.
+        r"""forward(hidden_states, lengths, use_triton=True) -> dict
+
+        Compute partition function from encoder hidden states.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) if projection
-                is enabled, or (batch, T, num_classes) if projection is None.
-            lengths: Sequence lengths of shape (batch,).
-            use_triton: Whether to use Triton kernels (default: True).
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                if projection is enabled, or :math:`(\text{batch}, T, C)` if projection is ``None``.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``True``
 
         Returns:
-            Dictionary with:
-                - 'partition': Log partition function of shape (batch,)
-                - 'cum_scores': Cumulative scores of shape (batch, T+1, C) for loss computation
+            dict: Dictionary containing:
+
+            - **partition** (Tensor): Log partition function of shape :math:`(\text{batch},)`.
+            - **cum_scores** (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`
+              for loss computation.
         """
         batch, T, _ = hidden_states.shape
 
@@ -157,18 +179,30 @@ class SemiMarkovCRFHead(nn.Module):
         use_triton: bool = True,
         reduction: str = "mean",
     ) -> Tensor:
-        """Compute negative log-likelihood loss.
+        r"""compute_loss(hidden_states, lengths, labels, use_triton=True, reduction="mean") -> Tensor
+
+        Compute negative log-likelihood loss.
+
+        The NLL loss is computed as:
+
+        .. math::
+            \text{NLL} = \log Z - \text{score}(y^*)
+
+        where :math:`Z` is the partition function and :math:`y^*` is the gold segmentation.
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
-            labels: Per-position labels of shape (batch, T). Each position has a label ID.
-                Segments are extracted by finding where labels change.
-            use_triton: Whether to use Triton kernels (default: True).
-            reduction: 'mean', 'sum', or 'none'. Default: 'mean'.
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            labels (Tensor): Per-position labels of shape :math:`(\text{batch}, T)`. Each position
+                has a label ID. Segments are extracted by finding where labels change.
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``True``
+            reduction (str, optional): Reduction mode: ``"mean"``, ``"sum"``, or ``"none"``.
+                Default: ``"mean"``
 
         Returns:
-            NLL loss. Scalar if reduction is 'mean' or 'sum', (batch,) if 'none'.
+            Tensor: NLL loss. Scalar if reduction is ``"mean"`` or ``"sum"``,
+            shape :math:`(\text{batch},)` if ``"none"``.
         """
         result = self.forward(hidden_states, lengths, use_triton)
         partition = result["partition"]
@@ -192,19 +226,23 @@ class SemiMarkovCRFHead(nn.Module):
         labels: Tensor,
         lengths: Tensor,
     ) -> Tensor:
-        """Score the gold segmentation.
+        r"""_score_gold(cum_scores, labels, lengths) -> Tensor
+
+        Score the gold segmentation.
 
         Extracts segments from per-position labels (where label changes indicate
         segment boundaries) and computes:
-            score = sum(content_scores) + sum(duration_biases) + sum(transitions)
+
+        .. math::
+            \text{score} = \sum_i \text{content}_i + \sum_i \text{duration\_bias}_i + \sum_i \text{transition}_i
 
         Args:
-            cum_scores: Cumulative scores of shape (batch, T+1, C).
-            labels: Per-position labels of shape (batch, T).
-            lengths: Sequence lengths of shape (batch,).
+            cum_scores (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`.
+            labels (Tensor): Per-position labels of shape :math:`(\text{batch}, T)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
 
         Returns:
-            Gold sequence scores of shape (batch,).
+            Tensor: Gold sequence scores of shape :math:`(\text{batch},)`.
         """
         batch = cum_scores.shape[0]
         device = cum_scores.device
@@ -257,19 +295,26 @@ class SemiMarkovCRFHead(nn.Module):
         lengths: Tensor,
         use_triton: bool = True,
     ) -> Tensor:
-        """Decode best segmentation using Viterbi algorithm.
+        r"""decode(hidden_states, lengths, use_triton=True) -> Tensor
+
+        Decode best segmentation using Viterbi algorithm.
+
+        Computes the maximum score over all valid segmentations using the
+        max semiring (Viterbi decoding).
 
         Args:
-            hidden_states: Encoder output of shape (batch, T, hidden_dim) or (batch, T, C).
-            lengths: Sequence lengths of shape (batch,).
-            use_triton: Whether to use Triton kernels (default: True).
+            hidden_states (Tensor): Encoder output of shape :math:`(\text{batch}, T, \text{hidden\_dim})`
+                or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            use_triton (bool, optional): Whether to use Triton kernels. Default: ``True``
 
         Returns:
-            Best score (max over all segmentations) of shape (batch,).
+            Tensor: Best score (max over all segmentations) of shape :math:`(\text{batch},)`.
 
-        Note:
+        .. note::
             This returns the score, not the actual segmentation. For the full
-            segmentation path, use the SemiMarkov class with argmax.
+            segmentation path, use the :class:`~torch_semimarkov.SemiMarkov` class
+            with :class:`~torch_semimarkov.semirings.MaxSemiring` and extract via marginals.
         """
         batch, T, _ = hidden_states.shape
 
