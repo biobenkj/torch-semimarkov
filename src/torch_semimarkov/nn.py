@@ -28,18 +28,28 @@ See Also:
     :func:`~torch_semimarkov.streaming.semi_crf_streaming_forward`: Streaming API
 """
 
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from .duration import DurationDistribution, LearnedDuration, create_duration_distribution
+from .helpers import Segment, ViterbiResult, score_gold_vectorized
 from .streaming import semi_crf_streaming_forward
+from .streaming.constants import NEG_INF
+from .streaming.pytorch_reference import compute_edge_block_streaming
 
 # Re-export uncertainty module for convenience
 from .uncertainty import UncertaintyMixin, UncertaintySemiMarkovCRFHead
 
-__all__ = ["SemiMarkovCRFHead", "UncertaintyMixin", "UncertaintySemiMarkovCRFHead"]
+__all__ = [
+    "SemiMarkovCRFHead",
+    "UncertaintyMixin",
+    "UncertaintySemiMarkovCRFHead",
+    "Segment",
+    "ViterbiResult",
+]
 
 
 class SemiMarkovCRFHead(nn.Module):
@@ -62,19 +72,40 @@ class SemiMarkovCRFHead(nn.Module):
             ``hidden_dim`` to ``num_classes``. Default: ``None``
         init_scale (float, optional): Scale for parameter initialization.
             Default: ``0.1``
+        duration_distribution (str, DurationDistribution, optional): Duration
+            distribution to use. Can be:
+
+            - ``None`` or ``"learned"``: Fully learned bias (default, current behavior)
+            - ``"geometric"``: Geometric distribution with learnable rate
+            - ``"negative_binomial"`` or ``"negbin"``: Negative binomial distribution
+            - ``"poisson"``: Poisson-like distribution
+            - ``"uniform"``: Uniform (no duration preference)
+            - A :class:`~torch_semimarkov.duration.DurationDistribution` instance
+
+            Default: ``None`` (uses learned duration bias)
 
     Attributes:
         transition (Parameter): Label transition scores of shape :math:`(C, C)`.
-        duration_bias (Parameter): Duration-specific bias of shape :math:`(K, C)`.
+        duration_dist (DurationDistribution): Duration distribution module.
         projection (Linear or None): Optional projection from encoder hidden dim.
+
+    Properties:
+        duration_bias: Returns the current duration bias tensor of shape :math:`(K, C)`.
+            This is a property for backward compatibility - internally uses ``duration_dist()``.
 
     Examples::
 
         >>> import torch
         >>> from torch_semimarkov import SemiMarkovCRFHead
         >>>
-        >>> # Create CRF head
+        >>> # Create CRF head with default learned duration
         >>> crf = SemiMarkovCRFHead(num_classes=24, max_duration=100, hidden_dim=512)
+        >>>
+        >>> # Or with geometric duration distribution
+        >>> crf = SemiMarkovCRFHead(
+        ...     num_classes=24, max_duration=100, hidden_dim=512,
+        ...     duration_distribution="geometric"
+        ... )
         >>>
         >>> # Encoder output
         >>> batch, T = 4, 1000
@@ -97,6 +128,7 @@ class SemiMarkovCRFHead(nn.Module):
     See Also:
         :class:`UncertaintySemiMarkovCRFHead`: Extended version with uncertainty methods
         :func:`~torch_semimarkov.streaming.semi_crf_streaming_forward`: Underlying API
+        :mod:`torch_semimarkov.duration`: Available duration distributions
     """
 
     def __init__(
@@ -105,6 +137,7 @@ class SemiMarkovCRFHead(nn.Module):
         max_duration: int,
         hidden_dim: Optional[int] = None,
         init_scale: float = 0.1,
+        duration_distribution: Optional[Union[str, DurationDistribution]] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -112,13 +145,30 @@ class SemiMarkovCRFHead(nn.Module):
 
         # CRF parameters
         self.transition = nn.Parameter(torch.randn(num_classes, num_classes) * init_scale)
-        self.duration_bias = nn.Parameter(torch.randn(max_duration, num_classes) * init_scale)
+
+        # Duration distribution (supports multiple parameterizations)
+        if duration_distribution is None or duration_distribution == "learned":
+            # Default: fully learned, use init_scale for consistency
+            self.duration_dist = LearnedDuration(max_duration, num_classes, init_std=init_scale)
+        else:
+            self.duration_dist = create_duration_distribution(
+                duration_distribution, max_duration, num_classes
+            )
 
         # Optional projection from encoder hidden dim
         if hidden_dim is not None:
             self.projection = nn.Linear(hidden_dim, num_classes)
         else:
             self.projection = None
+
+    @property
+    def duration_bias(self) -> Tensor:
+        """Duration bias tensor of shape (K, C).
+
+        This property provides backward compatibility. Internally calls
+        ``self.duration_dist()`` to compute the duration bias.
+        """
+        return self.duration_dist()
 
     def forward(
         self,
@@ -244,50 +294,14 @@ class SemiMarkovCRFHead(nn.Module):
         Returns:
             Tensor: Gold sequence scores of shape :math:`(\text{batch},)`.
         """
-        batch = cum_scores.shape[0]
-        device = cum_scores.device
-        scores = torch.zeros(batch, device=device, dtype=cum_scores.dtype)
-
-        for b in range(batch):
-            seq_len = lengths[b].item()
-            if seq_len == 0:
-                continue
-
-            seq_labels = labels[b, :seq_len]
-
-            # Find segment boundaries (where label changes)
-            # A segment ends at position t if label[t] != label[t+1] or t is last position
-            changes = torch.where(seq_labels[:-1] != seq_labels[1:])[0]
-
-            # Segment end positions (inclusive)
-            seg_ends = torch.cat([changes, torch.tensor([seq_len - 1], device=device)])
-            # Segment start positions
-            seg_starts = torch.cat([torch.tensor([0], device=device), changes + 1])
-
-            prev_label = None
-            for i in range(len(seg_starts)):
-                start = seg_starts[i].item()
-                end = seg_ends[i].item()
-                duration = end - start + 1
-                label = seq_labels[start].item()
-
-                # Content score: cum_scores[end+1] - cum_scores[start]
-                # Note: cum_scores is 1-indexed (cum_scores[0] = 0)
-                content_score = cum_scores[b, end + 1, label] - cum_scores[b, start, label]
-                scores[b] += content_score
-
-                # Duration bias (clamped to max_duration)
-                dur_idx = min(duration, self.max_duration) - 1  # 0-indexed
-                if dur_idx >= 0 and dur_idx < self.max_duration:
-                    scores[b] += self.duration_bias[dur_idx, label]
-
-                # Transition score (skip for first segment)
-                if prev_label is not None:
-                    scores[b] += self.transition[prev_label, label]
-
-                prev_label = label
-
-        return scores
+        return score_gold_vectorized(
+            cum_scores=cum_scores,
+            labels=labels,
+            lengths=lengths,
+            transition=self.transition,
+            duration_bias=self.duration_bias,
+            max_duration=self.max_duration,
+        )
 
     def decode(
         self,
@@ -343,6 +357,205 @@ class SemiMarkovCRFHead(nn.Module):
 
         return max_score
 
+    def decode_with_traceback(
+        self,
+        hidden_states: Tensor,
+        lengths: Tensor,
+        max_traceback_length: int = 10000,
+    ) -> ViterbiResult:
+        r"""Decode best segmentation with full path reconstruction.
+
+        Computes the maximum-scoring segmentation using Viterbi algorithm
+        and returns both the score and the actual segment boundaries.
+
+        Args:
+            hidden_states (Tensor): Encoder output of shape
+                :math:`(\text{batch}, T, \text{hidden\_dim})` or :math:`(\text{batch}, T, C)`.
+            lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+            max_traceback_length (int, optional): Maximum sequence length for
+                traceback. Sequences longer than this will have empty segment
+                lists (score is still computed). Default: ``10000``
+
+        Returns:
+            ViterbiResult: Named tuple containing:
+                - **scores** (Tensor): Best scores of shape :math:`(\text{batch},)`.
+                - **segments** (List[List[Segment]]): Per-batch segment lists.
+
+        Note:
+            For very long sequences (T > max_traceback_length), traceback requires
+            O(T × C) memory which may not be feasible. In such cases, the returned
+            segments list will be empty but scores are still computed.
+
+        Example::
+
+            >>> result = crf.decode_with_traceback(hidden_states, lengths)
+            >>> print(f"Score: {result.scores[0].item():.2f}")
+            >>> for seg in result.segments[0]:
+            ...     print(f"  [{seg.start}, {seg.end}] label={seg.label}")
+        """
+        batch, T, _ = hidden_states.shape
+        device = hidden_states.device
+
+        # Project to label space if needed
+        if self.projection is not None:
+            scores = self.projection(hidden_states)
+        else:
+            scores = hidden_states
+
+        # Build cumulative scores
+        cum_scores = torch.zeros(
+            batch, T + 1, self.num_classes, dtype=torch.float32, device=device
+        )
+        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+
+        # Get max scores using streaming API
+        max_scores = semi_crf_streaming_forward(
+            cum_scores,
+            self.transition,
+            self.duration_bias,
+            lengths,
+            self.max_duration,
+            semiring="max",
+            use_triton=False,  # Use PyTorch for traceback compatibility
+        )
+
+        # Perform traceback for each sequence
+        all_segments: List[List[Segment]] = []
+
+        for b in range(batch):
+            seq_len = lengths[b].item()
+
+            # Skip traceback for very long sequences
+            if seq_len > max_traceback_length:
+                all_segments.append([])
+                continue
+
+            if seq_len == 0:
+                all_segments.append([])
+                continue
+
+            # Run forward pass with backpointer storage for this sequence
+            segments = self._traceback_single(
+                cum_scores[b : b + 1],
+                seq_len,
+            )
+            all_segments.append(segments)
+
+        return ViterbiResult(scores=max_scores, segments=all_segments)
+
+    def _traceback_single(
+        self,
+        cum_scores: Tensor,
+        seq_len: int,
+    ) -> List[Segment]:
+        """Traceback for a single sequence to recover optimal segmentation.
+
+        Args:
+            cum_scores: Cumulative scores of shape (1, T+1, C).
+            seq_len: Actual sequence length.
+
+        Returns:
+            List of Segment objects forming the optimal segmentation.
+        """
+        device = cum_scores.device
+        C = self.num_classes
+        K = self.max_duration
+
+        # Allocate alpha table and backpointers
+        # alpha[t, c] = best score to reach position t ending in state c
+        alpha = torch.full((seq_len + 1, C), NEG_INF, device=device, dtype=torch.float32)
+        alpha[0, :] = 0.0  # Start: all states equally valid
+
+        # Backpointers: for each (t, c), store (best_k, best_c_src)
+        bp_k = torch.zeros((seq_len + 1, C), dtype=torch.long, device=device)
+        bp_c = torch.zeros((seq_len + 1, C), dtype=torch.long, device=device)
+
+        # Forward pass with backpointer storage
+        for t in range(1, seq_len + 1):
+            k_eff = min(K - 1, t)
+
+            for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
+                start = t - k
+
+                # Compute edge block for this (start, k)
+                edge_block = compute_edge_block_streaming(
+                    cum_scores,
+                    self.transition,
+                    self.duration_bias,
+                    start,
+                    k,
+                )  # (1, C_dest, C_src)
+
+                # scores[c_dest, c_src] = alpha[start, c_src] + edge[c_dest, c_src]
+                candidate_scores = alpha[start, :].unsqueeze(0) + edge_block[0]  # (C_dest, C_src)
+
+                # Find best c_src for each c_dest
+                best_scores_from_src, best_c_src = candidate_scores.max(dim=-1)  # (C_dest,)
+
+                # Update alpha and backpointers where this k gives better score
+                better_mask = best_scores_from_src > alpha[t, :]
+                alpha[t, :] = torch.where(better_mask, best_scores_from_src, alpha[t, :])
+                bp_k[t, :] = torch.where(better_mask, k, bp_k[t, :])
+                bp_c[t, :] = torch.where(better_mask, best_c_src, bp_c[t, :])
+
+        # Traceback from final position
+        final_scores = alpha[seq_len, :]
+        best_final_c = final_scores.argmax().item()
+
+        segments: List[Segment] = []
+        t = seq_len
+        c = best_final_c
+
+        while t > 0:
+            k = bp_k[t, c].item()
+            c_prev = bp_c[t, c].item()
+
+            if k == 0:
+                # Safety check - shouldn't happen with proper initialization
+                break
+
+            start = t - k
+            end = t - 1  # Segment is [start, end] inclusive
+
+            # Compute segment score contribution
+            # Always include transition, even for first segment - the forward pass
+            # computes: max_{c_src} [alpha[0, c_src] + segment_score + transition[c_src, c_dest]]
+            # where alpha[0, c_src] = 0, so transition from c_prev is part of the score
+            seg_score = self._compute_segment_score(cum_scores[0], start, end, c, c_prev)
+
+            segments.append(Segment(start=start, end=end, label=c, score=seg_score))
+
+            t = start
+            c = c_prev
+
+        # Reverse to get segments in order
+        segments.reverse()
+        return segments
+
+    def _compute_segment_score(
+        self,
+        cum_scores: Tensor,
+        start: int,
+        end: int,
+        label: int,
+        prev_label: Optional[int],
+    ) -> float:
+        """Compute the score contribution of a single segment."""
+        # Content score
+        content = (cum_scores[end + 1, label] - cum_scores[start, label]).item()
+
+        # Duration bias (duration_bias[k] stores bias for segments of duration k)
+        duration = end - start + 1
+        dur_idx = min(duration, self.max_duration - 1)  # Clamp to valid range
+        dur_bias = self.duration_bias[dur_idx, label].item()
+
+        # Transition (if not first segment)
+        trans = 0.0
+        if prev_label is not None:
+            trans = self.transition[prev_label, label].item()
+
+        return content + dur_bias + trans
+
     def extra_repr(self) -> str:
         parts = [
             f"num_classes={self.num_classes}",
@@ -350,4 +563,5 @@ class SemiMarkovCRFHead(nn.Module):
         ]
         if self.projection is not None:
             parts.append(f"hidden_dim={self.projection.in_features}")
+        parts.append(f"duration_dist={self.duration_dist.__class__.__name__}")
         return ", ".join(parts)

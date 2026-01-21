@@ -174,44 +174,25 @@ if HAS_TRITON:
                 other=0.0,
             )  # (C_PAD, C_PAD) - this is transition.T
 
-        # Initialize ring buffer: alpha[0, :] = 0.0, rest = NEG_INF
-        # Ring buffer layout: ring[k, c] where k = position % K
-        # Note: Use tl.range (not static_range) to avoid compile-time explosion for large K
-        for k_init in tl.range(0, K):
-            val = tl.where(k_init == 0, 0.0, NEG_INF)
-            init_vals = tl.where(c_mask, val, NEG_INF)
-            tl.store(
-                ring_base + k_init * stride_ring_k + c_idx * stride_ring_c,
-                init_vals,
-                mask=c_mask,
-            )
-
-        # Save initial ring buffer state as checkpoint 0
-        for k_init in tl.range(0, K):
-            val = tl.where(k_init == 0, 0.0, NEG_INF)
-            init_vals = tl.where(c_mask, val, NEG_INF)
-            tl.store(
-                ring_ckpt_base + 0 * stride_ckpt_n + k_init * stride_ckpt_k + c_idx * stride_ckpt_c,
-                init_vals,
-                mask=c_mask,
-            )
+        # Ring buffer and checkpoint 0 are pre-initialized by the launcher:
+        # - ring_buffer[:, 0, :C] = 0.0, rest = NEG_INF
+        # - ring_checkpoints[:, 0, 0, :C] = 0.0, rest = NEG_INF
+        # This avoids K iterations of conditional writes per batch element.
 
         # Track final alpha for each batch element
-        final_alpha = tl.where(c_mask, 0.0, NEG_INF).to(tl.float32)
-
-        # Handle length=1 sequences (no transitions)
-        is_len_1 = seq_len == 1
-        # For length 1, final_alpha is just 0.0 (initial state)
+        final_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
         # Main forward loop: t = 1, 2, ..., T
         for t in tl.range(1, T + 1):
-            active = t < seq_len
+            # Include t == seq_len to compute alpha at final position
+            active = t <= seq_len
 
             # Accumulate alpha[t] = logsumexp over (k, c_src)
             alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
             # Loop over valid segment durations k = 1, 2, ..., min(K-1, t)
-            for k in tl.range(1, K):
+            # tl.maximum ensures K=1 processes at least one duration
+            for k in tl.range(1, tl.maximum(K, 2)):
                 k_valid = (k <= t) & (k <= K - 1)
                 start_pos = t - k
 
@@ -344,12 +325,11 @@ if HAS_TRITON:
                         mask=save_mask,
                     )
 
-            # Capture final alpha at sequence end
-            is_final = t == seq_len - 1
+            # Capture final alpha at sequence end (t == seq_len)
+            # At iteration t, alpha_t represents segments ending at position t-1
+            # For sequence of length L, we need alpha at t=L (segments ending at L-1)
+            is_final = t == seq_len
             final_alpha = tl.where(is_final & c_mask, alpha_t, final_alpha)
-
-        # Handle length=1 case
-        final_alpha = tl.where(is_len_1 & c_mask, 0.0, final_alpha)
 
         # Final reduction: logsumexp over labels
         final_alpha_masked = tl.where(c_mask, final_alpha, NEG_INF)
@@ -443,35 +423,20 @@ if HAS_TRITON:
                 other=0.0,
             )
 
-        # Initialize ring buffer
-        # Note: Use tl.range (not static_range) to avoid compile-time explosion for large K
-        for k_init in tl.range(0, K):
-            val = tl.where(k_init == 0, 0.0, NEG_INF)
-            init_vals = tl.where(c_mask, val, NEG_INF)
-            tl.store(
-                ring_base + k_init * stride_ring_k + c_idx * stride_ring_c,
-                init_vals,
-                mask=c_mask,
-            )
+        # Ring buffer and checkpoint 0 are pre-initialized by the launcher:
+        # - ring_buffer[:, 0, :C] = 0.0, rest = NEG_INF
+        # - ring_checkpoints[:, 0, 0, :C] = 0.0, rest = NEG_INF
+        # This avoids K iterations of conditional writes per batch element.
 
-        # Save initial checkpoint
-        for k_init in tl.range(0, K):
-            val = tl.where(k_init == 0, 0.0, NEG_INF)
-            init_vals = tl.where(c_mask, val, NEG_INF)
-            tl.store(
-                ring_ckpt_base + 0 * stride_ckpt_n + k_init * stride_ckpt_k + c_idx * stride_ckpt_c,
-                init_vals,
-                mask=c_mask,
-            )
-
-        final_alpha = tl.where(c_mask, 0.0, NEG_INF).to(tl.float32)
-        is_len_1 = seq_len == 1
+        final_alpha = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
         for t in tl.range(1, T + 1):
-            active = t < seq_len
+            # Include t == seq_len to compute alpha at final position
+            active = t <= seq_len
             alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-            for k in tl.range(1, K):
+            # tl.maximum ensures K=1 processes at least one duration
+            for k in tl.range(1, tl.maximum(K, 2)):
                 k_valid = (k <= t) & (k <= K - 1)
                 start_pos = t - k
                 ring_k_idx = start_pos % K
@@ -574,10 +539,11 @@ if HAS_TRITON:
                         mask=save_mask,
                     )
 
-            is_final = t == seq_len - 1
+            # Capture final alpha at sequence end (t == seq_len)
+            # At iteration t, alpha_t represents segments ending at position t-1
+            # For sequence of length L, we need alpha at t=L (segments ending at L-1)
+            is_final = t == seq_len
             final_alpha = tl.where(is_final & c_mask, alpha_t, final_alpha)
-
-        final_alpha = tl.where(is_len_1 & c_mask, 0.0, final_alpha)
 
         # Max semiring: max over labels
         final_alpha_masked = tl.where(c_mask, final_alpha, NEG_INF)
@@ -670,12 +636,16 @@ if HAS_TRITON:
         partition = torch.empty(batch, device=device, dtype=dtype)
 
         # Live ring buffer (will be L1/L2 cached for small K*C)
+        # Initialize to NEG_INF, then set k=0 to 0.0 (initial alpha state)
         ring_buffer = torch.full((batch, K, C_PAD), NEG_INF, device=device, dtype=dtype)
+        ring_buffer[:, 0, :C] = 0.0  # alpha[0, c] = 0.0 for all valid labels
 
         # Checkpoint storage for backward pass
+        # Initialize to NEG_INF, then set checkpoint 0, k=0 to 0.0
         ring_checkpoints = torch.full(
             (batch, num_checkpoints, K, C_PAD), NEG_INF, device=device, dtype=dtype
         )
+        ring_checkpoints[:, 0, 0, :C] = 0.0  # Initial state at checkpoint 0
 
         # Get strides
         stride_cs_b, stride_cs_t, stride_cs_c = cum_scores.stride()

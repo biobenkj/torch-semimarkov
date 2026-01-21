@@ -89,7 +89,7 @@ def semi_crf_forward_with_alpha(
         # Accumulate contributions from all valid durations
         scores_all = []
 
-        for k in range(1, k_eff + 1):
+        for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
             start = t - k
 
             # α[t, c_dest] = logsumexp over c_src of: α[start, c_src] + edge[start, k, c_dest, c_src]
@@ -190,7 +190,7 @@ def semi_crf_backward_beta(
 
         scores_all = []
 
-        for k in range(1, max_k + 1):
+        for k in range(1, max(max_k + 1, 2)):  # max ensures K=1 processes duration 1
             end_pos = t + k
 
             # Only valid if end_pos <= lengths - 1
@@ -273,7 +273,7 @@ def semi_crf_compute_marginals(
     marginals = torch.zeros_like(edge)
 
     for t in range(T - 1):
-        for k in range(1, K):
+        for k in range(1, max(K, 2)):  # max ensures K=1 processes duration 1
             end_pos = t + k
 
             # Only valid if end_pos < T and within sequence length
@@ -560,8 +560,8 @@ if HAS_TRITON:
                 other=NEG_INF,
             )  # [C_PAD] indexed by c_src
 
-            # Loop over durations k = 1, 2, ..., K-1
-            for k in tl.range(1, K):
+            # Loop over durations k = 1, 2, ..., K-1 (tl.maximum ensures K=1 works)
+            for k in tl.range(1, tl.maximum(K, 2)):
                 end_pos = t + k
 
                 # Valid if end_pos <= seq_len - 1

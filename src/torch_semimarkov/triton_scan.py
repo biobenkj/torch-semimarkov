@@ -155,8 +155,9 @@ def semi_crf_forward_pytorch(edge, lengths, semiring="log"):
     beta_ring[0] = 0.0  # initial_beta = zeros
     head = 0
 
-    # Duration indices (reused each iteration) - shape: (K-1,)
-    dur_arange = torch.arange(1, K, device=device, dtype=torch.long)
+    # Duration indices (reused each iteration) - shape: (max(K-1, 1),)
+    # max(K, 2) ensures K=1 still has duration 1 available
+    dur_arange = torch.arange(1, max(K, 2), device=device, dtype=torch.long)
 
     # Final beta storage (captured at each batch's sequence end)
     final_beta = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
@@ -301,8 +302,8 @@ if HAS_TRITON:
             # Accumulate new_beta = logsumexp over (k, c_prev) - shape [C_PAD]
             new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-            # Loop over durations k = 1, 2, ..., K-1
-            for k in tl.range(1, K):
+            # Loop over durations k = 1, 2, ..., K-1 (tl.maximum ensures K=1 works)
+            for k in tl.range(1, tl.maximum(K, 2)):
                 # Skip if duration exceeds position
                 k_valid = (k <= n) & (k <= K - 1)
 
@@ -449,8 +450,8 @@ if HAS_TRITON:
             # Accumulate new_beta = max over (k, c_prev) - shape [C_PAD]
             new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-            # Loop over durations k = 1, 2, ..., K-1
-            for k in tl.range(1, K):
+            # Loop over durations k = 1, 2, ..., K-1 (tl.maximum ensures K=1 works)
+            for k in tl.range(1, tl.maximum(K, 2)):
                 # Skip if duration exceeds position
                 k_valid = (k <= n) & (k <= K - 1)
 

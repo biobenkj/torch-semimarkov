@@ -248,8 +248,8 @@ if HAS_TRITON:
                     if t < seg_end and t < seq_len:
                         alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-                        # Loop over valid durations
-                        for k in tl.range(1, K):
+                        # Loop over valid durations (tl.maximum ensures K=1 works)
+                        for k in tl.range(1, tl.maximum(K, 2)):
                             start_pos = t - k
                             # Only process valid start positions
                             if start_pos >= 0:
@@ -373,7 +373,8 @@ if HAS_TRITON:
                         # Compute beta[t] and gradients
                         new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-                        for k in tl.range(1, K):
+                        # tl.maximum ensures K=1 processes at least one duration
+                        for k in tl.range(1, tl.maximum(K, 2)):
                             end_pos = t + k
                             # Only process valid end positions
                             if end_pos <= seq_len - 1 and end_pos <= T - 1:

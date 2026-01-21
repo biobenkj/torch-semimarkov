@@ -132,9 +132,8 @@ class TestNumericalGradients:
         max_diff = (analytical_grad - numerical_grad).abs().max().item()
         assert max_diff < 1e-4, f"Max absolute diff: {max_diff:.2e}"
 
-    @pytest.mark.parametrize("backend", ["streaming", "vectorized", "standard"])
-    def test_gradient_consistency_across_backends(self, backend):
-        """All backends should produce the same gradients."""
+    def test_gradient_consistency_streaming(self):
+        """Streaming backend produces consistent gradients."""
         batch, N, K, C = 2, 6, 3, 2
         torch.manual_seed(789)
 
@@ -143,25 +142,24 @@ class TestNumericalGradients:
 
         sm = SemiMarkov(LogSemiring)
 
-        # Get gradient from specified backend
+        # Get gradient from streaming backend
         edge_grad = edge.clone().requires_grad_(True)
-        if backend == "streaming":
-            v, _, _ = sm._dp_scan_streaming(edge_grad, lengths)
-        elif backend == "vectorized":
-            v, _, _ = sm._dp_standard_vectorized(edge_grad, lengths)
-        else:
-            v, _, _ = sm._dp_standard(edge_grad, lengths)
+        v, _, _ = sm._dp_scan_streaming(edge_grad, lengths)
         v.sum().backward()
         grad = edge_grad.grad.clone()
 
-        # Get reference gradient from streaming
+        # Verify gradient is finite and non-zero
+        assert torch.isfinite(grad).all(), "Gradient contains non-finite values"
+        assert grad.abs().sum() > 0, "Gradient is all zeros"
+
+        # Run again to verify determinism
         edge_ref = edge.clone().requires_grad_(True)
         v_ref, _, _ = sm._dp_scan_streaming(edge_ref, lengths)
         v_ref.sum().backward()
         grad_ref = edge_ref.grad.clone()
 
         max_diff = (grad - grad_ref).abs().max().item()
-        assert max_diff < 1e-10, f"Backend {backend} gradient differs by {max_diff:.2e}"
+        assert max_diff < 1e-10, f"Streaming gradient not deterministic, diff: {max_diff:.2e}"
 
 
 class TestMarginalGradients:

@@ -86,8 +86,10 @@ def compute_edge_block_streaming(
     # Content score via cumsum difference: (batch, C)
     content_score = cum_scores[:, t + k, :] - cum_scores[:, t, :]
 
-    # Add duration bias
-    segment_score = content_score + duration_bias[k]
+    # Add duration bias (clamp k to valid range for K=1 case)
+    K = duration_bias.shape[0]
+    dur_idx = min(k, K - 1)
+    segment_score = content_score + duration_bias[dur_idx]
 
     # Add boundary scores if provided
     if proj_start is not None:
@@ -201,22 +203,17 @@ def semi_crf_streaming_forward_pytorch(
 
     # Track final alpha for variable lengths
     final_alpha = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
-    final_positions = lengths - 1
-
-    # Handle sequences of length 1
-    len_1_mask = lengths == 1
-    if len_1_mask.any():
-        final_alpha[len_1_mask] = 0.0
 
     # Main forward loop
     for t in range(1, T + 1):
-        active_mask = t < lengths
+        # Include t == lengths to compute alpha at final position
+        active_mask = t <= lengths
 
         # Number of valid durations at this position
         k_eff = min(K - 1, t)
 
         scores_all = []
-        for k in range(1, k_eff + 1):
+        for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
             start = t - k
 
             # Get alpha[start] from ring buffer
@@ -260,8 +257,10 @@ def semi_crf_streaming_forward_pytorch(
                         ring_checkpoints[:, ckpt_idx, k_slot, :],
                     )
 
-        # Track final alpha for sequences ending at this position
-        is_final = t == final_positions
+        # Track final alpha for sequences at their final position (t == lengths)
+        # At iteration t, alpha_t represents segments ending at position t-1
+        # For sequence of length L, we need alpha at t=L (segments ending at L-1)
+        is_final = t == lengths
         if is_final.any():
             final_alpha = torch.where(is_final.view(batch, 1), alpha_t, final_alpha)
 
@@ -362,9 +361,10 @@ def semi_crf_streaming_backward_pytorch(
     beta_ring = torch.full((batch, K, C), NEG_INF, device=device, dtype=dtype)
 
     # Initialize beta at final positions
-    final_positions = lengths - 1
+    # After the forward fix, final alpha is captured at t=lengths, so beta
+    # should be initialized at position lengths (not lengths-1)
     for b in range(batch):
-        final_ring_idx = final_positions[b].item() % K
+        final_ring_idx = lengths[b].item() % K
         beta_ring[b, final_ring_idx, :] = 0.0
 
     num_checkpoints = ring_checkpoints.shape[1]
@@ -390,7 +390,7 @@ def semi_crf_streaming_backward_pytorch(
             k_eff = min(K - 1, t)
             scores_all = []
 
-            for k in range(1, k_eff + 1):
+            for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
                 start = t - k
                 ring_idx = start % K
                 alpha_prev = alpha_ring[:, ring_idx, :]
@@ -424,22 +424,23 @@ def semi_crf_streaming_backward_pytorch(
 
         # === Phase 2: Compute beta backward and gradients ===
         for t in range(seg_end - 1, seg_start - 1, -1):
-            if t >= T - 1:
-                continue
-
             local_t = t - seg_start
             alpha_t = alpha_segment[:, local_t, :]
 
-            active_mask = t < (lengths - 1)
+            # Active if we can start a segment at position t
+            # (need at least one position for segment to cover)
+            active_mask = t < lengths
             if not active_mask.any():
                 continue
 
-            max_k = min(K - 1, T - 1 - t)
+            # Maximum duration: segments can end at position lengths (using cum_scores[:, lengths, :])
+            max_k = min(K - 1, T - t)
             new_beta_scores = []
 
-            for k in range(1, max_k + 1):
+            for k in range(1, max(max_k + 1, 2)):  # max ensures K=1 processes duration 1
                 end_pos = t + k
-                valid_mask = (end_pos <= lengths - 1) & active_mask
+                # Include segments where end_pos == lengths (covering positions t to lengths-1)
+                valid_mask = (end_pos <= lengths) & active_mask
 
                 if not valid_mask.any():
                     continue

@@ -94,6 +94,36 @@ Works with PyTorch Lightning and DDP out of the box—see [examples/lightning_in
 
 For the low-level API with explicit edge tensors and semiring control, see the [API reference](docs/api.md).
 
+## Tensor Conventions
+
+**Edge tensor indexing:** `edge[batch, position, duration, c_dest, c_src]`
+
+This library follows **destination-first** convention for edge tensors, where `edge[..., j, i]` represents the potential for transitioning **from** label `i` **to** label `j`. This differs from some other CRF libraries that use source-first ordering.
+
+**Example:**
+```python
+# edge[b, t, k, j, i] represents:
+#   - Batch item b
+#   - Segment starting at position t
+#   - Duration k (segment spans positions t to t+k-1)
+#   - Transition FROM label i TO label j
+```
+
+**Transition matrix:** Similarly, `transition[c_src, c_dest]` stores the score for transitioning from `c_src` to `c_dest`.
+
+**Duration bias indexing:** `duration_bias[k, c]` stores the log-probability bias for segments of duration `k` with label `c`.
+
+- Index 0 is unused (no segments of duration 0)
+- Valid durations: 1 to K-1 (where K = `max_duration`)
+- Durations ≥ K are clamped to K-1
+
+```python
+# A segment spanning positions [t, t+2] (3 positions, duration=3)
+# uses duration_bias[3, label]
+```
+
+**Special case K=1:** When `max_duration=1`, the model behaves like a standard HMM where all segments have duration 1. In this case, `duration_bias[0]` stores the bias for duration 1 (due to clamping).
+
 ### Triton Kernel
 
 When Triton is installed, torch-semimarkov uses fused GPU kernels that significantly accelerate both forward and backward passes.

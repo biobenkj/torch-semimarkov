@@ -197,9 +197,10 @@ class TestSemiMarkovCRFHead:
 
         gold_score = crf._score_gold(cum_scores, labels, lengths)
 
-        # Expected: content = T * 1.0 = 5.0, duration_bias[4, 0], no transitions
+        # Expected: content = T * 1.0 = 5.0, duration_bias[5, 0], no transitions
+        # (duration_bias[k] stores bias for segments of duration k)
         expected_content = 5.0
-        expected_duration = crf.duration_bias[T - 1, 0].item()  # duration=5, 0-indexed
+        expected_duration = crf.duration_bias[T, 0].item()  # duration=5 uses index 5
         expected = expected_content + expected_duration
 
         assert abs(gold_score.item() - expected) < 1e-5
@@ -224,15 +225,15 @@ class TestSemiMarkovCRFHead:
 
         gold_score = crf._score_gold(cum_scores, labels, lengths)
 
-        # Expected components:
-        # Segment 1 (0-1, label 0, dur=2): content = 2*1 = 2, dur_bias[1, 0]
-        # Segment 2 (2-4, label 1, dur=3): content = 3*1 = 3, dur_bias[2, 1], trans[0, 1]
-        # Segment 3 (5-5, label 2, dur=1): content = 1*1 = 1, dur_bias[0, 2], trans[1, 2]
+        # Expected components (duration_bias[k] stores bias for segments of duration k):
+        # Segment 1 (0-1, label 0, dur=2): content = 2*1 = 2, dur_bias[2, 0]
+        # Segment 2 (2-4, label 1, dur=3): content = 3*1 = 3, dur_bias[3, 1], trans[0, 1]
+        # Segment 3 (5-5, label 2, dur=1): content = 1*1 = 1, dur_bias[1, 2], trans[1, 2]
         expected_content = 2 + 3 + 1
         expected_duration = (
-            crf.duration_bias[1, 0].item()  # dur=2, 0-indexed -> index 1
-            + crf.duration_bias[2, 1].item()  # dur=3
-            + crf.duration_bias[0, 2].item()  # dur=1
+            crf.duration_bias[2, 0].item()  # dur=2 uses index 2
+            + crf.duration_bias[3, 1].item()  # dur=3 uses index 3
+            + crf.duration_bias[1, 2].item()  # dur=1 uses index 1
         )
         expected_transition = crf.transition[0, 1].item() + crf.transition[1, 2].item()
         expected = expected_content + expected_duration + expected_transition

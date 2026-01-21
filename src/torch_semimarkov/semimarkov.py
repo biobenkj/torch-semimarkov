@@ -184,7 +184,8 @@ class SemiMarkov(_Struct):
         final_beta = torch.where(mask_len1, beta0, final_beta)
 
         # Pre-allocate duration indices (avoid re-creating each step)
-        dur_full = torch.arange(1, K, device=edge.device)  # 1..K-1
+        # max(K, 2) ensures K=1 still has duration 1 available
+        dur_full = torch.arange(1, max(K, 2), device=edge.device)  # 1..max(K-1, 1)
 
         for n in range(1, N):
             # Number of valid durations at this position

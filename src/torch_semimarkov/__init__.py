@@ -19,7 +19,17 @@ Modifications:
 - Optimized for genomic segmentation use cases
 """
 
-from .nn import SemiMarkovCRFHead
+from .duration import (
+    CallableDuration,
+    DurationDistribution,
+    GeometricDuration,
+    LearnedDuration,
+    NegativeBinomialDuration,
+    PoissonDuration,
+    UniformDuration,
+    create_duration_distribution,
+)
+from .nn import Segment, SemiMarkovCRFHead, ViterbiResult
 from .semimarkov import SemiMarkov
 from .streaming import (
     SemiCRFStreaming,
@@ -39,7 +49,18 @@ __all__ = [
     "compute_edge_block_streaming",
     # Neural network modules
     "SemiMarkovCRFHead",
+    "Segment",
+    "ViterbiResult",
     # Uncertainty quantification
     "UncertaintyMixin",
     "UncertaintySemiMarkovCRFHead",
+    # Duration distributions
+    "DurationDistribution",
+    "LearnedDuration",
+    "GeometricDuration",
+    "NegativeBinomialDuration",
+    "PoissonDuration",
+    "UniformDuration",
+    "CallableDuration",
+    "create_duration_distribution",
 ]
