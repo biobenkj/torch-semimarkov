@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass
-from typing import List
 
 import torch
 from torch import Tensor
@@ -41,7 +40,7 @@ class ViterbiResult:
     """
 
     scores: Tensor
-    segments: List[List[Segment]]
+    segments: list[list[Segment]]
 
 
 class Chart:
@@ -447,8 +446,6 @@ def score_gold_vectorized(
     # Step 3: Vectorized score computation
 
     # Content scores: cum_scores[b, end+1, label] - cum_scores[b, start, label]
-    # We need to gather from cum_scores using advanced indexing
-    batch_idx = torch.arange(batch, device=device).unsqueeze(1).expand(-1, max_segments)
 
     # Gather end positions (end + 1 for cumulative indexing)
     end_positions = seg_ends + 1  # (batch, max_segments)
@@ -477,7 +474,9 @@ def score_gold_vectorized(
 
     # Duration scores (duration_bias[k] stores bias for segments of duration k)
     durations = seg_ends - seg_starts + 1  # (batch, max_segments)
-    dur_indices = durations.clamp(1, max_duration - 1)  # duration k uses index k, clamped to valid range
+    dur_indices = durations.clamp(
+        1, max_duration - 1
+    )  # duration k uses index k, clamped to valid range
 
     # Gather duration bias: duration_bias[dur_idx, label]
     # duration_bias shape: (K, C), we need (batch, max_segments) values

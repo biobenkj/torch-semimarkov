@@ -6,7 +6,6 @@ computed by autograd are correct. This provides strong validation that the
 backward pass implementation is mathematically correct.
 """
 
-import pytest
 import torch
 
 from torch_semimarkov import SemiMarkov

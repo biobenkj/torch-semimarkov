@@ -18,7 +18,8 @@ Example usage:
 """
 
 from abc import ABC, abstractmethod
-from typing import Callable, Optional, Union
+from collections.abc import Callable
+from typing import Union
 
 import torch
 import torch.nn as nn
@@ -60,9 +61,7 @@ class LearnedDuration(DurationDistribution):
 
     def __init__(self, max_duration: int, num_classes: int, init_std: float = 0.1):
         super().__init__(max_duration, num_classes)
-        self.duration_bias = nn.Parameter(
-            torch.randn(max_duration, num_classes) * init_std
-        )
+        self.duration_bias = nn.Parameter(torch.randn(max_duration, num_classes) * init_std)
 
     def forward(self) -> Tensor:
         return self.duration_bias
@@ -195,9 +194,7 @@ class PoissonDuration(DurationDistribution):
         if learn_rate:
             self.log_lambda = nn.Parameter(torch.full((num_classes,), init_log_lambda))
         else:
-            self.register_buffer(
-                "log_lambda", torch.full((num_classes,), init_log_lambda)
-            )
+            self.register_buffer("log_lambda", torch.full((num_classes,), init_log_lambda))
 
     def forward(self) -> Tensor:
         lam = torch.exp(self.log_lambda)  # (C,)
@@ -257,9 +254,7 @@ class UniformDuration(DurationDistribution):
     def __init__(self, max_duration: int, num_classes: int):
         super().__init__(max_duration, num_classes)
         # Register as buffer so it moves with .to(device)
-        self.register_buffer(
-            "_zeros", torch.zeros(max_duration, num_classes)
-        )
+        self.register_buffer("_zeros", torch.zeros(max_duration, num_classes))
 
     def forward(self) -> Tensor:
         return self._zeros

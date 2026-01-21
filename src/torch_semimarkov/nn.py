@@ -28,7 +28,7 @@ See Also:
     :func:`~torch_semimarkov.streaming.semi_crf_streaming_forward`: Streaming API
 """
 
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -403,9 +403,7 @@ class SemiMarkovCRFHead(nn.Module):
             scores = hidden_states
 
         # Build cumulative scores
-        cum_scores = torch.zeros(
-            batch, T + 1, self.num_classes, dtype=torch.float32, device=device
-        )
+        cum_scores = torch.zeros(batch, T + 1, self.num_classes, dtype=torch.float32, device=device)
         cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
 
         # Get max scores using streaming API
@@ -420,7 +418,7 @@ class SemiMarkovCRFHead(nn.Module):
         )
 
         # Perform traceback for each sequence
-        all_segments: List[List[Segment]] = []
+        all_segments: list[list[Segment]] = []
 
         for b in range(batch):
             seq_len = lengths[b].item()
@@ -447,7 +445,7 @@ class SemiMarkovCRFHead(nn.Module):
         self,
         cum_scores: Tensor,
         seq_len: int,
-    ) -> List[Segment]:
+    ) -> list[Segment]:
         """Traceback for a single sequence to recover optimal segmentation.
 
         Args:
@@ -502,7 +500,7 @@ class SemiMarkovCRFHead(nn.Module):
         final_scores = alpha[seq_len, :]
         best_final_c = final_scores.argmax().item()
 
-        segments: List[Segment] = []
+        segments: list[Segment] = []
         t = seq_len
         c = best_final_c
 

@@ -20,7 +20,7 @@ See Also:
     :class:`UncertaintyMixin`: Mixin class providing uncertainty methods
 """
 
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -805,9 +805,7 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         else:
             scores = hidden_states
 
-        cum_scores = torch.zeros(
-            batch, T + 1, self.num_classes, dtype=torch.float32, device=device
-        )
+        cum_scores = torch.zeros(batch, T + 1, self.num_classes, dtype=torch.float32, device=device)
         cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
 
         max_scores = semi_crf_streaming_forward(
@@ -820,7 +818,7 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
             use_triton=False,
         )
 
-        all_segments: List[List[Segment]] = []
+        all_segments: list[list[Segment]] = []
 
         for b in range(batch):
             seq_len = lengths[b].item()
@@ -838,7 +836,7 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         self,
         cum_scores: Tensor,
         seq_len: int,
-    ) -> List[Segment]:
+    ) -> list[Segment]:
         """Traceback for a single sequence to recover optimal segmentation."""
         device = cum_scores.device
         C = self.num_classes
@@ -875,7 +873,7 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         final_scores = alpha[seq_len, :]
         best_final_c = final_scores.argmax().item()
 
-        segments: List[Segment] = []
+        segments: list[Segment] = []
         t = seq_len
         c = best_final_c
 

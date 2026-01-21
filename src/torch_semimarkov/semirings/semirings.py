@@ -216,6 +216,7 @@ class LogSemiring(_BaseLog):
         >>> marginals = model.marginals(edge)    # Posterior marginals via autograd
     """
 
+
 class MaxSemiring(_BaseLog):
     r"""Max-plus semiring :math:`(\mathbb{R} \cup \{-\infty\}, \max, +, -\infty, 0)`.
 

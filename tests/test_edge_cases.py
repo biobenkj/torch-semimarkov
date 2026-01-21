@@ -219,9 +219,9 @@ class TestViterbiTracebackConsistency:
 
         for b in range(2):
             seg_sum = sum(seg.score for seg in result.segments[b])
-            assert abs(seg_sum - result.scores[b].item()) < 1e-4, (
-                f"Batch {b}: segment sum {seg_sum} != Viterbi score {result.scores[b].item()}"
-            )
+            assert (
+                abs(seg_sum - result.scores[b].item()) < 1e-4
+            ), f"Batch {b}: segment sum {seg_sum} != Viterbi score {result.scores[b].item()}"
 
     def test_traceback_covers_full_sequence(self):
         """Traceback segments cover entire sequence without gaps or overlaps."""
@@ -239,15 +239,15 @@ class TestViterbiTracebackConsistency:
             assert segments[0].start == 0, f"Batch {b}: first segment doesn't start at 0"
 
             # Check last segment ends at seq_len - 1
-            assert segments[-1].end == seq_len - 1, (
-                f"Batch {b}: last segment ends at {segments[-1].end}, expected {seq_len - 1}"
-            )
+            assert (
+                segments[-1].end == seq_len - 1
+            ), f"Batch {b}: last segment ends at {segments[-1].end}, expected {seq_len - 1}"
 
             # Check segments are contiguous (no gaps or overlaps)
             for i in range(1, len(segments)):
-                assert segments[i].start == segments[i - 1].end + 1, (
-                    f"Batch {b}: gap/overlap between segments {i - 1} and {i}"
-                )
+                assert (
+                    segments[i].start == segments[i - 1].end + 1
+                ), f"Batch {b}: gap/overlap between segments {i - 1} and {i}"
 
 
 class TestVariableLengths:
