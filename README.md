@@ -156,13 +156,8 @@ Tests run CPU-only by default. GPU tests require CUDA and are skipped in CI.
 | Component | Status |
 |-----------|--------|
 | **Streaming Scan** | O(KC) memory, default backend |
-| **Vectorized Scan** | O(TKC) memory, 2-3x faster than standard linear scan |
-| **Binary Tree** | O(log N) depth, high memory for large KC |
-| **Block-Triangular** | Exploits duration constraint sparsity |
-| **Semirings** | Log, Max, Std, KMax, Entropy, CrossEntropy |
-| **Checkpoint Semiring** | Memory-efficient gradients |
-| **BandedMatrix (CPU)** | Prototype and not a recommended backend |
 | **Triton Kernel** | GPU acceleration, Log/Max semirings, custom forward/backward |
+| **Semirings** | Log, Max, Std, KMax, Entropy, CrossEntropy, KLDivergence |
 
 ## Acknowledgments
 

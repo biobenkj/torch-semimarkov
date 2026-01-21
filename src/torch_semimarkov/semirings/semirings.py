@@ -25,24 +25,6 @@ Examples::
 
 import torch
 
-# Try to import genbmm CUDA extension (optional)
-has_genbmm = False
-try:
-    from torch_semimarkov._genbmm import BandedMatrix as GenbmmBandedMatrix
-
-    has_genbmm = True
-except ImportError:
-    pass
-
-# Fallback banded implementation (CPU) for prototyping when genbmm CUDA is absent.
-try:
-    from torch_semimarkov import banded as local_banded
-
-    has_local_banded = True
-except ImportError:
-    local_banded = None
-    has_local_banded = False
-
 
 def matmul(cls, a, b):
     dims = 1
@@ -211,12 +193,6 @@ class StdSemiring(_Base):
 
     @classmethod
     def matmul(cls, a, b):
-        if has_genbmm and isinstance(a, GenbmmBandedMatrix):
-            return b.multiply(a.transpose())
-        if has_local_banded and isinstance(a, local_banded.BandedMatrix):
-            if not isinstance(b, local_banded.BandedMatrix):
-                b = local_banded.BandedMatrix.from_dense(b, a.lu, a.ld, fill=0.0)
-            return b.multiply(a.transpose())
         return torch.matmul(a, b)
 
 
@@ -240,17 +216,6 @@ class LogSemiring(_BaseLog):
         >>> marginals = model.marginals(edge)    # Posterior marginals via autograd
     """
 
-    @classmethod
-    def matmul(cls, a, b):
-        if has_genbmm and isinstance(a, GenbmmBandedMatrix):
-            return b.multiply_log(a.transpose())
-        if has_local_banded and isinstance(a, local_banded.BandedMatrix):
-            if not isinstance(b, local_banded.BandedMatrix):
-                b = local_banded.BandedMatrix.from_dense(b, a.lu, a.ld, fill=-1e9)
-            return b.multiply_log(a.transpose())
-        return _BaseLog.matmul(a, b)
-
-
 class MaxSemiring(_BaseLog):
     r"""Max-plus semiring :math:`(\mathbb{R} \cup \{-\infty\}, \max, +, -\infty, 0)`.
 
@@ -270,16 +235,6 @@ class MaxSemiring(_BaseLog):
         >>> viterbi_score, _ = model.logpartition(edge)  # Best path score
         >>> best_path = model.marginals(edge)            # Argmax via autograd
     """
-
-    @classmethod
-    def matmul(cls, a, b):
-        if has_genbmm and isinstance(a, GenbmmBandedMatrix):
-            return b.multiply_max(a.transpose())
-        if has_local_banded and isinstance(a, local_banded.BandedMatrix):
-            if not isinstance(b, local_banded.BandedMatrix):
-                b = local_banded.BandedMatrix.from_dense(b, a.lu, a.ld, fill=-1e9)
-            return b.multiply_max(a.transpose())
-        return matmul(cls, a, b)
 
     @staticmethod
     def sum(xs, dim=-1):

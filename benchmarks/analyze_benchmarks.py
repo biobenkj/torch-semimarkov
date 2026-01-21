@@ -36,25 +36,17 @@ except ImportError:
 
 # Colorblind-safe palette (IBM Design)
 COLORS = {
-    "linear_scan": "#648FFF",
-    "linear_scan_vectorized": "#785EF0",
     "linear_scan_streaming": "#DC267F",
-    "binary_tree": "#FE6100",
-    "binary_tree_sharded": "#FFB000",
-    "block_triangular": "#22A884",
     "triton": "#000000",
     "triton_pytorch": "#666666",
+    "triton_checkpointing": "#648FFF",
 }
 
 MARKERS = {
-    "linear_scan": "o",
-    "linear_scan_vectorized": "s",
     "linear_scan_streaming": "^",
-    "binary_tree": "D",
-    "binary_tree_sharded": "v",
-    "block_triangular": "p",
     "triton": "*",
     "triton_pytorch": "x",
+    "triton_checkpointing": "o",
 }
 
 
@@ -772,12 +764,12 @@ def generate_crossover_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Find crossover points between streaming scan and other backends."""
     crossovers = []
 
-    # Compare streaming scan vs other backends
-    streaming_backends = ["linear_scan_streaming", "triton"]
-    other_backends = ["binary_tree", "linear_scan", "linear_scan_vectorized"]
+    # Compare streaming scan vs Triton backends
+    streaming_backends = ["linear_scan_streaming"]
+    triton_backends = ["triton", "triton_pytorch", "triton_checkpointing"]
 
     for stream_backend in streaming_backends:
-        for other_backend in other_backends:
+        for other_backend in triton_backends:
             cross_df = find_crossover_points(df, stream_backend, other_backend)
             if len(cross_df) > 0:
                 crossovers.append(cross_df)

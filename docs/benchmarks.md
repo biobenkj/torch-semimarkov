@@ -11,7 +11,7 @@ python benchmarks/benchmark_memory_analysis.py \
     --T 128,256,512,1024 \
     --K 4,8,12,16,20,24 \
     --C 3,6,9,12 \
-    --backends linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,block_triangular
+    --backends triton,triton_pytorch,linear_scan_streaming
 ```
 
 ## Triton-Accelerated Scan
@@ -57,7 +57,7 @@ Compare different semirings (Log, Max, Entropy):
 ```bash
 python benchmarks/benchmark_memory_analysis.py \
     --semirings Log,Max,Entropy \
-    --backends linear_scan,linear_scan_streaming,binary_tree \
+    --backends triton,linear_scan_streaming \
     --T 128,256,512 \
     --K 4,8,12 \
     --C 3,6
@@ -118,7 +118,7 @@ python benchmarks/benchmark_memory_analysis.py \
     --repeats 5 \
     --phases forward,backward,both \
     --semirings Log,Max \
-    --backends linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree \
+    --backends linear_scan_streaming \
     --output-dir results/
 
 # With triton backends, use compile-friendly mode
@@ -143,15 +143,10 @@ python benchmarks/benchmark_memory_analysis.py \
 
 | Backend | Description | Memory | Semirings |
 |---------|-------------|--------|-----------|
-| `linear_scan` | Reference O(N) scan | O(TKC) | All |
-| `linear_scan_vectorized` | Vectorized O(N) scan | O(TKC) | All |
-| `linear_scan_streaming` | Streaming O(N) scan | O(KC) | All |
-| `binary_tree` | O(log N) parallel tree | O((KC)^3) | All |
-| `binary_tree_sharded` | Sharded tree (checkpointed) | Reduced | All |
-| `block_triangular` | Block-sparse tree | O(N*KC^2) | All |
+| `linear_scan_streaming` | Streaming O(N) scan (PyTorch reference) | O(KC) | All |
 | `triton` | Fused Triton GPU kernel (torch.compile for training) | O(KC) | Log, Max |
 | `triton_pytorch` | PyTorch reference for Triton | O(KC) | Log, Max |
-| `triton_checkpointing` | Triton with gradient checkpointing (old approach) | O(KC) | Log, Max |
+| `triton_checkpointing` | Triton with gradient checkpointing | O(KC) | Log, Max |
 
 ### Semirings
 
@@ -251,7 +246,7 @@ python benchmarks/analyze_benchmarks.py \
 python benchmarks/benchmark_memory_analysis.py \
     --phases forward,backward \
     --semirings Log,Max \
-    --backends linear_scan_streaming,triton,binary_tree \
+    --backends linear_scan_streaming,triton \
     --T 128,256,512,1024 \
     --K 4,8,12 \
     --C 3,6,9 \

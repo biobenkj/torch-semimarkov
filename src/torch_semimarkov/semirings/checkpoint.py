@@ -20,15 +20,6 @@ Examples::
 
 import torch
 
-has_genbmm = False
-try:
-    import torch_semimarkov._genbmm as genbmm
-    from torch_semimarkov._genbmm import BandedMatrix
-
-    has_genbmm = True
-except ImportError:
-    pass
-
 
 def broadcast_size(a, b):
     r"""Compute the broadcasted tensor size."""
@@ -63,8 +54,8 @@ def CheckpointSemiring(cls, min_size=0):
 
         >>> CheckpointedLog = CheckpointSemiring(LogSemiring, min_size=1000)
         >>> model = SemiMarkov(CheckpointedLog)
-        >>> # Now binary tree uses less memory (but ~2x slower)
-        >>> log_Z, _ = model.logpartition(edge, use_linear_scan=False)
+        >>> # Checkpointed backward uses less memory (but ~2x slower)
+        >>> log_Z, _, _ = model.logpartition(edge)
     """
 
     class _Check(torch.autograd.Function):
@@ -80,32 +71,9 @@ def CheckpointSemiring(cls, min_size=0):
                 q = cls.matmul(a, b)
                 return torch.autograd.grad(q, (a, b), grad_output)
 
-    class _CheckBand(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, a, a_lu, a_ld, b, b_lu, b_ld):
-            ctx.save_for_backward(a, b, torch.LongTensor([a_lu, a_ld, b_lu, b_ld]))
-            a = BandedMatrix(a, a_lu, a_ld)
-            b = BandedMatrix(b, b_lu, b_ld)
-            return cls.matmul(a, b).data
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            a, b, bands = ctx.saved_tensors
-            a_lu, a_ld, b_lu, b_ld = bands.tolist()
-            with torch.enable_grad():
-                q = cls.matmul(BandedMatrix(a, a_lu, a_ld), BandedMatrix(b, b_lu, b_ld))
-                grad_a, grad_b = torch.autograd.grad(q.data, (a, b), grad_output)
-                return grad_a, None, None, grad_b, None, None
-
     class _CheckpointSemiring(cls):
         @staticmethod
         def matmul(a, b):
-            if has_genbmm and isinstance(a, genbmm.BandedMatrix):
-                lu = a.lu + b.lu
-                ld = a.ld + b.ld
-                c = _CheckBand.apply(a.data, a.lu, a.ld, b.data, b.lu, b.ld)
-                return BandedMatrix(c, lu, ld, cls.zero)
-
             if broadcast_size(a, b) > min_size:
                 return _Check.apply(a, b)
             else:

@@ -614,12 +614,9 @@ def extract_segments(labels):
 2. **Choose K carefully**: Memory and compute scale with K. Use empirical
    quantiles (p95/p99) of segment lengths rather than maximum.
 
-3. **Vectorized scan for training**: When not using Triton, use
-   `use_vectorized=True` for 2-3x speedup during training.
+3. **Batch similar lengths together** to minimize padding waste.
 
-4. **Batch similar lengths together** to minimize padding waste.
-
-5. **First training call overhead**: The first call with `requires_grad=True`
+4. **First training call overhead**: The first call with `requires_grad=True`
    incurs a one-time `torch.compile` overhead (a few seconds). Subsequent
    calls reuse the cached compiled kernel.
 

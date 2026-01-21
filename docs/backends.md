@@ -5,26 +5,16 @@ performance and memory profiles.
 
 ## Backend summary
 
-| Backend | Time | DP memory | Parallel depth | Best for |
-|---------|------|-----------|----------------|----------|
-| `linear_scan_streaming` | O(TKC^2) | O(KC) | O(T) | **Default** - best memory, near-optimal speed |
-| `linear_scan_vectorized` | O(TKC^2) | O(TKC) | O(T) | When memory permits (2-3x faster than scalar) |
-| `linear_scan` | O(TKC^2) | O(TKC) | O(T) | Reference implementation |
-| `binary_tree` | O(TKC^2 log T) | O(T(KC)^2) | O(log T) | Small KC only |
-| `binary_tree_sharded` | O(TKC^2 log T) | O(T(KC)^2) | O(log T) | Reduced peak memory |
-| `block_triangular` | O(TKC^2) | O(T(KC)^2) | O(log T) | Structured sparsity |
+| Backend | Time | DP memory | Best for |
+|---------|------|-----------|----------|
+| `linear_scan_streaming` | O(TKC^2) | O(KC) | **Default** - PyTorch reference implementation |
+| `triton` | O(TKC^2) | O(KC) | GPU inference (~45x faster than PyTorch) |
 
 ## Recommendation
 
-**Default: `linear_scan_streaming`** - best for most use cases:
-- O(KC) memory via ring buffer - always fits
-- Within a few percent of vectorized speed
-- Works across all tested configurations
+**Default: `linear_scan_streaming`** - always available, O(KC) memory via ring buffer.
 
-Use `use_vectorized=True` when memory permits for 2-3x speedup over scalar scan.
-
-Tree-based methods can exhaust GPU memory for KC > 150 because of O((KC)^3)
-log-semiring temporaries.
+**Use `triton` for GPU inference** - ~45x speedup with custom Triton kernel.
 
 ## Triton fused streaming kernel (~45x speedup)
 

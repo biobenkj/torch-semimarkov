@@ -9,33 +9,19 @@ network encoders, see the [Integration guide](workflow_integration.md).
 class SemiMarkov(semiring):
     def logpartition(
         self,
-        edge,                    # (batch, T-1, K, C, C) potentials
+        log_potentials,          # (batch, T-1, K, C, C) potentials
         lengths=None,            # (batch,) sequence lengths
-        use_linear_scan=None,    # Auto-select based on KC (>200 uses linear scan)
-        use_vectorized=False,    # Use vectorized scan (O(TKC) memory, 2-3x faster)
-        use_banded=False,        # Use banded matrix operations
-        banded_perm="auto",      # Permutation strategy
-        banded_bw_ratio=0.6,     # Bandwidth threshold
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        force_grad=False,        # Force gradient computation
+    ) -> Tuple[Tensor, List[Tensor], None]:
         """
-        Compute log partition function and backward pointers.
+        Compute log partition function using streaming linear scan.
 
-        Default uses streaming scan with O(KC) memory.
+        Uses O(KC) memory via ring buffer, independent of sequence length T.
 
         Returns:
             v: (batch,) log partition values
-            edges: edge marginals (for gradient computation)
-            charts: intermediate DP tables
-        """
-
-    def _dp_scan_streaming(
-        self,
-        edge,                    # (batch, T-1, K, C, C) potentials
-        lengths=None,
-        force_grad=False,
-    ) -> Tuple[Tensor, List[Tensor], None]:
-        """
-        Streaming scan with O(KC) DP state (default).
+            edges: list of edge marginals (for gradient computation)
+            charts: None (streaming scan does not store charts)
         """
 ```
 

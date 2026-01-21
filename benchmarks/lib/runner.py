@@ -11,7 +11,6 @@ import torch
 
 from torch_semimarkov import SemiMarkov
 from torch_semimarkov.semirings import EntropySemiring, LogSemiring, MaxSemiring
-from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
 from torch_semimarkov.triton_scan import semi_crf_triton_forward
 
 from .memory import bytes_to_gb, estimate_memory_breakdown
@@ -149,45 +148,6 @@ def run_single_benchmark(
                     semiring=triton_semiring,
                     use_compile=False,
                 )
-            elif backend == "binary_tree":
-                v, _ = struct_to_use.logpartition(
-                    edge_input, lengths=lengths, use_linear_scan=False
-                )
-                return v
-            elif backend == "linear_scan":
-                v, _, _ = struct_to_use._dp_standard(edge_input, lengths, force_grad=True)
-                return v
-            elif backend == "linear_scan_vectorized":
-                v, _, _ = struct_to_use._dp_standard_vectorized(
-                    edge_input, lengths, force_grad=True
-                )
-                return v
-            elif backend == "banded":
-                v, _, _ = struct_to_use.logpartition(
-                    edge_input,
-                    lengths=lengths,
-                    use_linear_scan=True,
-                    use_vectorized=True,
-                    use_banded=True,
-                    banded_perm="auto",
-                    banded_bw_ratio=0.6,
-                )
-                return v
-            elif backend == "block_triangular":
-                if hasattr(struct_to_use, "_dp_blocktriangular"):
-                    v, _, _ = struct_to_use._dp_blocktriangular(
-                        edge_input, lengths, force_grad=True
-                    )
-                    return v
-                else:
-                    raise NotImplementedError("block_triangular not available")
-            elif backend == "binary_tree_sharded":
-                ShardedSemiring = CheckpointShardSemiring(semiring_cls, max_size=10000)
-                struct_sharded = SemiMarkov(ShardedSemiring)
-                v, _ = struct_sharded.logpartition(
-                    edge_input, lengths=lengths, use_linear_scan=False
-                )
-                return v
             elif backend == "linear_scan_streaming":
                 v, _, _ = struct_to_use._dp_scan_streaming(edge_input, lengths, force_grad=True)
                 return v

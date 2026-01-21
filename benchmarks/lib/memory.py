@@ -25,53 +25,11 @@ def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> d
     potentials_bytes = B * N * K * C * C * float_bytes
 
     # DP state depends on backend
-    if backend in ["linear_scan", "linear_scan_vectorized"]:
-        # alpha: (ssize, B, N, K, C) -> O(T*K*C) resident
-        # beta: list of N tensors of shape (ssize, B, C) -> O(T*C)
-        alpha_bytes = 1 * B * N * K * C * float_bytes
-        beta_bytes = 1 * B * N * C * float_bytes
-        dp_state_bytes = alpha_bytes + beta_bytes
-
-        if backend == "linear_scan_vectorized":
-            workspace_bytes = B * K * C * float_bytes * 2
-        else:
-            workspace_bytes = B * C * float_bytes
-
-        autograd_bytes = potentials_bytes
-
-    elif backend == "linear_scan_streaming":
+    if backend == "linear_scan_streaming":
         # TRUE streaming scan: O(K*C) DP state, independent of T
         dp_state_bytes = 1 * B * K * C * float_bytes + 1 * B * C * float_bytes
         workspace_bytes = B * K * C * C * float_bytes + B * K * C * float_bytes
         autograd_bytes = potentials_bytes + dp_state_bytes * N
-
-    elif backend == "binary_tree":
-        # Tree stores chart matrices at each level
-        # CRITICAL: log-semiring matmul materializes O((KC)^3) temporary
-        KC = K * C
-        dp_state_bytes = B * N * KC * float_bytes
-        workspace_bytes = B * KC * KC * KC * float_bytes  # (KC)^3 temporary
-        autograd_bytes = B * N * KC * KC * float_bytes * 2
-
-    elif backend == "binary_tree_sharded":
-        KC = K * C
-        dp_state_bytes = B * N * KC * float_bytes
-        shard_size = 10000
-        workspace_bytes = B * min(KC * KC * KC, shard_size * KC) * float_bytes
-        autograd_bytes = B * N * KC * KC * float_bytes
-
-    elif backend == "banded":
-        KC = K * C
-        bw = min(KC, K * 2)
-        dp_state_bytes = B * N * KC * float_bytes
-        workspace_bytes = B * KC * bw * float_bytes
-        autograd_bytes = B * N * KC * bw * float_bytes
-
-    elif backend == "block_triangular":
-        KC = K * C
-        dp_state_bytes = B * N * KC * float_bytes
-        workspace_bytes = B * KC * KC * float_bytes
-        autograd_bytes = B * N * KC * KC * float_bytes
 
     elif backend in ("triton", "triton_pytorch", "triton_checkpointing"):
         # Triton scan uses O(K*C) ring buffer

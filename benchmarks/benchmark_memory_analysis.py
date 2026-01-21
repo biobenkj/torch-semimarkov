@@ -148,14 +148,13 @@ def main():
     parser.add_argument(
         "--backends",
         type=str,
-        default="linear_scan,linear_scan_vectorized,linear_scan_streaming,binary_tree,binary_tree_sharded,block_triangular",
+        default="triton,triton_pytorch,linear_scan_streaming",
         help=(
             "Comma-separated list of backends. Options: "
-            "linear_scan, linear_scan_vectorized, linear_scan_streaming, "
-            "binary_tree, binary_tree_sharded, block_triangular, "
+            "linear_scan_streaming (PyTorch reference), "
             "triton (GPU Triton kernel with torch.compile for training), "
-            "triton_pytorch (PyTorch reference), "
-            "triton_checkpointing (Triton with gradient checkpointing, for comparison). "
+            "triton_pytorch (PyTorch reference for Triton), "
+            "triton_checkpointing (Triton with gradient checkpointing). "
             "Note: triton backends support Log and Max semirings."
         ),
     )
