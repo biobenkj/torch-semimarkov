@@ -27,7 +27,7 @@ This makes Semi-Markov CRF inference practical for genome-scale annotation witho
 **torch-semimarkov** provides:
 
 - **Streaming scan** — $O(KC)$ memory, universally applicable across genomic parameter regimes
-- **Triton fused kernel** — optional GPU acceleration with ~45x speedup
+- **Triton fused kernel** — optional GPU acceleration
 
 ## Why Semi-Markov CRFs in genomics contexts?
 
@@ -58,10 +58,7 @@ git clone https://github.com/biobenkj/torch-semimarkov.git
 cd torch-semimarkov
 pip install -e ".[dev]"
 
-# With CUDA support (requires nvcc via CUDA_HOME)
-TORCH_SEMIMARKOV_CUDA=1 pip install -e .
-
-# Optional Triton kernel for GPU (used automatically when available)
+# Optional Triton kernel for GPU acceleration
 pip install triton
 ```
 
@@ -97,30 +94,42 @@ Works with PyTorch Lightning and DDP out of the box—see [examples/lightning_in
 
 For the low-level API with explicit edge tensors and semiring control, see the [API reference](docs/api.md).
 
-### Triton Fused Kernel (~45x speedup)
+### Triton Kernel
 
-The Triton kernel uses a hybrid approach for optimal performance:
+When Triton is installed, torch-semimarkov uses fused GPU kernels that significantly accelerate both forward and backward passes.
 
-- **Inference** (`requires_grad=False`): Custom Triton kernel for maximum speed
-- **Training** (`requires_grad=True`): `torch.compile` for efficient automatic backward pass
+**How it works:**
+
+The streaming API computes edge potentials on-the-fly from cumulative scores rather than materializing the full `O(T × K × C²)` edge tensor. The Triton kernel fuses this computation with the forward scan:
+
+```
+# Edge computed on-the-fly (never materialized):
+content = cum_scores[t+k, c] - cum_scores[t, c]  # O(1) lookup
+edge[t, k, c_dst, c_src] = content + duration_bias[k, c] + transition[c_src, c_dst]
+```
+
+Key optimizations:
+- **Fused edge computation** — computes edges on-the-fly via prefix-sum, avoiding the full edge tensor
+- **O(KC) memory** — ring buffer for DP state, independent of sequence length
+- **Custom backward kernel** — custom Triton kernel for gradients, not autograd
+- **Checkpointing** — trades compute for memory by recomputing alpha values during backward
+
+**Usage:**
+
+The `SemiMarkovCRFHead` uses Triton automatically when available—pass `use_triton=True` (the default on GPU) to `forward()`, `compute_loss()`, or `decode()`.
+
+For direct access to the streaming kernel:
 
 ```python
-from torch_semimarkov.triton_scan import semi_crf_triton_forward
+from torch_semimarkov.streaming import semi_crf_streaming_forward
 
-edge = edge.cuda()
-lengths = lengths.cuda()
-
-# Inference: uses fast custom Triton kernel
-partition = semi_crf_triton_forward(edge, lengths)
-
-# Training: uses torch.compile for efficient backward
-edge_train = edge.requires_grad_(True)
-partition = semi_crf_triton_forward(edge_train, lengths)
-partition.sum().backward()
-
-# Viterbi decoding (max semiring)
-viterbi_score = semi_crf_triton_forward(edge, lengths, semiring="max")
+# Cumulative scores from encoder (see docs for zero-centering requirements)
+partition = semi_crf_streaming_forward(
+    cum_scores, transition, duration_bias, lengths, K
+)
 ```
+
+For performance characteristics, see [Benchmarking](docs/benchmarks.md).
 
 ## Documentation
 
@@ -153,12 +162,11 @@ Tests run CPU-only by default. GPU tests require CUDA and are skipped in CI.
 | **Semirings** | Log, Max, Std, KMax, Entropy, CrossEntropy |
 | **Checkpoint Semiring** | Memory-efficient gradients |
 | **BandedMatrix (CPU)** | Prototype and not a recommended backend |
-| **CUDA Extension** | Builds when nvcc available |
-| **Triton Kernel** | ~45x speedup on GPU, Log/Max semirings, hybrid inference/training |
+| **Triton Kernel** | GPU acceleration, Log/Max semirings, custom forward/backward |
 
 ## Acknowledgments
 
-This library builds on [pytorch-struct](https://github.com/harvardnlp/pytorch-struct) by Alexander Rush and [genbmm](https://github.com/harvardnlp/genbmm) for CUDA generalized batch matrix multiplication.
+This library builds on [pytorch-struct](https://github.com/harvardnlp/pytorch-struct) by Alexander Rush. GPU kernels are written using [Triton](https://github.com/triton-lang/triton).
 
 ## License
 
