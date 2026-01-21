@@ -8,6 +8,7 @@ Key Features:
 - O(KC) memory streaming scan (independent of sequence length T)
 - Streaming API for on-the-fly edge computation via prefix-sum decomposition
 - Triton GPU acceleration for inference
+- Multiple backend algorithms for benchmarking (banded, block-triangular)
 
 Original pytorch-struct: https://github.com/harvardnlp/pytorch-struct
 License: MIT (see LICENSE file)
@@ -15,10 +16,18 @@ License: MIT (see LICENSE file)
 Modifications:
 - Added streaming linear scan with O(KC) memory
 - Added streaming API for T=400K+ sequences with on-the-fly edge computation
-- Removed memory-intensive backends (banded, block-triangular)
+- Added banded and block-triangular backends for benchmarking
 - Optimized for genomic segmentation use cases
 """
 
+from .banded import BandedMatrix
+from .banded_utils import (
+    apply_permutation,
+    measure_effective_bandwidth,
+    rcm_ordering_from_adjacency,
+    snake_ordering,
+)
+from .blocktriangular import BlockTriangularMatrix, block_triang_matmul
 from .duration import (
     CallableDuration,
     DurationDistribution,
@@ -63,4 +72,12 @@ __all__ = [
     "UniformDuration",
     "CallableDuration",
     "create_duration_distribution",
+    # Benchmark backends
+    "BandedMatrix",
+    "BlockTriangularMatrix",
+    "block_triang_matmul",
+    "measure_effective_bandwidth",
+    "snake_ordering",
+    "rcm_ordering_from_adjacency",
+    "apply_permutation",
 ]
