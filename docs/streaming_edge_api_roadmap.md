@@ -32,12 +32,12 @@ The edge tensor represents all possible segment transitions:
 - `edge[b, t, k, c_dest, c_src]` = score for transitioning from label `c_src` at position `t` to label `c_dest` at position `t+k`
 - This is O(T × K × C²) values
 
-## Solution: Pre-Projected Streaming (Golden Rule)
+## Solution: Pre-Projected Streaming
 
 Instead of pre-computing the full edge tensor OR doing matmuls inside the kernel,
 we **pre-project features to label space** before the scan.
 
-### Critical Insight: The "Golden Rule"
+### Critical Insight: Loop-Invariant Projection + Prefix Sums
 
 **Original streaming idea (FLAWED):**
 ```python
@@ -46,7 +46,7 @@ segment_feat = cum_features[t+k] - cum_features[t]  # (D,)
 segment_score = segment_feat @ label_weights         # D×C matmul per (t,k)!
 ```
 
-**Golden Rule (CORRECT):**
+**Streaming (CORRECT):**
 ```python
 # Outside kernel - parallel, fast
 projected = encoder_output @ label_weights  # (B, T, D) @ (D, C) → (B, T, C)
@@ -101,7 +101,7 @@ This removes all matrix multiplications from the sequential scan.
 
 ### Memory Comparison
 
-| Component | Pre-computed Edge | Golden Rule (Basic) | Golden Rule (Boundaries) |
+| Component | Pre-computed Edge | Streaming (Basic) | Streaming (Boundaries) |
 |-----------|-------------------|---------------------|--------------------------|
 | Edge tensor | 2.76 TB | **0** | **0** |
 | Encoder hidden states | - | (not stored) | (not stored) |
@@ -116,7 +116,7 @@ This removes all matrix multiplications from the sequential scan.
 
 ### Compute Comparison
 
-| Metric | Pre-computed Edge | Original Streaming | Golden Rule |
+| Metric | Pre-computed Edge | Original Streaming | Streaming |
 |--------|-------------------|-------------------|-------------|
 | Inner loop per (t,k) | 1 scalar load | 2×D loads + D×C matmul | 2-4×C loads + C ops |
 | FLOPs per (t,k) | ~10 | 6,144 | ~50 |
@@ -188,7 +188,7 @@ def test_long_sequence_drift():
 
 ```python
 def semi_crf_streaming_forward(
-    # Pre-projected inputs (Golden Rule: projection done OUTSIDE kernel)
+    # Pre-projected inputs (loop-invariant: projection done OUTSIDE kernel)
     cum_scores: torch.Tensor,           # (batch, T+1, C) - cumsum of ZERO-CENTERED projected features, FLOAT32
     transition: torch.Tensor,           # (C, C)
     duration_bias: torch.Tensor,        # (K, C) - REQUIRED: compensates for sum-pooling length bias
@@ -207,7 +207,7 @@ def semi_crf_streaming_forward(
     """
     Compute Semi-CRF partition function with pre-projected streaming.
 
-    This uses the "Golden Rule" optimization: features are projected to label
+    This uses loop-invariant projection: features are projected to label
     space BEFORE the kernel, eliminating matmuls from the sequential scan.
 
     Edge potentials are computed on-the-fly as:
@@ -241,7 +241,7 @@ def semi_crf_streaming_forward(
 
 ```python
 class MambaSemiCRF(nn.Module):
-    """End-to-end Mamba encoder + Semi-CRF decoder with Golden Rule optimization.
+    """End-to-end Mamba encoder + Semi-CRF decoder with streaming edge computation.
 
     Incorporates all critical numerical stability fixes for T=400K+ sequences:
     1. Zero-centering before cumsum (prevents floating-point erasure)
@@ -274,7 +274,7 @@ class MambaSemiCRF(nn.Module):
         h = self.encoder(x)  # (B, T, D)
         batch, T, D = h.shape
 
-        # === Golden Rule: Project OUTSIDE the kernel ===
+        # === Loop-invariant: Project OUTSIDE the kernel ===
         content_projected = h @ self.W_content  # (B, T, C)
 
         # CRITICAL: Zero-center before cumsum to prevent floating-point erasure
@@ -321,7 +321,7 @@ class MambaSemiCRF(nn.Module):
 
 ### Backward Pass (Gradient Flow)
 
-With the Golden Rule, gradients flow through the pre-projection:
+With streaming edge computation, gradients flow through the pre-projection:
 
 ```python
 # Gradient flow (conceptual):
@@ -442,7 +442,7 @@ This enables clinicians to see:
 
 **Status**: ✅ Completed (2025-01-18)
 
-**Goal**: Working Golden Rule forward/backward in pure PyTorch for correctness verification.
+**Goal**: Working streaming edge forward/backward in pure PyTorch for correctness verification.
 
 **Files**:
 - `src/torch_semimarkov/streaming.py`
@@ -454,10 +454,10 @@ This enables clinicians to see:
 - [x] Add gradient tests with `torch.autograd.gradcheck`
 - [x] Test numerical stability with T=100K+ in float32
 
-**Golden Rule edge computation (inside forward loop)**:
+**Streaming edge computation (inside forward loop)**:
 ```python
-def compute_edge_block_golden_rule(cum_scores, transition, duration_bias, t, k,
-                                    proj_start=None, proj_end=None):
+def compute_edge_block_streaming(cum_scores, transition, duration_bias, t, k,
+                                  proj_start=None, proj_end=None):
     """Compute edge[t, k, :, :] - NO MATMULS, just vector ops."""
     # Content score via cumsum difference: (batch, C)
     content_score = cum_scores[:, t + k, :] - cum_scores[:, t, :]

@@ -3,8 +3,8 @@ r"""Triton forward kernels for streaming Semi-CRF.
 This module contains the Triton kernels for the forward pass (log and max semiring)
 and the launcher function that allocates buffers and dispatches the kernels.
 
-The kernels implement the Golden Rule optimization where edge potentials are
-computed on-the-fly from cumulative scores:
+The kernels implement streaming edge computation where edge potentials are
+computed on-the-fly from cumulative scores via prefix-sum decomposition:
 
 .. math::
     \text{edge}[c_{\text{dst}}, c_{\text{src}}] =
@@ -117,7 +117,7 @@ if HAS_TRITON:
         stride_ckpt_k,
         stride_ckpt_c,
     ):
-        r"""Streaming Semi-CRF forward scan with Golden Rule edge computation (log semiring).
+        r"""Streaming Semi-CRF forward scan with on-the-fly edge computation (log semiring).
 
         This Triton kernel computes the forward pass of the Semi-CRF using logsumexp
         reductions. Edge potentials are computed on-the-fly from cumulative scores:
@@ -225,7 +225,7 @@ if HAS_TRITON:
                     other=NEG_INF,
                 )  # (C_PAD,) - alpha[start_pos, c_src]
 
-                # === Compute edge block on-the-fly (Golden Rule) ===
+                # === Compute edge block on-the-fly (prefix-sum) ===
 
                 # Load cum_scores[t, :] and cum_scores[start_pos, :]
                 cum_end = tl.load(

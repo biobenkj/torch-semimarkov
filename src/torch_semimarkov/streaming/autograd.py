@@ -31,7 +31,7 @@ except ImportError:
 
 
 class SemiCRFStreaming(torch.autograd.Function):
-    r"""Autograd function for streaming Semi-CRF with Golden Rule edge computation.
+    r"""Autograd function for streaming Semi-CRF with on-the-fly edge computation.
 
     This wraps the forward and backward passes to enable automatic differentiation.
     Memory usage is :math:`O(KC)` for the ring buffer, independent of sequence length T.
@@ -281,7 +281,7 @@ def semi_crf_streaming_forward(
 ) -> torch.Tensor:
     r"""semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K, semiring="log", proj_start=None, proj_end=None, use_triton=True) -> Tensor
 
-    Compute Semi-CRF partition function with Golden Rule streaming.
+    Compute Semi-CRF partition function with streaming edge computation.
 
     This is the main entry point for the streaming API. Edge potentials are
     computed on-the-fly from cumulative scores, eliminating the need for the
@@ -333,7 +333,7 @@ def semi_crf_streaming_forward(
         >>> h = torch.randn(batch, T, hidden_dim)  # encoder output
         >>> W_content = torch.randn(hidden_dim, C)
         >>>
-        >>> # Pre-project to label space (Golden Rule: outside kernel)
+        >>> # Pre-project to label space (loop-invariant: outside kernel)
         >>> projected = h @ W_content  # (batch, T, C)
         >>>
         >>> # CRITICAL: Zero-center before cumsum
@@ -357,7 +357,7 @@ def semi_crf_streaming_forward(
 
     See Also:
         :class:`~torch_semimarkov.SemiMarkov`: Pre-computed edge tensor API
-        :func:`compute_edge_block_golden_rule`: On-the-fly edge computation helper
+        :func:`compute_edge_block_streaming`: On-the-fly edge computation helper
     """
     if semiring not in ("log", "max"):
         raise ValueError(f"semiring must be 'log' or 'max', got {semiring!r}")

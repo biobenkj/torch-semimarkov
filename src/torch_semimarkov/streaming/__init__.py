@@ -1,6 +1,6 @@
-r"""Golden Rule Streaming API for memory-efficient Semi-CRF.
+r"""Streaming API for memory-efficient Semi-CRF inference.
 
-This module implements the "Golden Rule" optimization for Semi-CRF inference:
+This module implements on-the-fly edge computation using prefix-sum decomposition:
 edge potentials are computed on-the-fly from pre-projected cumulative scores,
 eliminating the need to materialize the full (batch, T-1, K, C, C) edge tensor.
 
@@ -9,7 +9,7 @@ eliminating the need to materialize the full (batch, T-1, K, C, C) edge tensor.
 
     Use ``streaming`` (this module) when:
         - Edge tensor is too large to materialize (T > 10K, large K)
-        - Edges follow the "Golden Rule" structure (content + transition)
+        - Edges follow the decomposable structure (content + transition)
         - Very long sequences (T = 100K - 400K+)
 
     Use ``triton_scan`` module when:
@@ -47,12 +47,12 @@ This module takes **cumulative scores** and computes edges on-the-fly::
 Memory Complexity
 -----------------
 - Pre-computed edge API (triton_scan): O(T × K × C²) - 2.76 TB for T=400K, K=3K, C=24
-- Golden Rule API (this module): O(T × C + K × C + C²) - ~50 MB for same dimensions
+- Streaming API (this module): O(T × C + K × C + C²) - ~50 MB for same dimensions
 
-The Golden Rule
----------------
+Streaming Edge Computation
+--------------------------
 Instead of pre-computing edges, we pre-project encoder features to label space
-BEFORE the kernel, then compute edges on-the-fly inside:
+BEFORE the kernel (loop-invariant projection), then compute edges on-the-fly inside:
 
     # Outside kernel (parallel, efficient)
     projected = h @ W_content                    # (batch, T, C)
@@ -115,7 +115,7 @@ from .autograd import (
 from .constants import NEG_INF
 from .pytorch_reference import (
     _compute_checkpoint_interval,
-    compute_edge_block_golden_rule,
+    compute_edge_block_streaming,
     semi_crf_streaming_backward_pytorch,
     semi_crf_streaming_forward_pytorch,
 )
@@ -140,7 +140,7 @@ __all__ = [
     # PyTorch reference implementations
     "semi_crf_streaming_forward_pytorch",
     "semi_crf_streaming_backward_pytorch",
-    "compute_edge_block_golden_rule",
+    "compute_edge_block_streaming",
     # Utilities
     "_compute_checkpoint_interval",
     "NEG_INF",

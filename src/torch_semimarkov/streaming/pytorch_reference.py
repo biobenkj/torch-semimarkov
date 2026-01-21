@@ -8,7 +8,7 @@ This module contains the pure PyTorch implementations used for:
 
 Functions:
     _compute_checkpoint_interval: Compute optimal checkpoint interval.
-    compute_edge_block_golden_rule: Compute edge block on-the-fly.
+    compute_edge_block_streaming: Compute edge block on-the-fly.
     semi_crf_streaming_forward_pytorch: Forward pass with ring buffer.
     semi_crf_streaming_backward_pytorch: Backward pass via forward-backward algorithm.
 """
@@ -45,7 +45,7 @@ def _compute_checkpoint_interval(T: int, K: int) -> int:
     return max(K, optimal)
 
 
-def compute_edge_block_golden_rule(
+def compute_edge_block_streaming(
     cum_scores: torch.Tensor,
     transition: torch.Tensor,
     duration_bias: torch.Tensor,
@@ -54,9 +54,9 @@ def compute_edge_block_golden_rule(
     proj_start: Optional[torch.Tensor] = None,
     proj_end: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""compute_edge_block_golden_rule(cum_scores, transition, duration_bias, t, k, proj_start=None, proj_end=None) -> Tensor
+    r"""compute_edge_block_streaming(cum_scores, transition, duration_bias, t, k, proj_start=None, proj_end=None) -> Tensor
 
-    Compute edge block on-the-fly using the Golden Rule.
+    Compute edge block on-the-fly using prefix-sum decomposition.
 
     This computes the edge potential for segments starting at position ``t``
     with duration ``k``, without materializing the full edge tensor:
@@ -124,7 +124,7 @@ def semi_crf_streaming_forward_pytorch(
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     r"""semi_crf_streaming_forward_pytorch(cum_scores, transition, duration_bias, lengths, K, semiring="log", proj_start=None, proj_end=None, checkpoint_interval=None) -> tuple[Tensor, Tensor, int]
 
-    Forward pass with Golden Rule edge computation (pure PyTorch reference).
+    Forward pass with streaming edge computation (pure PyTorch reference).
 
     Computes the log partition function using a ring buffer with :math:`O(KC)` memory.
     Edge potentials are computed on-the-fly from cumulative scores.
@@ -223,8 +223,8 @@ def semi_crf_streaming_forward_pytorch(
             ring_idx = start % K
             alpha_prev = alpha_ring[:, ring_idx, :]  # (batch, C_src)
 
-            # Compute edge block on-the-fly (Golden Rule)
-            edge_block = compute_edge_block_golden_rule(
+            # Compute edge block on-the-fly (streaming)
+            edge_block = compute_edge_block_streaming(
                 cum_scores, transition, duration_bias, start, k, proj_start, proj_end
             )  # (batch, C_dest, C_src)
 
@@ -396,7 +396,7 @@ def semi_crf_streaming_backward_pytorch(
                 alpha_prev = alpha_ring[:, ring_idx, :]
 
                 # Compute edge on-the-fly
-                edge_block = compute_edge_block_golden_rule(
+                edge_block = compute_edge_block_streaming(
                     cum_scores, transition, duration_bias, start, k, proj_start, proj_end
                 )
 
@@ -448,7 +448,7 @@ def semi_crf_streaming_backward_pytorch(
                 beta_next = beta_ring[:, ring_k_idx, :]
 
                 # Compute edge on-the-fly
-                edge_block = compute_edge_block_golden_rule(
+                edge_block = compute_edge_block_streaming(
                     cum_scores, transition, duration_bias, t, k, proj_start, proj_end
                 )
 

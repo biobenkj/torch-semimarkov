@@ -1,12 +1,12 @@
 """
-Scaling tests for the Golden Rule streaming API.
+Scaling tests for the streaming API.
 
 These tests verify that the streaming implementation does NOT OOM at scale.
 The primary success metric is: no OOM for T=100K, K=1K, C=24.
 
 Memory expectations:
 - Pre-computed edge API: O(T × K × C²) = 2.76 TB for T=400K, K=3K, C=24
-- Golden Rule API: O(K × C + T × C) ≈ 50 MB for same dimensions
+- Streaming API: O(K × C + T × C) ≈ 50 MB for same dimensions
 """
 
 import gc
@@ -17,8 +17,8 @@ import torch
 from torch_semimarkov.streaming import semi_crf_streaming_forward
 
 
-def create_golden_rule_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
-    """Create test inputs for the Golden Rule streaming API."""
+def create_streaming_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
+    """Create test inputs for the streaming API."""
     torch.manual_seed(seed)
 
     # Simulate projected encoder features
@@ -52,7 +52,7 @@ class TestNoOOM:
 
         gc.collect()
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -66,7 +66,7 @@ class TestNoOOM:
 
         gc.collect()
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -81,7 +81,7 @@ class TestNoOOM:
 
         gc.collect()
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -97,7 +97,7 @@ class TestNoOOM:
         gc.collect()
         torch.cuda.empty_cache()
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -116,7 +116,7 @@ class TestNoOOM:
         gc.collect()
         torch.cuda.empty_cache()
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -142,7 +142,7 @@ class TestMemoryUsage:
 
         # Test with T=5K
         T1 = 5_000
-        cum_scores1, transition1, duration_bias1, lengths1 = create_golden_rule_inputs(
+        cum_scores1, transition1, duration_bias1, lengths1 = create_streaming_inputs(
             batch, T1, K, C, device="cuda"
         )
         _ = semi_crf_streaming_forward(cum_scores1, transition1, duration_bias1, lengths1, K)
@@ -157,7 +157,7 @@ class TestMemoryUsage:
 
         # Test with T=20K (4x larger)
         T2 = 20_000
-        cum_scores2, transition2, duration_bias2, lengths2 = create_golden_rule_inputs(
+        cum_scores2, transition2, duration_bias2, lengths2 = create_streaming_inputs(
             batch, T2, K, C, device="cuda"
         )
         _ = semi_crf_streaming_forward(cum_scores2, transition2, duration_bias2, lengths2, K)
@@ -184,7 +184,7 @@ class TestNumericalStabilityAtScale:
         T, K, C = 10_000, 50, 8
         batch = 1
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -196,7 +196,7 @@ class TestNumericalStabilityAtScale:
         T, K, C = 50_000, 100, 8
         batch = 1
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -207,7 +207,7 @@ class TestNumericalStabilityAtScale:
         T, K, C = 1_000, 20, 8
         batch = 1
 
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         cum_scores.requires_grad_(True)
         transition.requires_grad_(True)
@@ -233,7 +233,7 @@ if __name__ == "__main__":
     T, K, C = 10_000, 100, 24
     batch = 1
 
-    cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+    cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
     partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
     print(f"  Partition: {partition.item():.4f}")
@@ -244,7 +244,7 @@ if __name__ == "__main__":
     T, K, C = 50_000, 500, 24
     batch = 1
 
-    cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+    cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
     partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
     print(f"  Partition: {partition.item():.4f}")
@@ -258,7 +258,7 @@ if __name__ == "__main__":
     gc.collect()
 
     try:
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
         print(f"  Partition: {partition.item():.4f}")

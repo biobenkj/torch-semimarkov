@@ -20,8 +20,8 @@ if HAS_TRITON:
     )
 
 
-def create_golden_rule_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
-    """Create test inputs for the Golden Rule streaming API."""
+def create_streaming_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
+    """Create test inputs for the streaming API."""
     torch.manual_seed(seed)
 
     # Simulate projected encoder features
@@ -53,7 +53,7 @@ class TestTritonStreamingKernel:
     def test_triton_matches_pytorch_small(self):
         """Verify Triton kernel matches PyTorch for small inputs."""
         batch, T, K, C = 2, 20, 4, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -72,7 +72,7 @@ class TestTritonStreamingKernel:
     def test_triton_matches_pytorch_medium(self):
         """Verify Triton kernel matches PyTorch for medium inputs."""
         batch, T, K, C = 4, 100, 8, 6
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -89,7 +89,7 @@ class TestTritonStreamingKernel:
     def test_triton_matches_pytorch_large_C(self):
         """Verify Triton kernel works with larger C (requires padding)."""
         batch, T, K, C = 2, 50, 6, 24  # C=24 -> C_PAD=32
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -107,7 +107,7 @@ class TestTritonStreamingKernel:
         """Verify Triton kernel handles non-power-of-2 C values."""
         for C in [3, 5, 7, 11, 13, 17]:
             batch, T, K = 2, 30, 5
-            cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+            cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
                 batch, T, K, C, device="cuda"
             )
 
@@ -126,7 +126,7 @@ class TestTritonStreamingKernel:
     def test_triton_variable_lengths(self):
         """Verify Triton kernel handles variable sequence lengths."""
         batch, T, K, C = 4, 50, 6, 4
-        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
         lengths = torch.tensor([T, T - 10, T - 20, T - 30], dtype=torch.long, device="cuda")
@@ -146,7 +146,7 @@ class TestTritonStreamingKernel:
         K, C, batch = 10, 4, 2
 
         for T in [4, 6, 8, 12]:
-            cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+            cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
                 batch, T, K, C, device="cuda"
             )
 
@@ -165,7 +165,7 @@ class TestTritonStreamingKernel:
     def test_triton_max_semiring(self):
         """Verify Triton max semiring matches PyTorch."""
         batch, T, K, C = 2, 50, 6, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -182,7 +182,7 @@ class TestTritonStreamingKernel:
     def test_triton_produces_finite_values(self):
         """Verify Triton kernel produces finite values."""
         batch, T, K, C = 4, 100, 8, 6
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -195,7 +195,7 @@ class TestTritonStreamingKernel:
     def test_triton_checkpoints_saved(self):
         """Verify Triton kernel saves checkpoints correctly."""
         batch, T, K, C = 2, 100, 8, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -218,7 +218,7 @@ class TestTritonStreamingKernel:
     def test_triton_larger_sequence(self):
         """Verify Triton kernel works with larger sequences."""
         batch, T, K, C = 2, 500, 16, 8
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -244,7 +244,7 @@ class TestTritonStreamingTraining:
         from torch_semimarkov.streaming import semi_crf_streaming_forward
 
         batch, T, K, C = 2, 50, 6, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -267,7 +267,7 @@ class TestTritonStreamingTraining:
         from torch_semimarkov.streaming import semi_crf_streaming_forward
 
         batch, T, K, C = 2, 30, 5, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -300,7 +300,7 @@ class TestTritonStreamingTraining:
         from torch_semimarkov.streaming import semi_crf_streaming_forward
 
         batch, T, K, C = 2, 50, 6, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -322,7 +322,7 @@ class TestTritonStreamingTraining:
     def test_triton_backward_kernel_raw(self):
         """Test the raw Triton backward kernel launcher."""
         batch, T, K, C = 2, 30, 5, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -361,7 +361,7 @@ class TestTritonStreamingTraining:
         from torch_semimarkov.streaming import semi_crf_streaming_forward
 
         batch, T, K, C = 4, 50, 6, 4
-        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
         lengths = torch.tensor([T, T - 10, T - 20, T - 30], dtype=torch.long, device="cuda")
@@ -660,7 +660,7 @@ class TestTritonStreamingBenchmark:
     def test_benchmark_correctness(self, T, K):
         """Verify correctness across different T and K values."""
         batch, C = 4, 6
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -913,7 +913,7 @@ class TestGradientScalingBugFix:
         from torch_semimarkov.streaming import semi_crf_streaming_forward
 
         batch, T, K, C = 2, 30, 5, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -957,7 +957,7 @@ class TestGradientScalingBugFix:
         from torch_semimarkov.streaming import semi_crf_streaming_forward
 
         batch, T, K, C = 2, 30, 5, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -999,11 +999,11 @@ class TestGradientScalingBugFix:
 
         # Create different inputs for each batch element
         torch.manual_seed(42)
-        cum_scores_0, transition, duration_bias, _ = create_golden_rule_inputs(
+        cum_scores_0, transition, duration_bias, _ = create_streaming_inputs(
             1, T, K, C, device="cuda"
         )
         torch.manual_seed(123)  # Different seed for different data
-        cum_scores_1, _, _, _ = create_golden_rule_inputs(1, T, K, C, device="cuda")
+        cum_scores_1, _, _, _ = create_streaming_inputs(1, T, K, C, device="cuda")
 
         # Combine into batch of 2
         cum_scores_batch = torch.cat([cum_scores_0, cum_scores_1], dim=0)
@@ -1095,7 +1095,7 @@ if __name__ == "__main__":
 
         # Quick validation
         batch, T, K, C = 2, 100, 8, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 

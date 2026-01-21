@@ -1,5 +1,5 @@
 """
-Tests for the Golden Rule streaming API.
+Tests for the streaming API.
 
 The streaming API computes edge potentials on-the-fly from cumulative scores,
 enabling memory-efficient inference at chromosome scale (T=400K+).
@@ -9,13 +9,13 @@ import pytest
 import torch
 
 from torch_semimarkov.streaming import (
-    compute_edge_block_golden_rule,
+    compute_edge_block_streaming,
     semi_crf_streaming_forward,
 )
 
 
-def create_golden_rule_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
-    """Create test inputs for the Golden Rule streaming API."""
+def create_streaming_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, seed=42):
+    """Create test inputs for the streaming API."""
     torch.manual_seed(seed)
 
     # Simulate projected encoder features
@@ -40,16 +40,14 @@ def create_golden_rule_inputs(batch, T, K, C, device="cpu", dtype=torch.float32,
 
 
 class TestEdgeBlockComputation:
-    """Test the compute_edge_block_golden_rule helper."""
+    """Test the compute_edge_block_streaming helper."""
 
     def test_edge_block_shape(self):
         """Verify edge block has correct shape."""
         batch, T, K, C = 2, 100, 8, 4
-        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(batch, T, K, C)
 
-        edge_block = compute_edge_block_golden_rule(
-            cum_scores, transition, duration_bias, t=10, k=3
-        )
+        edge_block = compute_edge_block_streaming(cum_scores, transition, duration_bias, t=10, k=3)
 
         assert edge_block.shape == (
             batch,
@@ -60,10 +58,10 @@ class TestEdgeBlockComputation:
     def test_edge_block_values(self):
         """Verify edge block computation is correct."""
         batch, T, K, C = 1, 20, 4, 2
-        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(batch, T, K, C)
 
         t, k = 5, 2
-        edge_block = compute_edge_block_golden_rule(cum_scores, transition, duration_bias, t, k)
+        edge_block = compute_edge_block_streaming(cum_scores, transition, duration_bias, t, k)
 
         # Manual computation
         content_score = cum_scores[:, t + k, :] - cum_scores[:, t, :]  # (batch, C)
@@ -75,12 +73,12 @@ class TestEdgeBlockComputation:
     def test_edge_block_with_boundaries(self):
         """Verify edge block with boundary projections."""
         batch, T, K, C = 2, 50, 6, 3
-        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(batch, T, K, C)
         proj_start = torch.randn(batch, T, C)
         proj_end = torch.randn(batch, T, C)
 
         t, k = 10, 3
-        edge_block = compute_edge_block_golden_rule(
+        edge_block = compute_edge_block_streaming(
             cum_scores, transition, duration_bias, t, k, proj_start, proj_end
         )
 
@@ -88,9 +86,7 @@ class TestEdgeBlockComputation:
         assert edge_block.shape == (batch, C, C)
 
         # Verify boundaries are included (non-zero contribution)
-        edge_no_boundary = compute_edge_block_golden_rule(
-            cum_scores, transition, duration_bias, t, k
-        )
+        edge_no_boundary = compute_edge_block_streaming(cum_scores, transition, duration_bias, t, k)
         assert not torch.allclose(edge_block, edge_no_boundary)
 
 
@@ -100,7 +96,7 @@ class TestStreamingForward:
     def test_forward_produces_finite_values(self):
         """Verify forward pass produces finite partition values."""
         batch, T, K, C = 2, 100, 8, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -110,7 +106,7 @@ class TestStreamingForward:
     def test_forward_variable_lengths(self):
         """Verify forward handles variable sequence lengths."""
         batch, T, K, C = 4, 50, 6, 3
-        cum_scores, transition, duration_bias, _ = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(batch, T, K, C)
         lengths = torch.tensor([T, T - 10, T - 20, T], dtype=torch.long)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
@@ -122,7 +118,7 @@ class TestStreamingForward:
     def test_forward_max_semiring(self):
         """Verify max semiring (Viterbi) works."""
         batch, T, K, C = 2, 50, 6, 3
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition_log = semi_crf_streaming_forward(
             cum_scores, transition, duration_bias, lengths, K, semiring="log"
@@ -140,9 +136,7 @@ class TestStreamingForward:
         K, C, batch = 10, 3, 2
 
         for T in [4, 6, 8, 12]:
-            cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
-                batch, T, K, C
-            )
+            cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
             partition = semi_crf_streaming_forward(
                 cum_scores, transition, duration_bias, lengths, K
@@ -157,7 +151,7 @@ class TestStreamingBackward:
     def test_backward_produces_finite_gradients(self):
         """Verify backward produces finite gradients."""
         batch, T, K, C = 2, 50, 6, 3
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         cum_scores.requires_grad_(True)
         transition.requires_grad_(True)
@@ -173,7 +167,7 @@ class TestStreamingBackward:
     def test_backward_gradient_shapes(self):
         """Verify gradient shapes match input shapes."""
         batch, T, K, C = 2, 50, 6, 3
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         cum_scores.requires_grad_(True)
         transition.requires_grad_(True)
@@ -189,7 +183,7 @@ class TestStreamingBackward:
     def test_backward_with_boundaries(self):
         """Verify backward works with boundary projections."""
         batch, T, K, C = 2, 50, 6, 3
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
         proj_start = torch.randn(batch, T, C, requires_grad=True)
         proj_end = torch.randn(batch, T, C, requires_grad=True)
 
@@ -215,7 +209,7 @@ class TestStreamingBackward:
     def test_backward_cuda(self):
         """Verify backward works on CUDA."""
         batch, T, K, C = 2, 100, 8, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, device="cuda"
         )
 
@@ -235,7 +229,7 @@ class TestGradientCorrectness:
     def test_gradcheck_small(self):
         """Verify gradients using torch.autograd.gradcheck."""
         batch, T, K, C = 1, 10, 4, 2
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
             batch, T, K, C, dtype=torch.float64
         )
 
@@ -259,7 +253,7 @@ class TestGradientCorrectness:
     def test_gradient_sum_property(self):
         """Verify marginal probabilities sum to approximately 1 per position."""
         batch, T, K, C = 1, 20, 4, 3
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         cum_scores.requires_grad_(True)
 
@@ -283,7 +277,7 @@ class TestNumericalStability:
     def test_large_T_produces_finite(self):
         """Verify forward works with moderately large T."""
         batch, T, K, C = 1, 1000, 10, 4
-        cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
         partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
@@ -316,7 +310,7 @@ class TestNumericalStability:
 if __name__ == "__main__":
     # Quick manual test
     batch, T, K, C = 2, 100, 8, 4
-    cum_scores, transition, duration_bias, lengths = create_golden_rule_inputs(batch, T, K, C)
+    cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
 
     cum_scores.requires_grad_(True)
     transition.requires_grad_(True)

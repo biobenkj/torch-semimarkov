@@ -13,7 +13,7 @@ CRFs when edge potentials are **pre-computed and materialized in GPU memory**.
 
     Use ``streaming`` module when:
         - Edge tensor is too large to materialize (T > 10K, large K)
-        - Edges follow the "Golden Rule" structure (content + transition)
+        - Edges follow the decomposable structure (content + transition)
         - Very long sequences (T = 100K - 400K+)
 
     **Memory comparison:**

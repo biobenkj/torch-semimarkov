@@ -6,7 +6,7 @@ algorithms for genomic sequence annotation at chromosome scale (T=400K+).
 
 Key Features:
 - O(KC) memory streaming scan (independent of sequence length T)
-- Golden Rule streaming API for on-the-fly edge computation
+- Streaming API for on-the-fly edge computation via prefix-sum decomposition
 - Triton GPU acceleration for inference
 
 Original pytorch-struct: https://github.com/harvardnlp/pytorch-struct
@@ -14,25 +14,32 @@ License: MIT (see LICENSE file)
 
 Modifications:
 - Added streaming linear scan with O(KC) memory
-- Added Golden Rule streaming API for T=400K+ sequences
+- Added streaming API for T=400K+ sequences with on-the-fly edge computation
 - Removed memory-intensive backends (banded, block-triangular)
 - Optimized for genomic segmentation use cases
 """
 
+from .nn import SemiMarkovCRFHead
 from .semimarkov import SemiMarkov
 from .streaming import (
     SemiCRFStreaming,
-    compute_edge_block_golden_rule,
+    compute_edge_block_streaming,
     semi_crf_streaming_forward,
 )
+from .uncertainty import UncertaintyMixin, UncertaintySemiMarkovCRFHead
 
 __version__ = "0.2.0"
 
 __all__ = [
     # Core API
     "SemiMarkov",
-    # Streaming API (Golden Rule)
+    # Streaming API
     "semi_crf_streaming_forward",
     "SemiCRFStreaming",
-    "compute_edge_block_golden_rule",
+    "compute_edge_block_streaming",
+    # Neural network modules
+    "SemiMarkovCRFHead",
+    # Uncertainty quantification
+    "UncertaintyMixin",
+    "UncertaintySemiMarkovCRFHead",
 ]
