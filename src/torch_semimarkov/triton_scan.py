@@ -272,6 +272,10 @@ if HAS_TRITON:
         if batch_idx >= batch_size:
             return
 
+        # Cast to int64 for pointer arithmetic to avoid overflow with large batches
+        # (batch_idx * stride can exceed int32 max ~2.1B when batch >= 64 with large tensors)
+        batch_idx_i64 = batch_idx.to(tl.int64)
+
         # 1D indices for labels (padded to power of 2)
         c_idx = tl.arange(0, C_PAD)
         c_mask = c_idx < C  # mask for valid label indices
@@ -282,11 +286,11 @@ if HAS_TRITON:
         c_mask_2d = (c_dst < C) & (c_src < C)  # [C_PAD, C_PAD]
 
         # Load sequence length
-        seq_len = tl.load(lengths_ptr + batch_idx)
+        seq_len = tl.load(lengths_ptr + batch_idx_i64)
 
         # Base pointers
-        edge_base = edge_ptr + batch_idx * stride_eb
-        ring_base = ring_ptr + batch_idx * stride_rb
+        edge_base = edge_ptr + batch_idx_i64 * stride_eb
+        ring_base = ring_ptr + batch_idx_i64 * stride_rb
 
         # Initialize ring buffer: slot 0 = 0.0, rest = NEG_INF
         for k_init in tl.static_range(0, K):
@@ -376,7 +380,7 @@ if HAS_TRITON:
         partition = max_val + tl.log(sum_exp)
 
         # Store result (partition is a scalar)
-        tl.store(out_ptr + batch_idx, partition)
+        tl.store(out_ptr + batch_idx_i64, partition)
 
     @triton.jit
     def semi_crf_scan_kernel_max(
@@ -420,6 +424,10 @@ if HAS_TRITON:
         if batch_idx >= batch_size:
             return
 
+        # Cast to int64 for pointer arithmetic to avoid overflow with large batches
+        # (batch_idx * stride can exceed int32 max ~2.1B when batch >= 64 with large tensors)
+        batch_idx_i64 = batch_idx.to(tl.int64)
+
         # 1D indices for labels (padded to power of 2)
         c_idx = tl.arange(0, C_PAD)
         c_mask = c_idx < C  # mask for valid label indices
@@ -430,11 +438,11 @@ if HAS_TRITON:
         c_mask_2d = (c_dst < C) & (c_src < C)  # [C_PAD, C_PAD]
 
         # Load sequence length
-        seq_len = tl.load(lengths_ptr + batch_idx)
+        seq_len = tl.load(lengths_ptr + batch_idx_i64)
 
         # Base pointers
-        edge_base = edge_ptr + batch_idx * stride_eb
-        ring_base = ring_ptr + batch_idx * stride_rb
+        edge_base = edge_ptr + batch_idx_i64 * stride_eb
+        ring_base = ring_ptr + batch_idx_i64 * stride_rb
 
         # Initialize ring buffer: slot 0 = 0.0, rest = NEG_INF
         for k_init in tl.static_range(0, K):
@@ -517,7 +525,7 @@ if HAS_TRITON:
         partition = tl.max(final_beta_masked, axis=0)
 
         # Store result (partition is a scalar)
-        tl.store(out_ptr + batch_idx, partition)
+        tl.store(out_ptr + batch_idx_i64, partition)
 
     def _next_power_of_2(n):
         """Return the smallest power of 2 >= n."""

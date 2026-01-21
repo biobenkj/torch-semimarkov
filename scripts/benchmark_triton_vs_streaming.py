@@ -92,17 +92,18 @@ def compute_edge_from_cumscores(
     return edge
 
 
-def warmup_cuda(iterations: int = 10):
+def warmup_cuda(device: torch.device, iterations: int = 10):
     """Warm up CUDA to get stable timing."""
-    x = torch.randn(1000, 1000, device="cuda")
+    x = torch.randn(1000, 1000, device=device)
     for _ in range(iterations):
         _ = x @ x
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
 
 
 def benchmark_forward(
     fn: Callable,
     *args,
+    device: torch.device | None = None,
     warmup: int = 3,
     iterations: int = 10,
     **kwargs,
@@ -115,14 +116,14 @@ def benchmark_forward(
     # Warmup
     for _ in range(warmup):
         result = fn(*args, **kwargs)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
     # Timed runs
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     start = time.perf_counter()
     for _ in range(iterations):
         result = fn(*args, **kwargs)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     return (elapsed / iterations) * 1000, result
@@ -132,6 +133,7 @@ def benchmark_backward(
     fn: Callable,
     grad_inputs: list[torch.Tensor],
     *args,
+    device: torch.device | None = None,
     warmup: int = 3,
     iterations: int = 10,
     **kwargs,
@@ -141,6 +143,7 @@ def benchmark_backward(
     Args:
         fn: Forward function
         grad_inputs: List of tensors that require gradients
+        device: CUDA device to synchronize
 
     Returns:
         Average time per backward call in milliseconds
@@ -153,10 +156,10 @@ def benchmark_backward(
         result = fn(*args, **kwargs)
         loss = result.sum()
         loss.backward()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
     # Timed runs
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
     start = time.perf_counter()
     for _ in range(iterations):
         for t in grad_inputs:
@@ -165,7 +168,7 @@ def benchmark_backward(
         result = fn(*args, **kwargs)
         loss = result.sum()
         loss.backward()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     return (elapsed / iterations) * 1000
@@ -304,13 +307,43 @@ class BatchScalingResult:
     backward_time_ms: float
     throughput_seq_per_sec: float
     memory_mb: float
-    oom: bool = False
+    error: str | None = None  # None=success, "OOM", "KERNEL_ERROR"
 
 
 def estimate_edge_memory_mb(batch: int, T: int, K: int, C: int) -> float:
     """Estimate memory for edge tensor in MB."""
     # edge shape: (batch, T-1, K, C, C), float32
     return batch * (T - 1) * K * C * C * 4 / (1024 * 1024)
+
+
+def _reset_cuda_state(device: torch.device) -> None:
+    """Attempt to reset CUDA state after an error."""
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_cuda_error(e: Exception) -> bool:
+    """Check if an exception is a CUDA-related error."""
+    err_str = str(e).lower()
+    err_type = type(e).__name__.lower()
+    return (
+        "out of memory" in err_str
+        or "illegal" in err_str
+        or "cuda" in err_str
+        or "accelerator" in err_type
+    )
+
+
+def _is_oom_error(e: Exception) -> bool:
+    """Check if an exception is specifically an out-of-memory error."""
+    err_str = str(e).lower()
+    return "out of memory" in err_str
 
 
 def run_batch_scaling_test(
@@ -325,6 +358,10 @@ def run_batch_scaling_test(
 ) -> tuple[list[BatchScalingResult], list[BatchScalingResult]]:
     """Run batch scaling test for both triton_scan and streaming.
 
+    Tests all streaming batch sizes first, then all triton_scan batch sizes.
+    This prevents triton_scan OOMs from corrupting GPU state and affecting
+    streaming results.
+
     Args:
         T: Sequence length
         K: Max segment duration
@@ -338,26 +375,40 @@ def run_batch_scaling_test(
     Returns:
         (triton_results, streaming_results): Lists of BatchScalingResult
     """
-    triton_results = []
     streaming_results = []
+    triton_results = []
 
     # Shared parameters (don't change with batch)
     transition = torch.randn(C, C, device=device, dtype=torch.float32) * 0.1
     duration_bias = torch.randn(K, C, device=device, dtype=torch.float32) * 0.1
 
-    for batch in batch_sizes:
-        print(f"  Testing batch={batch}...")
+    # Phase 1: Test all streaming batch sizes
+    print("  Phase 1: Testing streaming API...")
+    streaming_error: str | None = None
 
-        # Create batch-specific data
+    for batch in batch_sizes:
+        if streaming_error:
+            streaming_results.append(
+                BatchScalingResult(
+                    batch_size=batch,
+                    forward_time_ms=0,
+                    backward_time_ms=0,
+                    throughput_seq_per_sec=0,
+                    memory_mb=0,
+                    error=streaming_error,
+                )
+            )
+            continue
+
+        print(f"    batch={batch}...")
         torch.cuda.empty_cache()
+
         projected = torch.randn(batch, T, C, device=device, dtype=torch.float32)
         projected = projected - projected.mean(dim=1, keepdim=True)
-
         cum_scores = torch.zeros(batch, T + 1, C, device=device, dtype=torch.float32)
         cum_scores[:, 1:, :] = torch.cumsum(projected, dim=1)
         lengths = torch.full((batch,), T, device=device, dtype=torch.long)
 
-        # Test streaming (always works, compute-bound)
         try:
             if mode == "forward":
                 time_ms, _ = benchmark_forward(
@@ -367,6 +418,7 @@ def run_batch_scaling_test(
                     duration_bias,
                     lengths,
                     K,
+                    device=device,
                     warmup=warmup,
                     iterations=iterations,
                     use_triton=True,
@@ -383,6 +435,7 @@ def run_batch_scaling_test(
                     duration_bias_train,
                     lengths,
                     K,
+                    device=device,
                     warmup=warmup,
                     iterations=iterations,
                     use_triton=True,
@@ -401,8 +454,13 @@ def run_batch_scaling_test(
                     memory_mb=memory_mb,
                 )
             )
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
+        except Exception as e:
+            if _is_cuda_error(e):
+                is_oom = _is_oom_error(e)
+                streaming_error = "OOM" if is_oom else "KERNEL_ERROR"
+                err_msg = str(e).split("\n")[0][:80]
+                print(f"      streaming {streaming_error}: {type(e).__name__}")
+                print(f"        Error: {err_msg}")
                 streaming_results.append(
                     BatchScalingResult(
                         batch_size=batch,
@@ -410,17 +468,52 @@ def run_batch_scaling_test(
                         backward_time_ms=0,
                         throughput_seq_per_sec=0,
                         memory_mb=0,
-                        oom=True,
+                        error=streaming_error,
                     )
                 )
-                torch.cuda.empty_cache()
+                _reset_cuda_state(device)
             else:
                 raise
 
-        # Test triton_scan (may OOM due to edge tensor)
-        edge_memory_mb = estimate_edge_memory_mb(batch, T, K, C)
+        del projected, cum_scores, lengths
         try:
             torch.cuda.empty_cache()
+        except Exception:
+            pass  # GPU state may be corrupted after error
+
+    # Phase 2: Test all triton_scan batch sizes
+    print("  Phase 2: Testing triton_scan API...")
+    triton_error: str | None = None
+
+    for batch in batch_sizes:
+        edge_memory_mb = estimate_edge_memory_mb(batch, T, K, C)
+
+        if triton_error:
+            triton_results.append(
+                BatchScalingResult(
+                    batch_size=batch,
+                    forward_time_ms=0,
+                    backward_time_ms=0,
+                    throughput_seq_per_sec=0,
+                    memory_mb=edge_memory_mb,
+                    error=triton_error,
+                )
+            )
+            continue
+
+        print(f"    batch={batch}...")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass  # GPU state may be corrupted after error
+
+        projected = torch.randn(batch, T, C, device=device, dtype=torch.float32)
+        projected = projected - projected.mean(dim=1, keepdim=True)
+        cum_scores = torch.zeros(batch, T + 1, C, device=device, dtype=torch.float32)
+        cum_scores[:, 1:, :] = torch.cumsum(projected, dim=1)
+        lengths = torch.full((batch,), T, device=device, dtype=torch.long)
+
+        try:
             edge = compute_edge_from_cumscores(cum_scores, transition, duration_bias, K)
 
             if mode == "forward":
@@ -428,6 +521,7 @@ def run_batch_scaling_test(
                     semi_crf_triton_forward,
                     edge,
                     lengths,
+                    device=device,
                     warmup=warmup,
                     iterations=iterations,
                     use_triton=True,
@@ -439,6 +533,7 @@ def run_batch_scaling_test(
                     [edge_train],
                     edge_train,
                     lengths,
+                    device=device,
                     warmup=warmup,
                     iterations=iterations,
                     use_triton=True,
@@ -456,11 +551,16 @@ def run_batch_scaling_test(
                 )
             )
             del edge
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
+        except Exception as e:
+            if _is_cuda_error(e):
+                is_oom = _is_oom_error(e)
+                triton_error = "OOM" if is_oom else "KERNEL_ERROR"
+                err_msg = str(e).split("\n")[0][:80]
                 print(
-                    f"    triton_scan OOM at batch={batch} (edge would need {edge_memory_mb:.0f} MB)"
+                    f"      triton_scan {triton_error} "
+                    f"(edge would need {edge_memory_mb:.0f} MB): {type(e).__name__}"
                 )
+                print(f"        Error: {err_msg}")
                 triton_results.append(
                     BatchScalingResult(
                         batch_size=batch,
@@ -468,16 +568,18 @@ def run_batch_scaling_test(
                         backward_time_ms=0,
                         throughput_seq_per_sec=0,
                         memory_mb=edge_memory_mb,
-                        oom=True,
+                        error=triton_error,
                     )
                 )
-                torch.cuda.empty_cache()
+                _reset_cuda_state(device)
             else:
                 raise
 
-        # Clean up
         del projected, cum_scores, lengths
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass  # GPU state may be corrupted after error
 
     return triton_results, streaming_results
 
@@ -517,8 +619,10 @@ def format_batch_scaling_results(
         batch = tr.batch_size
 
         # triton_scan columns
-        if tr.oom:
-            triton_str = f"{'OOM':<12} {'-':<14} {tr.memory_mb:<12.0f}"
+        if tr.error:
+            # Show error type: OOM or ERR (kernel error)
+            err_label = "OOM" if tr.error == "OOM" else "ERR"
+            triton_str = f"{err_label:<12} {'-':<14} {tr.memory_mb:<12.0f}"
         else:
             time_ms = tr.forward_time_ms if mode == "forward" else tr.backward_time_ms
             triton_str = (
@@ -529,8 +633,9 @@ def format_batch_scaling_results(
                 best_triton_batch = batch
 
         # streaming columns
-        if sr.oom:
-            streaming_str = f"{'OOM':<12} {'-':<14} {sr.memory_mb:<12.0f}"
+        if sr.error:
+            err_label = "OOM" if sr.error == "OOM" else "ERR"
+            streaming_str = f"{err_label:<12} {'-':<14} {sr.memory_mb:<12.0f}"
         else:
             time_ms = sr.forward_time_ms if mode == "forward" else sr.backward_time_ms
             streaming_str = (
@@ -672,7 +777,7 @@ def main():
         print(f"Testing batch sizes: {batch_sizes}")
         print()
 
-        warmup_cuda()
+        warmup_cuda(device)
 
         config = {
             "Sequence length (T)": T,
@@ -741,7 +846,7 @@ def main():
 
     # Warmup CUDA
     print("Warming up CUDA...")
-    warmup_cuda()
+    warmup_cuda(device)
     print()
 
     # Run benchmarks
