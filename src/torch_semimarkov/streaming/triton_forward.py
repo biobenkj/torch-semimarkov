@@ -699,87 +699,46 @@ if HAS_TRITON:
             else semi_crf_streaming_scan_kernel_max
         )
 
-        # Only apply device context for non-current devices (avoids Triton issues on default device)
-        device_index = device.index if device.index is not None else 0
-        if device_index != torch.cuda.current_device():
-            with torch.cuda.device(device_index):
-                kernel[grid](
-                    cum_scores,
-                    transition,
-                    duration_bias,
-                    lengths,
-                    proj_start,
-                    proj_end,
-                    partition,
-                    ring_buffer,
-                    ring_checkpoints,
-                    batch,
-                    T,
-                    K,
-                    C,
-                    C_PAD,
-                    checkpoint_interval,
-                    num_checkpoints,
-                    has_boundaries,  # HAS_BOUNDARIES constexpr
-                    has_duration_transitions,  # HAS_DURATION_TRANSITIONS constexpr
-                    stride_cs_b,
-                    stride_cs_t,
-                    stride_cs_c,
-                    stride_tr_k,
-                    stride_tr_src,
-                    stride_tr_dst,
-                    stride_db_k,
-                    stride_db_c,
-                    stride_ps_b,
-                    stride_ps_t,
-                    stride_ps_c,
-                    stride_ring_b,
-                    stride_ring_k,
-                    stride_ring_c,
-                    stride_ckpt_b,
-                    stride_ckpt_n,
-                    stride_ckpt_k,
-                    stride_ckpt_c,
-                )
-        else:
-            kernel[grid](
-                cum_scores,
-                transition,
-                duration_bias,
-                lengths,
-                proj_start,
-                proj_end,
-                partition,
-                ring_buffer,
-                ring_checkpoints,
-                batch,
-                T,
-                K,
-                C,
-                C_PAD,
-                checkpoint_interval,
-                num_checkpoints,
-                has_boundaries,  # HAS_BOUNDARIES constexpr
-                has_duration_transitions,  # HAS_DURATION_TRANSITIONS constexpr
-                stride_cs_b,
-                stride_cs_t,
-                stride_cs_c,
-                stride_tr_k,
-                stride_tr_src,
-                stride_tr_dst,
-                stride_db_k,
-                stride_db_c,
-                stride_ps_b,
-                stride_ps_t,
-                stride_ps_c,
-                stride_ring_b,
-                stride_ring_k,
-                stride_ring_c,
-                stride_ckpt_b,
-                stride_ckpt_n,
-                stride_ckpt_k,
-                stride_ckpt_c,
-            )
+        # Ensure CUDA context is set for Triton kernel launch
+        torch.cuda.set_device(device)
+        kernel[grid](
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            proj_start,
+            proj_end,
+            partition,
+            ring_buffer,
+            ring_checkpoints,
+            batch,
+            T,
+            K,
+            C,
+            C_PAD,
+            checkpoint_interval,
+            num_checkpoints,
+            has_boundaries,  # HAS_BOUNDARIES constexpr
+            has_duration_transitions,  # HAS_DURATION_TRANSITIONS constexpr
+            stride_cs_b,
+            stride_cs_t,
+            stride_cs_c,
+            stride_tr_k,
+            stride_tr_src,
+            stride_tr_dst,
+            stride_db_k,
+            stride_db_c,
+            stride_ps_b,
+            stride_ps_t,
+            stride_ps_c,
+            stride_ring_b,
+            stride_ring_k,
+            stride_ring_c,
+            stride_ckpt_b,
+            stride_ckpt_n,
+            stride_ckpt_k,
+            stride_ckpt_c,
+        )
 
         # Trim padding from checkpoints for return
         ring_checkpoints = ring_checkpoints[:, :, :, :C]
