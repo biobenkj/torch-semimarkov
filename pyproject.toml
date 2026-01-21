@@ -106,4 +106,16 @@ markers = [
 omit = [
     "src/torch_semimarkov/_genbmm/*",
     "src/torch_semimarkov/triton_scan.py",
+    "src/torch_semimarkov/streaming/triton_forward.py",
+    "src/torch_semimarkov/streaming/triton_backward.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if HAS_TRITON:",
+    "if torch.cuda.is_available():",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
 ]
