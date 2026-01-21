@@ -1105,9 +1105,7 @@ class TestTritonBackwardDebug:
         tr_py = transition.clone().requires_grad_(True)
         db_py = duration_bias.clone().requires_grad_(True)
 
-        partition_py = semi_crf_streaming_forward(
-            cs_py, tr_py, db_py, lengths, K, use_triton=False
-        )
+        partition_py = semi_crf_streaming_forward(cs_py, tr_py, db_py, lengths, K, use_triton=False)
         partition_py.sum().backward()
 
         # Triton path
@@ -1115,9 +1113,7 @@ class TestTritonBackwardDebug:
         tr_tr = transition.clone().requires_grad_(True)
         db_tr = duration_bias.clone().requires_grad_(True)
 
-        partition_tr = semi_crf_streaming_forward(
-            cs_tr, tr_tr, db_tr, lengths, K, use_triton=True
-        )
+        partition_tr = semi_crf_streaming_forward(cs_tr, tr_tr, db_tr, lengths, K, use_triton=True)
         partition_tr.sum().backward()
 
         # Print detailed comparison
@@ -1179,9 +1175,7 @@ class TestTritonBackwardDebug:
         tr_py = transition.clone().requires_grad_(True)
         db_py = duration_bias.clone().requires_grad_(True)
 
-        partition_py = semi_crf_streaming_forward(
-            cs_py, tr_py, db_py, lengths, K, use_triton=False
-        )
+        partition_py = semi_crf_streaming_forward(cs_py, tr_py, db_py, lengths, K, use_triton=False)
         partition_py.sum().backward()
 
         # Triton path
@@ -1189,9 +1183,7 @@ class TestTritonBackwardDebug:
         tr_tr = transition.clone().requires_grad_(True)
         db_tr = duration_bias.clone().requires_grad_(True)
 
-        partition_tr = semi_crf_streaming_forward(
-            cs_tr, tr_tr, db_tr, lengths, K, use_triton=True
-        )
+        partition_tr = semi_crf_streaming_forward(cs_tr, tr_tr, db_tr, lengths, K, use_triton=True)
         partition_tr.sum().backward()
 
         # Statistical summary
@@ -1218,7 +1210,9 @@ class TestTritonBackwardDebug:
             print("First 5 mismatched positions:")
             for idx in idxs:
                 b, t, c = idx.tolist()
-                print(f"  [{b},{t},{c}]: PyTorch={cs_py.grad[b,t,c]:.4f}, Triton={cs_tr.grad[b,t,c]:.4f}, diff={cs_diff[b,t,c]:.4f}")
+                print(
+                    f"  [{b},{t},{c}]: PyTorch={cs_py.grad[b,t,c]:.4f}, Triton={cs_tr.grad[b,t,c]:.4f}, diff={cs_diff[b,t,c]:.4f}"
+                )
 
         print("\n--- grad_transition statistics ---")
         print(f"Shape: {tr_py.grad.shape}")
