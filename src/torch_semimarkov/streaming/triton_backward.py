@@ -699,9 +699,72 @@ if HAS_TRITON:
         grad_pe_for_kernel = grad_proj_end if has_boundaries else grad_cum_scores
 
         # Launch kernel
-        # Note: Use device context to ensure Triton launches on correct GPU for multi-GPU setups
         grid = (batch,)
-        with torch.cuda.device(device):
+
+        # Only apply device context for non-current devices (avoids Triton issues on default device)
+        device_index = device.index if device.index is not None else 0
+        if device_index != torch.cuda.current_device():
+            with torch.cuda.device(device_index):
+                semi_crf_streaming_backward_kernel[grid](
+                    cum_scores,
+                    transition,
+                    duration_bias,
+                    lengths,
+                    log_Z,
+                    ring_ckpts_padded,
+                    grad_output,
+                    proj_start,
+                    proj_end,
+                    alpha_buffer,
+                    beta_ring,
+                    grad_cum_scores,
+                    grad_tr_workspace,
+                    grad_db_workspace,
+                    grad_ps_for_kernel,
+                    grad_pe_for_kernel,
+                    batch,
+                    T,
+                    K,
+                    C,
+                    C_PAD,
+                    checkpoint_interval,
+                    num_checkpoints,
+                    segment_size,
+                    has_boundaries,  # HAS_BOUNDARIES constexpr
+                    has_duration_transitions,  # HAS_DURATION_TRANSITIONS constexpr
+                    stride_cs_b,
+                    stride_cs_t,
+                    stride_cs_c,
+                    stride_tr_k,
+                    stride_tr_src,
+                    stride_tr_dst,
+                    stride_db_k,
+                    stride_db_c,
+                    stride_ps_b,
+                    stride_ps_t,
+                    stride_ps_c,
+                    stride_ckpt_b,
+                    stride_ckpt_n,
+                    stride_ckpt_k,
+                    stride_ckpt_c,
+                    stride_ab_b,
+                    stride_ab_t,
+                    stride_ab_c,
+                    stride_br_b,
+                    stride_br_k,
+                    stride_br_c,
+                    stride_gcs_b,
+                    stride_gcs_t,
+                    stride_gcs_c,
+                    stride_gtw_b,
+                    stride_gtw_k,
+                    stride_gtw_src,
+                    stride_gtw_dst,
+                    stride_gdbw_b,
+                    stride_gdbw_k,
+                    stride_gdbw_c,
+                )
+        else:
             semi_crf_streaming_backward_kernel[grid](
                 cum_scores,
                 transition,
