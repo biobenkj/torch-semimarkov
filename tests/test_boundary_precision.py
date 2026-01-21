@@ -147,8 +147,9 @@ class TestScoreGoldBoundaryPrecision:
 
         # Content score should be sum of all 10 positions = 10.0
         expected_content = 10.0
-        # Plus duration bias for duration=10 (or max_duration-1 if clamped)
-        dur_idx = min(T, crf_head.max_duration) - 1
+        # Plus duration bias for duration=10 (clamped to max_duration-1 if needed)
+        # Convention: duration_bias[k] stores bias for duration k
+        dur_idx = min(T, crf_head.max_duration - 1)
         expected_duration = crf_head.duration_bias[dur_idx, 0].item()
         expected = expected_content + expected_duration
 
@@ -174,9 +175,10 @@ class TestScoreGoldBoundaryPrecision:
 
         # Segment 1: [0, 4], label=0, duration=5, content=5.0
         # Segment 2: [5, 9], label=1, duration=5, content=5.0
+        # Convention: duration_bias[k] stores bias for duration k
         expected_content = 5.0 + 5.0
         expected_duration = (
-            crf_head.duration_bias[4, 0].item() + crf_head.duration_bias[4, 1].item()
+            crf_head.duration_bias[5, 0].item() + crf_head.duration_bias[5, 1].item()
         )
         expected_transition = crf_head.transition[0, 1].item()
         expected = expected_content + expected_duration + expected_transition
@@ -198,11 +200,12 @@ class TestScoreGoldBoundaryPrecision:
 
         # Segment 1: [0, 8], label=0, duration=9
         # Segment 2: [9, 9], label=1, duration=1
+        # Convention: duration_bias[k] stores bias for duration k
         expected_content = 9.0 + 1.0  # All ones
-        dur_idx_1 = min(9, crf_head.max_duration) - 1
+        dur_idx_1 = min(9, crf_head.max_duration - 1)
         expected_duration = (
             crf_head.duration_bias[dur_idx_1, 0].item()
-            + crf_head.duration_bias[0, 1].item()  # duration=1 -> index 0
+            + crf_head.duration_bias[1, 1].item()  # duration=1 -> index 1
         )
         expected_transition = crf_head.transition[0, 1].item()
         expected = expected_content + expected_duration + expected_transition
