@@ -410,8 +410,9 @@ class UncertaintyMixin:
         edge = self._build_edge_tensor(scores, lengths)
 
         # Compute entropy using EntropySemiring
+        # Force linear scan - binary tree algorithm has numerical issues with EntropySemiring
         model = SemiMarkov(EntropySemiring)
-        entropy = model.sum(edge, lengths=lengths)
+        entropy = model.sum(edge, lengths=lengths, use_linear_scan=True)
 
         return entropy
 
