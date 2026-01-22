@@ -45,6 +45,7 @@ def create_streaming_inputs(batch, T, K, C, device="cpu", dtype=torch.float32, s
 class TestNoOOM:
     """Tests verifying the implementation does NOT run out of memory."""
 
+    @pytest.mark.slow
     def test_no_oom_T10K_K100_C24_cpu(self):
         """Verify no OOM at T=10K, K=100, C=24 on CPU."""
         T, K, C = 10_000, 100, 24
@@ -59,6 +60,7 @@ class TestNoOOM:
         assert partition.shape == (batch,)
         assert torch.isfinite(partition).all(), "Partition should be finite"
 
+    @pytest.mark.slow
     def test_no_oom_T50K_K500_C24_cpu(self):
         """Verify no OOM at T=50K, K=500, C=24 on CPU."""
         T, K, C = 50_000, 500, 24

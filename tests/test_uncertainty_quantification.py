@@ -129,7 +129,6 @@ class TestExactMarginals:
 
         assert boundary_probs.shape == (batch, T)
 
-    @pytest.mark.skip(reason="Exact method edge tensor construction needs refinement")
     def test_exact_marginals_finite(self, small_model):
         """Test exact marginals are finite."""
         batch, T = 2, 20
@@ -159,7 +158,6 @@ class TestStreamingVsExactConsistency:
             hidden_dim=16,
         )
 
-    @pytest.mark.skip(reason="Exact method edge tensor construction needs refinement")
     def test_marginals_correlation(self, small_model):
         """Streaming and exact marginals should be correlated for short sequences.
 
@@ -315,7 +313,6 @@ class TestExactEntropy:
 
         assert entropy.shape == (batch,)
 
-    @pytest.mark.skip(reason="Exact method edge tensor construction needs refinement")
     def test_entropy_exact_finite(self, small_model):
         """Exact entropy should be finite."""
         batch, T = 2, 15
@@ -326,7 +323,6 @@ class TestExactEntropy:
 
         assert torch.isfinite(entropy).all()
 
-    @pytest.mark.skip(reason="Exact method edge tensor construction needs refinement")
     def test_entropy_exact_non_negative(self, small_model):
         """Exact entropy should be non-negative."""
         batch, T = 2, 15

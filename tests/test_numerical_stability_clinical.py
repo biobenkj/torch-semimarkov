@@ -115,6 +115,7 @@ class TestVariableLengthBatches:
 
         assert torch.isfinite(loss)
 
+    @pytest.mark.slow
     def test_variable_lengths_large_range(self, clinical_model):
         """Test with variable lengths spanning large range."""
         batch = 4
@@ -147,6 +148,7 @@ class TestVariableLengthBatches:
         assert not torch.allclose(partition[0], partition[1])
         assert not torch.allclose(partition[1], partition[2])
 
+    @pytest.mark.slow
     def test_extreme_length_ratio(self, clinical_model):
         """Test with extreme length ratios in batch."""
         batch = 3
@@ -419,6 +421,7 @@ class TestClinicalDomainScales:
             hidden_dim=256,
         )
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("T", [2500, 7500])  # 10s, 30s at 250Hz
     def test_ecg_scale(self, ecg_model, T):
         """Test at ECG recording scales."""
@@ -431,6 +434,7 @@ class TestClinicalDomainScales:
 
         assert torch.isfinite(loss)
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("T", [2400, 4800])  # 4h, 8h at 10Hz feature rate
     def test_eeg_scale(self, eeg_model, T):
         """Test at EEG sleep study scales."""
@@ -443,6 +447,7 @@ class TestClinicalDomainScales:
 
         assert torch.isfinite(loss)
 
+    @pytest.mark.slow
     def test_genomics_moderate_scale(self, genomics_model):
         """Test at moderate genomics scale."""
         batch = 2

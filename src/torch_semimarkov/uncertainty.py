@@ -244,16 +244,19 @@ class UncertaintyMixin:
         )
 
         for n in range(T - 1):
-            for k in range(1, max(min(K, T - n), 2)):  # max ensures K=1 processes duration 1
+            for k in range(1, max(min(K, T - n + 1), 2)):  # max ensures K=1 processes duration 1
                 # Content score for segment [n, n+k)
                 content = cum_scores[:, n + k, :] - cum_scores[:, n, :]  # (batch, C)
 
+                # Use same indexing convention as streaming implementation
+                dur_idx = min(k, K - 1)
+
                 # Add duration bias
-                segment_score = content + self.duration_bias[k - 1]  # (batch, C)
+                segment_score = content + self.duration_bias[dur_idx]  # (batch, C)
 
                 # Add transition (C_dest x C_src)
                 # edge[n, k, c_dest, c_src] = segment_score[c_dest] + transition[c_src, c_dest]
-                edge[:, n, k - 1] = segment_score.unsqueeze(-1) + self.transition.T.unsqueeze(0)
+                edge[:, n, dur_idx] = segment_score.unsqueeze(-1) + self.transition.T.unsqueeze(0)
 
         return edge
 

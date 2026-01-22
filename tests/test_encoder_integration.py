@@ -285,6 +285,7 @@ class TestMambaEncoderIntegration:
             assert param.grad is not None, f"Mamba param {name} missing gradient"
             assert torch.isfinite(param.grad).all()
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("seq_len", [256, 512, 1000, 2000])
     def test_mamba_long_sequence_stability(self, mamba_config, seq_len):
         """Test Mamba + CRF handles long clinical sequences."""

@@ -650,6 +650,7 @@ class TestTritonStreamingBoundaries:
         torch.testing.assert_close(pe_tr.grad, pe_py.grad, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
 class TestTritonStreamingBenchmark:
@@ -1085,6 +1086,8 @@ class TestGradientScalingBugFix:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
 class TestTritonBackwardDebug:
     """Debug tests to diagnose Triton vs PyTorch gradient mismatches."""
 
