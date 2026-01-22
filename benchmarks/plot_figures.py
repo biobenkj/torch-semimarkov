@@ -43,18 +43,22 @@ BACKEND_ORDER = [
     "linear_scan",
     "linear_scan_vectorized",
     "linear_scan_streaming",
+    "triton_streaming",
     "binary_tree",
     "binary_tree_sharded",
     "block_triangular",
+    "banded",
 ]
 
 BACKEND_LABELS = {
     "linear_scan": "Linear Scan",
     "linear_scan_vectorized": "Vectorized Linear",
     "linear_scan_streaming": "Streaming Linear",
+    "triton_streaming": "Triton Streaming",
     "binary_tree": "Binary Tree",
     "binary_tree_sharded": "Sharded Tree",
     "block_triangular": "Block Triangular",
+    "banded": "Banded",
 }
 
 # Colorblind-safe palette
@@ -62,18 +66,22 @@ BACKEND_COLORS = {
     "linear_scan": "#1f77b4",  # Blue
     "linear_scan_vectorized": "#ff7f0e",  # Orange (baseline)
     "linear_scan_streaming": "#2ca02c",  # Green
+    "triton_streaming": "#000000",  # Black
     "binary_tree": "#d62728",  # Red
     "binary_tree_sharded": "#9467bd",  # Purple
     "block_triangular": "#8c564b",  # Brown
+    "banded": "#e377c2",  # Pink
 }
 
 BACKEND_MARKERS = {
     "linear_scan": "o",
     "linear_scan_vectorized": "s",
     "linear_scan_streaming": "D",
+    "triton_streaming": "h",  # Hexagon
     "binary_tree": "^",
     "binary_tree_sharded": "v",
     "block_triangular": "p",
+    "banded": "H",  # Filled hexagon
 }
 
 

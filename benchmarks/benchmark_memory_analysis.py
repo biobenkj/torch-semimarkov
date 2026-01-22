@@ -34,20 +34,24 @@ import torch
 from lib import (
     BenchmarkResult,
     get_canonical_shapes,
-    precompile_canonical_shapes,
     print_summary,
-    reset_compile_caches,
     run_single_benchmark,
     sample_compile_friendly,
     sample_configurations,
     save_results,
-    setup_compile_cache,
     should_skip_config,
 )
-from lib.runner import LOG_SEMIRING_ONLY_BACKENDS, SEMIRING_MAP, TRITON_SUPPORTED_SEMIRINGS
+from lib.runner import (
+    LOG_MAX_BACKENDS,
+    LOG_SEMIRING_ONLY_BACKENDS,
+    SEMIRING_MAP,
+)
 from lib.sampling import parse_int_list
 
-from torch_semimarkov.triton_scan import HAS_TRITON
+try:
+    from torch_semimarkov.streaming import HAS_TRITON
+except ImportError:
+    HAS_TRITON = False
 
 
 def main():
@@ -99,63 +103,17 @@ def main():
         ),
     )
     parser.add_argument(
-        "--skip-precompile",
-        action="store_true",
-        default=False,
-        help=(
-            "Skip the pre-compilation warmup phase. Use this if you have a warm cache "
-            "or want to include compilation time in benchmark results."
-        ),
-    )
-    parser.add_argument(
-        "--precompile-timeout",
-        type=int,
-        default=120,
-        help=(
-            "Timeout in seconds for compiling each shape during pre-compilation. "
-            "Shapes that exceed this timeout will be skipped and compile on-demand. "
-            "Set to 0 to disable timeout. Default: 120"
-        ),
-    )
-    parser.add_argument(
-        "--compile-cache-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Directory for torch.compile and Triton kernel cache. "
-            "On HPC, use local scratch (e.g., /tmp, $TMPDIR) for faster I/O. "
-            "Default: --output-dir/.torch_compile_cache"
-        ),
-    )
-    parser.add_argument(
-        "--compile-cache-size-gb",
-        type=float,
-        default=10.0,
-        help=(
-            "Maximum compile cache size in GB. Older entries are evicted when exceeded. "
-            "Set based on available scratch space. Default: 10.0"
-        ),
-    )
-    parser.add_argument(
-        "--compile-threads",
-        type=int,
-        default=None,
-        help=(
-            "Number of CPU threads for torch.compile. Default: all available. "
-            "On HPC, set to match your CPU allocation (e.g., --compile-threads 8)."
-        ),
-    )
-    parser.add_argument(
         "--backends",
         type=str,
-        default="triton,triton_pytorch,linear_scan_streaming",
+        default="linear_scan_vectorized,linear_scan_streaming,triton_streaming",
         help=(
             "Comma-separated list of backends. Options: "
-            "linear_scan_streaming (PyTorch reference), "
-            "triton (GPU Triton kernel with torch.compile for training), "
-            "triton_pytorch (PyTorch reference for Triton), "
-            "triton_checkpointing (Triton with gradient checkpointing). "
-            "Note: triton backends support Log and Max semirings."
+            "binary_tree, banded, block_triangular, "
+            "linear_scan, linear_scan_vectorized, linear_scan_streaming, "
+            "triton_streaming. "
+            "Note: binary_tree/block_triangular have O((KC)^2) memory. "
+            "banded is prototype (Log semiring only). "
+            "triton_streaming supports Log/Max only."
         ),
     )
     parser.add_argument(
@@ -164,7 +122,7 @@ def main():
         default="Log",
         help=(
             "Comma-separated list of semirings. Options: Log, Max, Entropy. "
-            "Note: triton/triton_pytorch backends support Log and Max semirings."
+            "Note: triton_streaming and banded have semiring restrictions."
         ),
     )
     parser.add_argument(
@@ -176,22 +134,6 @@ def main():
             "forward (forward pass only), backward (backward pass only), "
             "both (forward + backward together). Default: both"
         ),
-    )
-    parser.add_argument(
-        "--use-compile",
-        action="store_true",
-        default=True,
-        help=(
-            "Use torch.compile for triton training backward pass (default). "
-            "This generates optimized kernels for both forward and backward. "
-            "Disable with --no-use-compile to use gradient checkpointing instead."
-        ),
-    )
-    parser.add_argument(
-        "--no-use-compile",
-        dest="use_compile",
-        action="store_false",
-        help="Disable torch.compile for triton (use gradient checkpointing instead).",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument(
@@ -228,27 +170,11 @@ def main():
             print(f"WARNING: Unknown phase '{p}', available: {valid_phases}")
 
     # Check Triton availability if needed
-    if any(b in ("triton", "triton_pytorch", "triton_checkpointing") for b in backends):
+    if "triton_streaming" in backends:
         if not HAS_TRITON:
-            print("WARNING: Triton not available, triton backends will use PyTorch fallback")
+            print("WARNING: Triton not available, triton_streaming will use PyTorch fallback")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Setup persistent compile cache for torch.compile
-    has_triton_backends = any(
-        b in ("triton", "triton_pytorch", "triton_checkpointing") for b in backends
-    )
-    if args.use_compile and has_triton_backends:
-        cache_dir = setup_compile_cache(
-            args.output_dir,
-            cache_dir=args.compile_cache_dir,
-            max_cache_size_gb=args.compile_cache_size_gb,
-            compile_threads=args.compile_threads,
-        )
-        threads_str = str(args.compile_threads) if args.compile_threads else "all"
-        print(
-            f"Compile cache: {cache_dir} (max {args.compile_cache_size_gb}GB, {threads_str} threads)"
-        )
 
     torch.manual_seed(42)
 
@@ -298,7 +224,6 @@ def main():
     print(f"Semirings: {semirings}")
     print(f"Phases: {phases}")
     print(f"Repeats: {args.repeats}")
-    print(f"Triton use_compile: {args.use_compile}")
 
     if args.compile_friendly:
         print(
@@ -313,27 +238,8 @@ def main():
 
     print("-" * 80)
 
-    # Pre-compile all canonical shapes before timing (separates compile time from runtime)
-    if args.use_compile and has_triton_backends and not args.skip_precompile and canonical_shapes:
-        precompile_canonical_shapes(
-            canonical_shapes,
-            device,
-            backends,
-            semirings,
-            use_compile=True,
-            timeout_seconds=args.precompile_timeout,
-        )
-
     for backend in backends:
         for semiring_name in semirings:
-            # Only reset caches if NOT using compile-friendly mode
-            # (compile-friendly pre-compiles everything upfront)
-            if (
-                args.use_compile
-                and backend in ("triton", "triton_pytorch", "triton_checkpointing")
-                and not args.compile_friendly
-            ):
-                reset_compile_caches()
             for phase in phases:
                 for T, K, C in configs:
                     KC = K * C
@@ -369,11 +275,8 @@ def main():
                         )
                         continue
 
-                    # Check triton backend semiring compatibility (Log, Max only)
-                    if (
-                        backend in ("triton", "triton_pytorch", "triton_checkpointing")
-                        and semiring_name not in TRITON_SUPPORTED_SEMIRINGS
-                    ):
+                    # Check streaming backend semiring compatibility (Log, Max only)
+                    if backend in LOG_MAX_BACKENDS and semiring_name not in {"Log", "Max"}:
                         print(
                             f"[{completed}/{total_configs}] SKIP T={T}, K={K}, C={C}, "
                             f"{backend}/{semiring_name}/{phase}: "
@@ -456,7 +359,6 @@ def main():
                         args.repeats,
                         semiring_name=semiring_name,
                         phase=phase,
-                        use_compile=args.use_compile,
                     )
                     results.append(result)
 

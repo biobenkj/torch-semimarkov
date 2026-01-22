@@ -5,20 +5,18 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import Dict, List
-
 
 PCTS = ["p50", "p75", "p90", "p95", "p99"]
 
 
-def read_summary(summary_csv: Path) -> Dict[str, Dict[str, float]]:
+def read_summary(summary_csv: Path) -> dict[str, dict[str, float]]:
     """
     Returns:
       metrics[metric_name][col_name] = value
     Example:
       metrics["gene_length_bp"]["p95"] = 134465.0
     """
-    metrics: Dict[str, Dict[str, float]] = {}
+    metrics: dict[str, dict[str, float]] = {}
     with open(summary_csv, newline="") as f:
         r = csv.DictReader(f)
         for row in r:
@@ -54,7 +52,7 @@ def nice_round(x: float) -> int:
     return int(base * round(x / base))
 
 
-def choose_values(metric: Dict[str, float], pcts: List[str], do_round: bool) -> List[int]:
+def choose_values(metric: dict[str, float], pcts: list[str], do_round: bool) -> list[int]:
     vals = [metric[p] for p in pcts if p in metric and not math.isnan(metric[p])]
     out = [nice_round(v) if do_round else int(round(v)) for v in vals]
     # de-dup while preserving order
@@ -67,13 +65,13 @@ def choose_values(metric: Dict[str, float], pcts: List[str], do_round: bool) -> 
     return uniq
 
 
-def markdown_table(T_vals: List[int], K_vals: List[int], C: int, mode: str) -> str:
+def markdown_table(T_vals: list[int], K_vals: list[int], C: int, mode: str) -> str:
     lines = []
     lines.append(f"### Benchmark suite ({mode})")
     lines.append("")
     lines.append("| Config | T (bp) | K (bp) | C |")
     lines.append("|---|---:|---:|---:|")
-    for i, (T, K) in enumerate(zip(T_vals, K_vals), start=1):
+    for i, (T, K) in enumerate(zip(T_vals, K_vals, strict=True), start=1):
         lines.append(f"| {mode}{i} | {T:,} | {K:,} | {C} |")
     lines.append("")
     return "\n".join(lines)
