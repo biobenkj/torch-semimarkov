@@ -171,9 +171,7 @@ class SemiMarkov(_Struct):
 
         Use linear scan for large state spaces.
         """
-        log_potentials, batch, N, K, C, lengths = self._check_potentials(
-            log_potentials, lengths
-        )
+        log_potentials, batch, N, K, C, lengths = self._check_potentials(log_potentials, lengths)
         semiring = self.semiring
         ssize = semiring.size()
         log_potentials.requires_grad_(True)

@@ -1,0 +1,298 @@
+% Streaming Semi-CRF Algorithm Supplement
+% For inclusion in manuscript supplemental material
+%
+% Required packages:
+% \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+% \usepackage{amsmath,amssymb}
+
+\documentclass{article}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\begin{document}
+
+\section*{Supplemental Material: Streaming Semi-CRF Inference}
+
+This supplement provides formal algorithmic details for the streaming Semi-CRF implementation.
+
+%==============================================================================
+\section{Notation}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\begin{tabular}{c l l}
+\hline
+\textbf{Symbol} & \textbf{Description} & \textbf{Shape} \\
+\hline
+$T$ & Sequence length & scalar \\
+$K$ & Maximum segment duration & scalar \\
+$C$ & Number of labels (states) & scalar \\
+$B$ & Batch size & scalar \\
+$\mathcal{S}_{t,c}$ & Cumulative projected scores & $(B, T+1, C)$ \\
+$\mathcal{T}_{c',c}$ & Transition scores (source $c'$ to dest $c$) & $(C, C)$ \\
+$\mathcal{B}_{k,c}$ & Duration bias for duration $k$, label $c$ & $(K, C)$ \\
+$\tilde{\alpha}_t(c)$ & Log-forward message at position $t$, label $c$ & $(B, C)$ \\
+$\tilde{\beta}_t(c)$ & Log-backward message & $(B, C)$ \\
+$\boldsymbol{\alpha}$ & Ring buffer for forward messages & $(B, K, C)$ \\
+$\Omega$ & Checkpointed ring buffer states & $(B, N, K, C)$ \\
+$\Delta$ & Checkpoint interval & scalar \\
+$\log Z$ & Log partition function & $(B,)$ \\
+\hline
+\end{tabular}
+\caption{Notation used throughout this supplement. Tilde ($\tilde{\cdot}$) denotes log-domain quantities.}
+\label{tab:notation}
+\end{table}
+
+%==============================================================================
+\section{Edge Potential Decomposition}
+%==============================================================================
+
+The key innovation enabling $O(KC)$ memory is computing edge potentials on-the-fly from cumulative scores. Rather than materializing the full $O(TKC^2)$ edge tensor, we decompose the potential into components that can be computed efficiently.
+
+\begin{equation}
+\label{eq:streaming_potential}
+\tilde{\psi}(t, k, c, c') =
+\underbrace{\left(\mathcal{S}_{t, c} - \mathcal{S}_{t-k, c}\right)}_{\text{segment content}} +
+\underbrace{\mathcal{B}_{k, c}}_{\text{duration bias}} +
+\underbrace{\mathcal{T}_{c', c}}_{\text{transition}}
+\end{equation}
+
+\noindent where:
+\begin{itemize}
+    \item $t$ is the segment \textbf{end} position (1-indexed, inclusive)
+    \item $k$ is the segment duration ($1 \leq k \leq K-1$)
+    \item $c$ is the destination (current) state
+    \item $c'$ is the source (previous) state
+    \item $\mathcal{S}_{t,c}$ are cumulative scores: $\mathcal{S}_{t,c} = \sum_{\tau=0}^{t-1} s_{\tau,c}$ where $s_{\tau,c}$ are projected emission scores
+\end{itemize}
+
+The segment content score $\mathcal{S}_{t,c} - \mathcal{S}_{t-k,c}$ represents the sum of emission scores for positions $[t-k, t-1]$. This prefix-sum decomposition allows $O(1)$ computation per edge instead of $O(k)$.
+
+%==============================================================================
+\section{Streaming Forward Algorithm}
+%==============================================================================
+
+Algorithm~\ref{alg:streaming_forward} describes the streaming forward pass. The algorithm maintains a ring buffer $\boldsymbol{\alpha} \in \mathbb{R}^{K \times C}$ that stores the $K$ most recent forward messages. Checkpoints are saved at regular intervals to enable the backward pass.
+
+\begin{algorithm}[t]
+\caption{Streaming Semi-CRF Forward Scan}\label{alg:streaming_forward}
+\KwIn{Cumulative scores $\mathcal{S} \in \mathbb{R}^{B \times (T+1) \times C}$,
+      Transitions $\mathcal{T} \in \mathbb{R}^{C \times C}$,
+      Duration bias $\mathcal{B} \in \mathbb{R}^{K \times C}$,
+      Checkpoint interval $\Delta$}
+\KwOut{Log partition $\log Z \in \mathbb{R}^B$, Checkpoints $\Omega$}
+\BlankLine
+\tcp{Initialize ring buffer}
+$\boldsymbol{\alpha} \gets -\infty \in \mathbb{R}^{K \times C}$\;
+$\boldsymbol{\alpha}[0, :] \gets 0$ \tcp*{Base case: uniform over labels at $t=0$}
+$\Omega[0] \gets \boldsymbol{\alpha}$ \tcp*{Save initial checkpoint}
+\BlankLine
+\tcp{Main forward loop}
+\For{$t \gets 1$ \KwTo $T$}{
+    $\mathbf{v}_t \gets -\infty \in \mathbb{R}^C$ \tcp*{Accumulator for position $t$}
+    \BlankLine
+    \tcp{Loop over valid segment durations}
+    \For{$k \gets 1$ \KwTo $\min(K-1, t)$}{
+        $t_{\text{start}} \gets t - k$\;
+        \BlankLine
+        \tcp{Load previous $\alpha$ from ring buffer}
+        $\tilde{\boldsymbol{\alpha}}_{\text{prev}} \gets \boldsymbol{\alpha}[t_{\text{start}} \bmod K, :]$\;
+        \BlankLine
+        \tcp{Compute segment score on-the-fly}
+        $\mathbf{h} \gets \bigl(\mathcal{S}[:, t, :] - \mathcal{S}[:, t_{\text{start}}, :]\bigr) + \mathcal{B}[k, :]$\;
+        \BlankLine
+        \tcp{Build edge block and reduce over source labels}
+        $\mathbf{E} \gets \mathbf{h}[:, \text{None}] + \mathcal{T}^\top$ \tcp*{$(C_{\text{dst}}, C_{\text{src}})$}
+        $\mathbf{M} \gets \tilde{\boldsymbol{\alpha}}_{\text{prev}}[\text{None}, :] + \mathbf{E}$ \tcp*{$(C_{\text{dst}}, C_{\text{src}})$}
+        $\mathbf{s}_k \gets \text{LogSumExp}(\mathbf{M}, \text{axis}=C_{\text{src}})$ \tcp*{$(C_{\text{dst}},)$}
+        \BlankLine
+        \tcp{Accumulate over durations}
+        $\mathbf{v}_t \gets \text{LogSumExp}(\mathbf{v}_t, \mathbf{s}_k)$\;
+    }
+    \BlankLine
+    \tcp{Store to ring buffer}
+    $\boldsymbol{\alpha}[t \bmod K, :] \gets \mathbf{v}_t$\;
+    \BlankLine
+    \tcp{Save checkpoint at interval boundaries}
+    \If{$t \bmod \Delta = 0$}{
+        $\Omega[t / \Delta] \gets \boldsymbol{\alpha}$ \tcp*{Save full ring state}
+    }
+}
+\BlankLine
+\tcp{Final reduction over labels}
+$\log Z \gets \text{LogSumExp}(\boldsymbol{\alpha}[T \bmod K, :])$\;
+\Return{$\log Z$, $\Omega$}\;
+\end{algorithm}
+
+\subsection{Complexity Analysis}
+
+\begin{itemize}
+    \item \textbf{Time}: $O(TKC^2)$ --- same as standard Semi-CRF
+    \item \textbf{Space}: $O(KC + \frac{T}{\Delta} \cdot KC)$ where $\Delta = \sqrt{TK}$
+    \begin{itemize}
+        \item Ring buffer: $O(KC)$
+        \item Checkpoints: $O(\frac{T}{\sqrt{TK}} \cdot KC) = O(\sqrt{T/K} \cdot KC)$
+    \end{itemize}
+\end{itemize}
+
+For typical genomic parameters ($T = 100\text{K}$, $K = 1000$, $C = 24$), space reduces from $O(TKC^2) \approx 138$ GB to $O(KC) \approx 96$ KB for the ring buffer plus checkpoints.
+
+%==============================================================================
+\section{Backward Pass with Checkpointing}
+%==============================================================================
+
+Algorithm~\ref{alg:streaming_backward} describes the backward pass using checkpointed forward states. The algorithm processes segments in reverse order, recomputing $\alpha$ values within each segment from the saved checkpoint.
+
+\begin{algorithm}[t]
+\caption{Streaming Semi-CRF Backward Pass}\label{alg:streaming_backward}
+\KwIn{Forward inputs ($\mathcal{S}$, $\mathcal{T}$, $\mathcal{B}$),
+      Checkpoints $\Omega$,
+      $\log Z$,
+      Upstream gradient $\frac{\partial \mathcal{L}}{\partial Z}$}
+\KwOut{Gradients $\nabla \mathcal{S}$, $\nabla \mathcal{T}$, $\nabla \mathcal{B}$}
+\BlankLine
+\tcp{Initialize beta ring buffer at final position}
+$\boldsymbol{\beta} \gets -\infty \in \mathbb{R}^{K \times C}$\;
+$\boldsymbol{\beta}[T \bmod K, :] \gets 0$ \tcp*{Terminal condition}
+\BlankLine
+Initialize gradient accumulators\;
+\BlankLine
+\tcp{Process segments in reverse order}
+\For{$i \gets N_{\text{ckpts}}-1$ \KwTo $0$}{
+    $t_{\text{start}} \gets i \cdot \Delta$\;
+    $t_{\text{end}} \gets \min((i+1) \cdot \Delta, T)$\;
+    \BlankLine
+    \tcp{Phase 1: Recompute alpha from checkpoint}
+    $\boldsymbol{\alpha}_{\text{local}} \gets$ \textsc{RecomputeAlpha}($\Omega[i]$, $t_{\text{start}}$, $t_{\text{end}}$)\;
+    \BlankLine
+    \tcp{Phase 2: Beta backward + gradient accumulation}
+    \For{$t \gets t_{\text{end}}-1$ \KwTo $t_{\text{start}}$}{
+        $\tilde{\boldsymbol{\alpha}}_t \gets \boldsymbol{\alpha}_{\text{local}}[t - t_{\text{start}}, :]$\;
+        $\tilde{\boldsymbol{\beta}}_t \gets -\infty \in \mathbb{R}^C$\;
+        \BlankLine
+        \For{$k \gets 1$ \KwTo $\min(K-1, T-t)$}{
+            $t_{\text{end}} \gets t + k$\;
+            $\tilde{\boldsymbol{\beta}}_{\text{next}} \gets \boldsymbol{\beta}[t_{\text{end}} \bmod K, :]$\;
+            \BlankLine
+            \tcp{Compute edge}
+            $\tilde{\psi}(\cdot) \gets$ \text{Eq.~\eqref{eq:streaming_potential}}\;
+            \BlankLine
+            \tcp{Compute marginal probability}
+            $\log \mu \gets \tilde{\boldsymbol{\alpha}}_t[\text{None}, :] + \tilde{\psi} + \tilde{\boldsymbol{\beta}}_{\text{next}}[:, \text{None}] - \log Z$\;
+            $\mu \gets \exp(\log \mu)$ \tcp*{$(C_{\text{dst}}, C_{\text{src}})$}
+            \BlankLine
+            \tcp{Accumulate gradients (see Section~\ref{sec:gradients})}
+            Accumulate $\nabla \mathcal{S}$, $\nabla \mathcal{T}$, $\nabla \mathcal{B}$ from $\mu$\;
+            \BlankLine
+            \tcp{Update beta contribution}
+            $\tilde{\boldsymbol{\beta}}_t \gets \text{LogSumExp}(\tilde{\boldsymbol{\beta}}_t, \text{LogSumExp}(\tilde{\psi} + \tilde{\boldsymbol{\beta}}_{\text{next}}[:, \text{None}], \text{axis}=C_{\text{dst}}))$\;
+        }
+        \BlankLine
+        $\boldsymbol{\beta}[t \bmod K, :] \gets \tilde{\boldsymbol{\beta}}_t$\;
+    }
+}
+\Return{$\nabla \mathcal{S}$, $\nabla \mathcal{T}$, $\nabla \mathcal{B}$}\;
+\end{algorithm}
+
+%==============================================================================
+\section{Gradient Computation}
+\label{sec:gradients}
+%==============================================================================
+
+Gradients are computed via marginal probabilities. The marginal for a segment spanning $[t-k, t-1]$ with transition $c' \to c$ is:
+
+\begin{equation}
+\mu(t, k, c, c') = \frac{\exp\bigl(\tilde{\alpha}_{t-k}(c') + \tilde{\psi}(t, k, c, c') + \tilde{\beta}_t(c)\bigr)}{\exp(\log Z)}
+\end{equation}
+
+\subsection{Per-Sequence Parameters}
+
+For per-sequence parameters (e.g., emission scores contributing to $\mathcal{S}$), gradients are scaled by the upstream gradient inside the kernel:
+
+\begin{equation}
+\nabla \mathcal{S}_{t,c} = \frac{\partial \mathcal{L}}{\partial Z_b} \cdot \left( \sum_{k, c'} \mu_b(t, k, c, c') - \sum_{k, c'} \mu_b(t+k, k, c, c') \right)
+\end{equation}
+
+The positive term accounts for segments \emph{ending} at position $t$; the negative term accounts for segments \emph{starting} after position $t$.
+
+\subsection{Shared Parameters}
+
+For shared parameters (transitions $\mathcal{T}$, duration bias $\mathcal{B}$), we first accumulate unscaled marginals per-batch, then apply the weighted sum after the kernel:
+
+\begin{align}
+\nabla \mathcal{T}_{c',c} &= \sum_{b} \frac{\partial \mathcal{L}}{\partial Z_b} \cdot \sum_{t,k} \mu_b(t, k, c, c') \label{eq:grad_transition} \\
+\nabla \mathcal{B}_{k,c} &= \sum_{b} \frac{\partial \mathcal{L}}{\partial Z_b} \cdot \sum_{t, c'} \mu_b(t, k, c, c') \label{eq:grad_duration_bias}
+\end{align}
+
+\textbf{Implementation detail}: Equations~\eqref{eq:grad_transition}--\eqref{eq:grad_duration_bias} are computed via \texttt{einsum} for memory efficiency:
+
+\begin{verbatim}
+grad_transition = torch.einsum("bij, b -> ij", grad_transition_per_batch, grad_output)
+grad_duration_bias = torch.einsum("bkc, b -> kc", grad_duration_per_batch, grad_output)
+\end{verbatim}
+
+This hybrid approach ensures correct gradient scaling when the upstream gradient varies across the batch (e.g., weighted losses, masked sequences).
+
+%==============================================================================
+\section{Numerical Stability}
+%==============================================================================
+
+\subsection{Zero-Centering}
+
+Cumulative scores can grow large for long sequences, causing precision loss. We zero-center before computing the cumsum:
+
+\begin{equation}
+\bar{s}_{t,c} = s_{t,c} - \frac{1}{T}\sum_{\tau=0}^{T-1} s_{\tau,c}, \quad
+\mathcal{S}_{t,c} = \sum_{\tau=0}^{t-1} \bar{s}_{\tau,c}
+\end{equation}
+
+This ensures cumulative scores remain bounded, maintaining float32 precision at $T > 100\text{K}$.
+
+\subsection{Log-Domain Computation}
+
+All computations are performed in log-domain to prevent underflow. The logsumexp operation provides numerically stable summation:
+
+\begin{equation}
+\text{LogSumExp}(\mathbf{x}) = \max(\mathbf{x}) + \log\sum_i \exp(x_i - \max(\mathbf{x}))
+\end{equation}
+
+Invalid positions are masked with $-10^9$ (not $-\infty$) to avoid NaN in gradients.
+
+%==============================================================================
+\section{Implementation Correspondence}
+%==============================================================================
+
+Table~\ref{tab:implementation} maps mathematical notation to implementation variables.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l}
+\hline
+\textbf{Math} & \textbf{Code Variable} & \textbf{Notes} \\
+\hline
+$\mathcal{S}_{t,c}$ & \texttt{cum\_scores[:, t, c]} & Boundary at index 0 \\
+$\mathcal{T}_{c',c}$ & \texttt{transition[c\_src, c\_dst]} & Source-first storage \\
+$\mathcal{B}_{k,c}$ & \texttt{duration\_bias[k, c]} & Index 0 unused (no $k=0$) \\
+$\boldsymbol{\alpha}$ & \texttt{alpha\_ring[:, :, :]} & Ring buffer \\
+$\tilde{\alpha}_t$ & \texttt{alpha\_ring[:, t \% K, :]} & Wrapped index \\
+$\Omega$ & \texttt{ring\_checkpoints} & Saved at intervals \\
+$\Delta$ & \texttt{checkpoint\_interval} & $\approx \sqrt{TK}$ \\
+$\mu(t,k,c,c')$ & \texttt{marginal} & Computed in backward \\
+\hline
+\end{tabular}
+\caption{Mapping between mathematical notation and implementation.}
+\label{tab:implementation}
+\end{table}
+
+\subsection{Index Convention}
+
+The algorithms are presented with 1-indexed positions ($t = 1, \ldots, T$) following mathematical convention. The implementation uses 0-indexed arrays, with the correspondence:
+\begin{itemize}
+    \item Math position $t$ $\leftrightarrow$ Code \texttt{t} (loop variable, 1-indexed in kernel)
+    \item Math $\mathcal{S}_{t,c}$ $\leftrightarrow$ Code \texttt{cum\_scores[:, t, c]} (cumsum boundary at index 0)
+\end{itemize}
+
+\end{document}

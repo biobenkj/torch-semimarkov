@@ -5,7 +5,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 
 PCTS = ["p50", "p75", "p90", "p95", "p99"]
@@ -81,7 +81,9 @@ def markdown_table(T_vals: List[int], K_vals: List[int], C: int, mode: str) -> s
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--summary-csv", type=Path, required=True, help="Path to gtf_stats_out/.../summary.csv")
+    ap.add_argument(
+        "--summary-csv", type=Path, required=True, help="Path to gtf_stats_out/.../summary.csv"
+    )
     ap.add_argument("--C", type=int, default=6, help="State count C to use in configs")
     ap.add_argument("--round", action="store_true", help="Round values to nice benchmark numbers")
     ap.add_argument("--T-pcts", default="p50,p90,p95,p99", help="Comma-separated percentiles for T")
@@ -92,8 +94,15 @@ def main():
         default="exon",
         help="Use exon_length_bp or intron_length_bp percentiles for K",
     )
-    ap.add_argument("--backend-cmd", type=str, default="benchmark_memory_analysis.py", help="Benchmark script name")
-    ap.add_argument("--out-dir", type=Path, default=None, help="If set, write outputs into this directory")
+    ap.add_argument(
+        "--backend-cmd",
+        type=str,
+        default="benchmark_memory_analysis.py",
+        help="Benchmark script name",
+    )
+    ap.add_argument(
+        "--out-dir", type=Path, default=None, help="If set, write outputs into this directory"
+    )
     args = ap.parse_args()
 
     metrics = read_summary(args.summary_csv)
@@ -140,4 +149,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

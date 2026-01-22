@@ -1,0 +1,478 @@
+% Semi-Markov CRF Backends Algorithm Supplement
+% For inclusion in manuscript supplemental material
+%
+% Required packages:
+% \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+% \usepackage{amsmath,amssymb}
+
+\documentclass{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+% Theorem environments
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\begin{document}
+
+\section*{Supplemental Material: Semi-Markov CRF Backend Algorithms}
+
+This supplement provides formal algorithmic and mathematical details for the Semi-Markov CRF inference backends analyzed in the main paper. We establish unified notation, present each algorithm with complexity analysis, and summarize why banded matrix representations fail for exact tree-structured inference (with full proofs deferred to Appendix~\ref{app:banded}).
+
+%==============================================================================
+\section{Notation}
+\label{sec:notation}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\begin{tabular}{c l l}
+\hline
+\textbf{Symbol} & \textbf{Description} & \textbf{Shape/Domain} \\
+\hline
+$T$ & Sequence length & scalar \\
+$K$ & Maximum segment duration & scalar \\
+$C$ & Number of labels (states) & scalar \\
+$B$ & Batch size & scalar \\
+$n$ & State-space size: $n = (K-1) \cdot C$ & scalar \\
+$\psi(t, k, c', c)$ & Edge potential: segment $[t, t+k)$ with transition $c' \to c$ & $(B, T-1, K, C, C)$ \\
+$\tilde{\psi}(\cdot)$ & Log-domain edge potential & \\
+$\alpha_t(c)$ & Forward message at position $t$, label $c$ & $(B, C)$ \\
+$\tilde{\alpha}_t(c)$ & Log-forward message & $(B, C)$ \\
+$\beta_t(c)$ & Backward message at position $t$, label $c$ & $(B, C)$ \\
+$\mathbf{W}_t$ & Transition matrix at position $t$ for tree reduction & $(n, n)$ \\
+$\mathcal{S}_{t,c}$ & Cumulative projected scores (streaming) & $(B, T+1, C)$ \\
+$\mathcal{T}_{c',c}$ & Transition scores (source $c'$ to dest $c$) & $(C, C)$ \\
+$\mathcal{B}_{k,c}$ & Duration bias for duration $k$, label $c$ & $(K, C)$ \\
+$\log Z$ & Log partition function & $(B,)$ \\
+\hline
+\end{tabular}
+\caption{Notation used throughout this supplement. Tilde ($\tilde{\cdot}$) denotes log-domain quantities.}
+\label{tab:notation}
+\end{table}
+
+%==============================================================================
+\section{Semi-Markov CRF Formulation}
+\label{sec:formulation}
+%==============================================================================
+
+Let $x_{1:T}$ be an observed sequence of length $T$. A Semi-Markov CRF models segmentations $S = ((s_1, e_1, \ell_1), \ldots, (s_M, e_M, \ell_M))$ where segments are contiguous, non-overlapping, cover $\{1, \ldots, T\}$, and have durations $d_m = e_m - s_m + 1 \in \{1, \ldots, K\}$. The distribution is:
+\begin{equation}
+\label{eq:semimarkov-distribution}
+p_\theta(S \mid x_{1:T})
+= \frac{1}{Z_\theta(x_{1:T})}
+\exp\left(\sum_{m=1}^M
+\psi_\theta(x_{s_m:e_m}, \ell_{m-1}, \ell_m, d_m)\right).
+\end{equation}
+
+The edge potential decomposes as:
+\begin{equation}
+\label{eq:edge-decomposition}
+\psi(t, k, c', c) = \underbrace{\psi_{\text{emission}}(x_{t:t+k}, c)}_{\text{segment content}} + \underbrace{\psi_{\text{transition}}(c', c)}_{\text{label transition}} + \underbrace{\psi_{\text{duration}}(c, k)}_{\text{length prior}}
+\end{equation}
+
+The partition function $Z_\theta$ is computed via dynamic programming. The forward recursion in log-domain is:
+\begin{equation}
+\label{eq:semimarkov-forward}
+\tilde{\alpha}_t(c) = \log \sum_{k=1}^{\min(K-1,t)} \sum_{c'=1}^{C}
+\exp\left(\tilde{\alpha}_{t-k}(c') + \tilde{\psi}(t-k, k, c', c)\right)
+\end{equation}
+with base case $\tilde{\alpha}_0(c) = 0$ for all $c$ (uniform initialization). The log-partition function is:
+\begin{equation}
+\log Z_\theta = \log \sum_c \exp(\tilde{\alpha}_T(c)) = \text{LogSumExp}_c\, \tilde{\alpha}_T(c)
+\end{equation}
+
+%==============================================================================
+\section{Provenance}
+\label{sec:provenance}
+%==============================================================================
+
+The backends presented here derive from two sources:
+
+\paragraph{Derived from \texttt{pytorch-struct} \cite{rush2020torch}.} The standard binary tree (Section~\ref{sec:binary-tree}), sharded binary tree with gradient checkpointing (Section~\ref{sec:binary-tree}), and standard/vectorized linear scan (Section~\ref{sec:linear-scan}) follow the algorithmic structure of \texttt{pytorch-struct}. The sharded variant adds memory optimization via gradient checkpointing \cite{chen2016training}.
+
+\paragraph{Novel to this work.} The block-triangular backend (Section~\ref{sec:block-triangular}), banded backend analysis (Section~\ref{sec:banded}), and streaming linear scan with fused kernels (Section~\ref{sec:streaming}) are original contributions. The block-triangular and banded approaches explore whether structural sparsity can reduce tree-backend memory. The streaming backend achieves $T$-independent memory via edge potential decomposition and ring buffers.
+
+%==============================================================================
+\section{Backend 1: Binary Tree (Parallel Scan)}
+\label{sec:binary-tree}
+%==============================================================================
+
+The binary tree algorithm is the default implementation in \texttt{pytorch-struct} \cite{rush2020torch}. It reformulates the forward recursion as semiring matrix products, enabling parallel prefix computation via tree reduction.
+
+\subsection{State Space Representation}
+
+Define an expanded state space of size $n = (K-1) \cdot C$ where each state $(k, c)$ represents ``$k$ time steps remaining in a segment of label $c$.'' The transition matrix $\mathbf{W}_t \in \mathbb{R}^{n \times n}$ encodes all valid segment transitions at position $t$:
+\begin{equation}
+\mathbf{W}_t[(k_1, c_1), (k_2, c_2)] =
+\begin{cases}
+\tilde{\psi}(t, k_2, c_1, c_2) & \text{if } k_1 = 1 \text{ (segment ends)} \\
+0 & \text{if } k_1 > 1 \text{ and } k_2 = k_1 - 1, c_2 = c_1 \text{ (continue)} \\
+-\infty & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\subsection{Semiring Matrix Multiplication}
+
+Under the log-semiring, matrix multiplication becomes:
+\begin{equation}
+(\mathbf{A} \otimes \mathbf{B})_{ij} = \bigoplus_k \mathbf{A}_{ik} \otimes \mathbf{B}_{kj} = \text{LogSumExp}_k\, (\mathbf{A}_{ik} + \mathbf{B}_{kj})
+\end{equation}
+
+The forward pass becomes a prefix product:
+\begin{equation}
+\mathbf{A}_{1:T} = \mathbf{W}_1 \otimes \mathbf{W}_2 \otimes \cdots \otimes \mathbf{W}_T
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{Binary Tree Forward (Parallel Scan)}\label{alg:binary-tree}
+\KwIn{Transition matrices $\{\mathbf{W}_t\}_{t=1}^T$, each $\mathbf{W}_t \in \mathbb{R}^{n \times n}$}
+\KwOut{Log partition $\log Z \in \mathbb{R}^B$}
+\BlankLine
+$L \gets \lceil \log_2 T \rceil$\;
+Pad sequence to length $2^L$ with identity matrices\;
+\BlankLine
+$\text{chart}[:] \gets \{\mathbf{W}_1, \mathbf{W}_2, \ldots, \mathbf{W}_{2^L}\}$\;
+\BlankLine
+\For{$\ell \gets 1$ \KwTo $L$}{
+    \tcp{Combine adjacent pairs via semiring matmul}
+    $\text{chart}[:] \gets \text{chart}[1::2] \otimes \text{chart}[0::2]$ \tcp*{Odd $\times$ Even}
+}
+\BlankLine
+$\mathbf{A}_{1:T} \gets \text{chart}[0]$\;
+$\log Z \gets \text{LogSumExp}_{c}\, \mathbf{A}_{1:T}[(1, c), (1, c)]$\;
+\Return{$\log Z$}\;
+\end{algorithm}
+
+\subsection{Complexity Analysis}
+
+\begin{itemize}
+    \item \textbf{Time}: $O(T \cdot n^3) = O(T(KC)^3)$ --- each of $T$ matrices participates in $O(\log T)$ matmuls, each costing $O(n^3)$.
+    \item \textbf{Space}: $O(T \cdot n^2) = O(T(KC)^2)$ --- must store all intermediate matrices at each tree level.
+    \item \textbf{Depth}: $O(\log T)$ parallel steps.
+\end{itemize}
+
+The tree backend trades increased work and memory for reduced parallel depth. On a single GPU, \textbf{memory exhaustion typically occurs before the depth advantage can be realized}.
+
+\subsection{Sharded Binary Tree with Gradient Checkpointing}
+
+To mitigate the $O(Tn^2)$ memory requirement, the sharded variant combines two techniques:
+
+\paragraph{Gradient Checkpointing.} During backpropagation, instead of storing all intermediate activations from the forward pass, the forward computation is \emph{recomputed} on demand \cite{chen2016training}. This trades $2\times$ compute for reduced memory, eliminating the need to store intermediate matrices across tree levels.
+
+\paragraph{Sharded Computation.} For very large matrices that exceed memory even with basic checkpointing, the computation is split into \emph{shards} processed sequentially:
+\begin{equation}
+\mathbf{C} = \mathbf{A} \otimes \mathbf{B} \quad \Rightarrow \quad \mathbf{C}[i:i+s, :] = \mathbf{A}[i:i+s, :] \otimes \mathbf{B} \quad \text{for } i = 0, s, 2s, \ldots
+\end{equation}
+Each shard of size $s$ is computed and checkpointed independently, reducing peak memory from $O(n^2)$ per matmul to $O(sn)$.
+
+\paragraph{Complexity.}
+\begin{itemize}
+    \item \textbf{Time}: $O(T(KC)^3)$ --- same total work, but with $2\times$ overhead from recomputation during backward.
+    \item \textbf{Space}: $O(\sqrt{T}(KC)^2)$ --- sharding across $\sqrt{T}$ chunks at each level.
+    \item \textbf{Depth}: $O(\sqrt{T})$ effective depth --- sequential processing of shards increases depth from $O(\log T)$.
+\end{itemize}
+
+The sharded variant extends the viable regime for tree backends from $n < 100$ to approximately $n < 150$, but streaming linear scan remains preferable for larger state spaces.
+
+%==============================================================================
+\section{Backend 2: Binary Tree with Block-Triangular Sparsity}
+\label{sec:block-triangular}
+%==============================================================================
+
+The block-triangular backend uses the same binary tree structure as Section~\ref{sec:binary-tree}, but exploits a key observation: at a tree node of span $S$, the duration constraint limits which state pairs can interact.
+
+\subsection{Duration Constraint}
+
+When combining two subtrees, a left partial segment of remaining duration $k_1$ and a right segment starting with duration $k_2$ can only connect if:
+\begin{equation}
+\label{eq:duration-constraint}
+k_1 + k_2 \leq S
+\end{equation}
+where $S$ is the span of the combined node.
+
+This constraint means only $\frac{K(K+1)}{2}$ duration pairs (out of $K^2$) are feasible at each span, yielding block-triangular sparsity in the $(k_1, k_2)$ indices.
+
+\subsection{Block-Triangular Matrix Representation}
+
+\begin{definition}[Block-Triangular Matrix]
+A block-triangular matrix $\mathbf{M}^{\text{BT}}$ with parameters $(K, C, S)$ stores only blocks $(k_1, k_2)$ satisfying $k_1 + k_2 \leq S$:
+\begin{equation}
+\mathbf{M}^{\text{BT}} = \{(\mathbf{V}_{k_1, k_2}, (k_1, k_2)) : k_1 + k_2 \leq S, \; \mathbf{V}_{k_1, k_2} \in \mathbb{R}^{C \times C}\}
+\end{equation}
+\end{definition}
+
+\subsection{Sparse Semiring Multiplication}
+
+For block-triangular matrices $\mathbf{C}$ and $\mathbf{D}$ with span constraint $S$, their product $\mathbf{E} = \mathbf{C} \otimes \mathbf{D}$ is computed via triplet decomposition:
+\begin{equation}
+\mathbf{E}[k_1, k_3] = \bigoplus_{k_2 : k_1 + k_2 \leq S,\, k_2 + k_3 \leq S} \mathbf{C}[k_1, k_2] \otimes \mathbf{D}[k_2, k_3]
+\end{equation}
+
+The algorithm enumerates valid triplets $(k_1, k_2, k_3)$, computes block products, and accumulates into output blocks via CSR-indexed reduction.
+
+\subsection{Complexity Analysis}
+
+\begin{itemize}
+    \item \textbf{Space}: $O(\frac{K(K+1)}{2} \cdot C^2) \approx \frac{1}{2} K^2 C^2$ per matrix --- roughly 50\% reduction vs. dense at relevant spans.
+    \item \textbf{Time}: Similar asymptotic work to dense tree, but with overhead from indirect indexing.
+    \item \textbf{Practical outcome}: The overhead of non-contiguous memory access outweighs savings from skipping blocks. GPUs prefer well-tuned dense kernels for moderate sparsity.
+\end{itemize}
+
+%==============================================================================
+\section{Backend 3: Binary Tree with Banded Storage (Not Viable)}
+\label{sec:banded}
+%==============================================================================
+
+A bounded maximum segment length $K$ suggests locality: from boundary $i$, a single segment can reach only $\{i+1, \ldots, i+K\}$. This motivates storing intermediate matrices in banded format within the same binary tree structure as Section~\ref{sec:binary-tree}.
+
+\subsection{Approach}
+
+At each tree level, the algorithm:
+\begin{enumerate}
+    \item Computes the adjacency pattern from the duration constraint $k_1 + k_2 \leq S$
+    \item Optionally applies bandwidth-reducing permutations (Reverse Cuthill--McKee)
+    \item Converts dense matrices to banded format if bandwidth is below a threshold
+    \item Performs semiring multiplication in banded representation
+\end{enumerate}
+
+\subsection{Why Banded Storage Fails}
+
+Two structural facts defeat this approach:
+
+\paragraph{Local Geometry Mismatch.} The duration constraint $k_1 + k_2 \leq S$ induces \emph{anti-diagonal triangular} sparsity, not diagonal-banded sparsity. No permutation can reduce a clique to narrow bandwidth.
+
+\paragraph{Fill-in Under Composition.} Even if one-step operators were genuinely banded, repeated composition widens support: the effective bandwidth of $m$-step reachability grows as $\min(T, mK)$. In a balanced binary tree, $m$ doubles per level, so support becomes near-dense after $O(\log(T/K))$ levels.
+
+\paragraph{Empirical Result.} Bandwidth ratios $\text{bw}_{\text{best}}/(n-1)$ exceed 0.90 for spans $S > K/2$, meaning banded storage provides negligible benefit at the tree levels that dominate computation.
+
+\medskip
+\noindent\textit{For complete formal treatment including Proposition~1 (bandwidth lower bound from cliques) and Lemma~2 (boolean powers widen linearly), see Appendix~\ref{app:banded}.}
+
+%==============================================================================
+\section{Backend 4: Linear Scan}
+\label{sec:linear-scan}
+%==============================================================================
+
+The linear scan backend iterates sequentially over positions $t = 1, \ldots, T$, materializing $\alpha$ values at each step. We present two variants: a reference implementation with explicit loops, and a vectorized implementation that achieves 2--3$\times$ speedup through batched tensor operations. Both have identical asymptotic complexity; the differences are purely engineering optimizations.
+
+\subsection{Standard Linear Scan (Reference)}
+
+The reference implementation uses explicit iteration over durations and list-based accumulation:
+
+\begin{algorithm}[H]
+\caption{Linear Scan Forward Algorithm (Standard)}\label{alg:linear-scan}
+\KwIn{Edge potentials $\tilde{\boldsymbol{\Psi}} \in \mathbb{R}^{B \times (T-1) \times K \times C \times C}$}
+\KwOut{Log partition $\log Z \in \mathbb{R}^B$}
+\BlankLine
+\tcp{Initialize: paths of length 0 at position 0}
+$\boldsymbol{\beta}[0] \gets \mathbf{0} \in \mathbb{R}^{B \times C}$ \tcp*{$\beta_0(c) = 1$ in prob-domain}
+\BlankLine
+\For{$t \gets 1$ \KwTo $T$}{
+    $k_{\text{eff}} \gets \min(K-1, t)$\;
+    \BlankLine
+    \tcp{Compute alpha: edge scores for segments ending at $t$}
+    \For{$k \gets 1$ \KwTo $k_{\text{eff}}$}{
+        $\boldsymbol{\alpha}[t-1, k] \gets \text{LogSumExp}_{c'}\left(\boldsymbol{\beta}[t-k] + \tilde{\boldsymbol{\Psi}}[:, t-1, k, :, :]\right)$\;
+    }
+    \BlankLine
+    \tcp{Accumulate beta: sum over valid durations}
+    $\boldsymbol{\beta}[t] \gets \text{LogSumExp}_{k=1}^{k_{\text{eff}}}\, \boldsymbol{\alpha}[t-k, k]$\;
+}
+\BlankLine
+$\log Z \gets \text{LogSumExp}_c\, \boldsymbol{\beta}[T]$\;
+\Return{$\log Z$}\;
+\end{algorithm}
+
+\subsection{Vectorized Linear Scan}
+
+The vectorized implementation replaces the inner duration loop and list accumulation with batched tensor operations:
+
+\begin{enumerate}
+    \item \textbf{Alpha update}: Direct broadcasting $\boldsymbol{\beta}[t-1] + \tilde{\boldsymbol{\Psi}}[:, t-1]$ followed by reduction, instead of per-duration semiring dot products.
+    \item \textbf{Beta accumulation}: Advanced indexing with pre-computed time and duration index tensors, replacing list comprehension with a single \texttt{torch.gather} operation.
+\end{enumerate}
+
+These changes avoid Python-level iteration overhead and enable better GPU utilization, yielding 2--3$\times$ wall-clock speedup in practice.
+
+\subsection{Complexity Analysis}
+
+Both variants share the same asymptotic complexity:
+
+\begin{itemize}
+    \item \textbf{Time}: $O(TKC^2)$ --- each of $T$ positions performs $O(K)$ duration iterations, each requiring $O(C^2)$ operations for the source-label summation.
+    \item \textbf{Space}: $O(TKC)$ for storing all $\alpha$ values, or $O(KC)$ with ring buffer optimization (see Section~\ref{sec:streaming}).
+    \item \textbf{Depth}: $O(T)$ sequential steps.
+\end{itemize}
+
+%==============================================================================
+\section{Backend 5: Streaming Linear Scan (Fused Kernel)}
+\label{sec:streaming}
+%==============================================================================
+
+The streaming backend optimizes memory by computing edge potentials on-the-fly from cumulative scores using a prefix-sum decomposition, and using a ring buffer to store only the $K$ most recent $\alpha$ values.
+
+\subsection{Edge Potential Decomposition}
+
+\begin{equation}
+\label{eq:streaming_potential}
+\tilde{\psi}(t, k, c', c) =
+\underbrace{\left(\mathcal{S}_{t+k, c} - \mathcal{S}_{t, c}\right)}_{\text{segment content}} +
+\underbrace{\mathcal{B}_{k, c}}_{\text{duration bias}} +
+\underbrace{\mathcal{T}_{c', c}}_{\text{transition}}
+\end{equation}
+
+\noindent where $\mathcal{S}_{t,c} = \sum_{\tau=0}^{t-1} s_{\tau,c}$ are cumulative projected emission scores. This decomposition enables $O(1)$ edge computation per $(t, k, c', c)$ tuple instead of $O(k)$.
+
+\subsection{Ring Buffer}
+
+Instead of storing all $T$ forward messages, maintain a ring buffer $\boldsymbol{\alpha} \in \mathbb{R}^{K \times C}$:
+\begin{equation}
+\tilde{\alpha}_{t}(c) = \boldsymbol{\alpha}[t \bmod K, c]
+\end{equation}
+
+This reduces memory from $O(TKC)$ to $O(KC)$, independent of sequence length.
+
+\subsection{Complexity Analysis}
+
+\begin{itemize}
+    \item \textbf{Time}: $O(TKC^2)$ --- same asymptotic work as standard linear scan.
+    \item \textbf{Space}: $O(KC + \frac{T}{\Delta} \cdot KC)$ where $\Delta = \sqrt{TK}$ optimally.
+    \begin{itemize}
+        \item Ring buffer: $O(KC)$ --- stores only $K$ most recent $\alpha$ values
+        \item Checkpoints: $O(\sqrt{T/K} \cdot KC)$ for gradient computation
+    \end{itemize}
+    \item \textbf{Depth}: $O(T)$ sequential steps.
+\end{itemize}
+
+\medskip
+\noindent\textit{For complete algorithmic details of the streaming implementation including checkpointing, backward pass, and numerical stability considerations, see Supplement: Streaming Semi-CRF Inference.}
+
+%==============================================================================
+\section{Complexity Summary}
+\label{sec:complexity-summary}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\caption{Backend complexity comparison. Work = total operations; Depth = parallel steps; Memory = peak intermediate storage; Tree = tree-structured algorithm; $n = (K-1) \cdot C$.}
+\label{tab:complexity}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Backend & Work & Depth & Memory & Tree & Source \\
+\midrule
+Binary tree (dense) & $O(Tn^3)$ & $O(\log T)$ & $O(Tn^2)$ & Yes & \cite{rush2020torch} \\
+Binary tree (sharded) & $O(Tn^3)$ & $O(\sqrt{T})$ & $O(\sqrt{T}n^2)$ & Yes & \cite{rush2020torch}$^*$ \\
+Binary tree (block-tri) & $O(Tn^3)$ & $O(\log T)$ & $\sim\frac{1}{2}O(Tn^2)$ & Yes & Novel \\
+Binary tree (banded) & $O(Tn^3)$ & $O(\log T)$ & $\to O(Tn^2)$ & Yes & Novel \\
+Linear scan (std) & $O(TKC^2)$ & $O(T)$ & $O(TKC)$ & No & \cite{rush2020torch} \\
+Linear scan (vec) & $O(TKC^2)$ & $O(T)$ & $O(TKC)$ & No & \cite{rush2020torch}$^\dagger$ \\
+Streaming linear & $O(TKC^2)$ & $O(T)$ & $O(KC)$ & No & Novel \\
+\bottomrule
+\multicolumn{6}{l}{\footnotesize $^*$Adds gradient checkpointing \cite{chen2016training}. $^\dagger$Vectorized engineering optimization; same algorithm.}
+\end{tabular}
+\end{table}
+
+The critical observation: \textbf{memory scales with $T$ for tree backends but is $T$-independent for streaming linear scan}. Since $n = (K-1) \cdot C$, the tree backends have cubic dependence on state-space size in work and quadratic in memory, while linear scan backends have only quadratic work dependence on $C$.
+
+%==============================================================================
+\section{Implementation Correspondence}
+\label{sec:implementation}
+%==============================================================================
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l}
+\hline
+\textbf{Math} & \textbf{Code Variable} & \textbf{Notes} \\
+\hline
+$\tilde{\alpha}_t(c)$ & \texttt{alpha[:, t, c]} or \texttt{beta[t][:, c]} & Linear scan \\
+$\mathcal{S}_{t,c}$ & \texttt{cum\_scores[:, t, c]} & Streaming \\
+$\mathcal{T}_{c',c}$ & \texttt{transition[c\_src, c\_dst]} & Source-first indexing \\
+$\mathcal{B}_{k,c}$ & \texttt{duration\_bias[k, c]} & Index 0 unused ($k \geq 1$) \\
+$\mathbf{W}_t$ & \texttt{chart[:, :, t, :, :]} & Tree backend \\
+$n = (K-1) \cdot C$ & \texttt{K\_1 * C} & State-space size \\
+Ring buffer & \texttt{alpha\_ring[:, :, head, :]} & Modular indexing \\
+\hline
+\end{tabular}
+\caption{Mapping between mathematical notation and implementation.}
+\label{tab:implementation}
+\end{table}
+
+\subsection{Index Conventions}
+
+\begin{itemize}
+    \item \textbf{Algorithms}: Presented with 1-indexed positions ($t = 1, \ldots, T$) following mathematical convention.
+    \item \textbf{Implementation}: Uses 0-indexed arrays. Position $t$ in math corresponds to index \texttt{t-1} in code.
+    \item \textbf{Edge tensor}: Shape $(B, T-1, K, C, C)$ where \texttt{edge[b, n, k, c2, c1]} is the log-potential for transitioning from label \texttt{c1} to \texttt{c2} with duration \texttt{k} at position \texttt{n}.
+\end{itemize}
+
+%==============================================================================
+\appendix
+\section{Why Banded Matrices Do Not Provide Viable Exact Inference}
+\label{app:banded}
+%==============================================================================
+
+This appendix summarizes the formal analysis; for complete proofs, see the standalone supplement ``Why Banded Matrices Do Not Provide a Viable Exact Backend for Tree-Structured Semi-Markov CRF Inference.''
+
+\subsection{Bandwidth Definition}
+
+For a square matrix $\mathbf{M}$ with indices $\{1, \ldots, n\}$:
+\begin{equation}
+\text{bw}(\mathbf{M}) = \max\{|i - j| : \mathbf{M}[i, j] \neq 0\}
+\end{equation}
+
+\subsection{Proposition 1: Bandwidth Lower Bound}
+
+Let $D = \min(K, S)$ and define $\mathbf{M}_S \in \{0,1\}^{(DC) \times (DC)}$ with $\mathbf{M}_S[(d_1, y_1), (d_2, y_2)] = 1$ iff $d_1 + d_2 \leq S$. For any permutation $\pi$:
+\begin{equation}
+\text{bw}(\mathbf{P}_\pi^\top \mathbf{M}_S \mathbf{P}_\pi) \geq C \lfloor S/2 \rfloor - 1
+\end{equation}
+
+\textit{Proof sketch}: States with $d \leq \lfloor S/2 \rfloor$ form a clique of size $\lfloor S/2 \rfloor \cdot C$. Any linear ordering of an $n$-clique has bandwidth $n - 1$.
+
+\subsection{Lemma 2: Boolean Powers Widen Linearly}
+
+Let $\mathbf{B}$ be the boundary adjacency matrix with $\mathbf{B}[i, j] = 1$ iff $1 \leq j - i \leq K$. Then:
+\begin{equation}
+(\mathbf{B}^m)[i, j] = 1 \iff m \leq j - i \leq mK
+\end{equation}
+hence $\text{bw}(\mathbf{B}^m) = \min(T, mK)$.
+
+\textit{Consequence}: In a balanced binary tree, the number of composed segments doubles per level, so bandwidth saturates at the dense width after $O(\log(T/K))$ levels.
+
+%==============================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{rush2020torch}
+A.~M. Rush.
+\newblock Torch-Struct: Deep Structured Prediction Library.
+\newblock In \emph{ACL}, 2020.
+
+\bibitem{blelloch1990prefix}
+G.~E. Blelloch.
+\newblock Prefix sums and their applications.
+\newblock Technical Report CMU-CS-90-190, Carnegie Mellon University, 1990.
+
+\bibitem{sarawagi2004semi}
+S.~Sarawagi and W.~W. Cohen.
+\newblock Semi-Markov conditional random fields for information extraction.
+\newblock In \emph{NeurIPS}, pages 1185--1192, 2004.
+
+\bibitem{chen2016training}
+T.~Chen, B.~Xu, C.~Zhang, and C.~Guestrin.
+\newblock Training deep nets with sublinear memory cost.
+\newblock \emph{arXiv preprint arXiv:1604.06174}, 2016.
+
+\end{thebibliography}
+
+\end{document}
