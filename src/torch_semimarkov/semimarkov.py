@@ -299,8 +299,8 @@ class SemiMarkov(_Struct):
 
         for n in range(1, N):
             # Number of valid durations at this position
-            # k_eff = min(K-1, n) is the max duration index (durations are 1-indexed)
-            k_eff = min(K - 1, n)
+            # max(1, ...) ensures K=1 still processes duration 1
+            k_eff = max(1, min(K - 1, n))
 
             # Duration indices: 1, 2, ..., k_eff (slice pre-allocated tensor)
             dur = dur_full[:k_eff]
@@ -315,7 +315,9 @@ class SemiMarkov(_Struct):
 
             # Get edge potentials for these (start, duration) pairs
             # edge shape: (ssize, batch, N-1, K, C, C)
-            edge_slice = edge[:, :, start, dur, :, :]  # (ssize, batch, k_eff, C, C)
+            # Clamp dur to valid index range for K=1 case
+            dur_clamped = torch.clamp(dur, max=K - 1)
+            edge_slice = edge[:, :, start, dur_clamped, :, :]  # (ssize, batch, k_eff, C, C)
 
             # Compute: logsumexp over c_prev (last dim) of beta_prev + edge
             # beta_prev: (ssize, batch, k_eff, C) -> unsqueeze to (ssize, batch, k_eff, 1, C)

@@ -7,15 +7,15 @@ eliminating the need to materialize the full (batch, T-1, K, C, C) edge tensor.
 .. important::
     **When to use this module vs. triton_scan:**
 
-    Use ``streaming`` (this module) when:
-        - Edge tensor is too large to materialize (T > 10K, large K)
-        - Edges follow the decomposable structure (content + transition)
-        - Very long sequences (T = 100K - 400K+)
+    Use ``streaming`` (this module) for:
+        - **Training** (always) - hand-written Triton backward kernels
+        - **Inference** (recommended) - faster than triton_scan even when edge fits
+        - **Very long sequences** (T = 10K - 400K+) - edge tensor cannot fit
 
-    Use ``triton_scan`` module when:
-        - Edge tensor fits in GPU memory
-        - Edge potentials are pre-computed (e.g., from a neural network)
-        - Moderate sequence lengths (typically T < 10K)
+    Use ``triton_scan`` module only when:
+        - Edge tensor is pre-computed from an external source
+        - Inference only (no gradients needed)
+        - Edge tensor already fits in GPU memory
 
     **Memory comparison:**
 
@@ -31,6 +31,32 @@ eliminating the need to materialize the full (batch, T-1, K, C, C) edge tensor.
 
     For the T=400K case, the edge tensor cannot fit in memory. This module
     computes edges on-the-fly from O(T×C) cumulative scores instead.
+
+    **Performance comparison (forward-only, NVIDIA L40S):**
+
+    Streaming beats triton_scan on both speed AND memory:
+
+    +-----------------------+---------------------+---------------------+-------------------+
+    | Configuration         | triton_scan         | streaming           | Streaming wins by |
+    +=======================+=====================+=====================+===================+
+    | K=100, batch=64       | 127ms, 14GB         | 38ms, 6MB           | 3.35× faster      |
+    +-----------------------+---------------------+---------------------+-------------------+
+    | K=500, batch=32       | 330ms, 35GB         | 224ms, 3MB          | 1.48× faster      |
+    +-----------------------+---------------------+---------------------+-------------------+
+
+    Why streaming is faster:
+
+    - **Memory bandwidth**: Loading O(T×K×C²) edges from memory is slower than
+      computing O(T×C) edge blocks on-the-fly from cumulative scores
+    - **Cache efficiency**: Streaming keeps working set in L1/L2 cache
+    - **Linear batch scaling**: Memory grows as O(batch×T×C), not O(batch×T×K×C²)
+
+    **Training advantages:**
+
+    - Hand-written Triton backward kernels (no torch.compile overhead)
+    - No compilation latency (torch.compile takes 20+ minutes for T=1000)
+    - No RecursionError from deep computational graphs
+    - No OOM from compiled gradient buffers
 
 API Comparison
 --------------
@@ -103,7 +129,7 @@ Usage
 
 See Also
 --------
-:mod:`torch_semimarkov.triton_scan` : For sequences where edge tensor fits in memory
+:mod:`torch_semimarkov.triton_scan` : Inference only, when edge tensor is pre-computed externally
 :class:`torch_semimarkov.SemiMarkov` : High-level API with marginals and sampling
 """
 

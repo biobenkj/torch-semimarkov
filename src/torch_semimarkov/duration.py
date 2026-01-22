@@ -1,11 +1,32 @@
-"""
-Duration distribution classes for Semi-Markov CRF.
+r"""Duration distribution classes for Semi-Markov CRF.
 
 This module provides flexible duration parameterization through a factory pattern.
 Different distributions can be used to model segment durations, allowing for
 domain-specific priors or learned parameters.
 
-Example usage:
+Classes:
+    :class:`DurationDistribution`: Abstract base class for duration distributions.
+    :class:`LearnedDuration`: Fully learned duration bias (default behavior).
+    :class:`GeometricDuration`: Geometric distribution :math:`P(k) \propto p(1-p)^{k-1}`.
+    :class:`NegativeBinomialDuration`: Negative binomial distribution.
+    :class:`PoissonDuration`: Poisson-like distribution.
+    :class:`UniformDuration`: Uniform (no duration preference).
+    :class:`CallableDuration`: User-provided callable for custom distributions.
+
+Functions:
+    :func:`create_duration_distribution`: Factory function to create distributions.
+
+Numerical Stability:
+    Most distributions include safeguards against numerical instability:
+
+    - **GeometricDuration**: Numerically stable for all parameter values.
+    - **PoissonDuration**: Stable; epsilon added to prevent ``log(0)``.
+    - **NegativeBinomialDuration**: Can produce non-finite values with very small
+      shape parameter :math:`r`. A runtime warning is emitted when this occurs.
+      See :class:`NegativeBinomialDuration` for mitigation strategies.
+
+Examples::
+
     >>> from torch_semimarkov.duration import LearnedDuration, GeometricDuration
     >>>
     >>> # Default learned duration bias (current behavior)
@@ -15,8 +36,12 @@ Example usage:
     >>> # Geometric distribution with learned rate
     >>> dur = GeometricDuration(max_duration=8, num_classes=4)
     >>> bias = dur()  # Returns (K, C) tensor with geometric shape
+
+See Also:
+    :class:`~torch_semimarkov.nn.SemiMarkovCRFHead`: Uses duration distributions
 """
 
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Union
@@ -27,14 +52,23 @@ from torch import Tensor
 
 
 class DurationDistribution(nn.Module, ABC):
-    """Base class for duration distributions.
+    r"""Base class for duration distributions.
 
-    Duration distributions produce a bias tensor of shape (K, C) where:
-    - K is the maximum segment duration
-    - C is the number of classes/labels
+    Duration distributions produce a bias tensor of shape :math:`(K, C)` where:
+
+    - :math:`K` is the maximum segment duration
+    - :math:`C` is the number of classes/labels
 
     The bias is added to segment scores in the Semi-Markov CRF, effectively
     implementing a prior over segment durations for each class.
+
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+
+    Attributes:
+        max_duration (int): Maximum segment duration.
+        num_classes (int): Number of label classes.
     """
 
     def __init__(self, max_duration: int, num_classes: int):
@@ -44,19 +78,37 @@ class DurationDistribution(nn.Module, ABC):
 
     @abstractmethod
     def forward(self) -> Tensor:
-        """Compute duration bias tensor.
+        r"""forward() -> Tensor
+
+        Compute duration bias tensor.
 
         Returns:
-            Tensor of shape (K, C) containing log-space duration biases.
+            Tensor: Duration biases of shape :math:`(K, C)` in log-space.
         """
         raise NotImplementedError
 
 
 class LearnedDuration(DurationDistribution):
-    """Fully learned duration bias (default behavior).
+    r"""Fully learned duration bias (default behavior).
 
     Each (duration, class) combination has an independent learned parameter.
     This is the most flexible but requires the most data to learn.
+
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+        init_std (float, optional): Standard deviation for initialization.
+            Default: ``0.1``
+
+    Attributes:
+        duration_bias (Parameter): Learned bias of shape :math:`(K, C)`.
+
+    Examples::
+
+        >>> dur = LearnedDuration(max_duration=8, num_classes=4)
+        >>> bias = dur()
+        >>> bias.shape
+        torch.Size([8, 4])
     """
 
     def __init__(self, max_duration: int, num_classes: int, init_std: float = 0.1):
@@ -64,16 +116,53 @@ class LearnedDuration(DurationDistribution):
         self.duration_bias = nn.Parameter(torch.randn(max_duration, num_classes) * init_std)
 
     def forward(self) -> Tensor:
+        r"""forward() -> Tensor
+
+        Return the learned duration bias.
+
+        Returns:
+            Tensor: Duration biases of shape :math:`(K, C)`.
+        """
         return self.duration_bias
 
 
 class GeometricDuration(DurationDistribution):
-    """Geometric duration distribution: P(k) ∝ p(1-p)^(k-1).
+    r"""Geometric duration distribution.
 
     Models durations with exponential decay, where short segments are more
-    likely than long ones. The rate parameter p can be learned per-class.
+    likely than long ones. The rate parameter :math:`p` can be learned per-class.
 
-    In log space: log P(k) = log(p) + (k-1) * log(1-p)
+    .. math::
+        P(k) \propto p(1-p)^{k-1}
+
+    In log space:
+
+    .. math::
+        \log P(k) = \log(p) + (k-1) \cdot \log(1-p)
+
+    .. note::
+        This distribution is numerically stable for all parameter values. The
+        probability :math:`p` is constrained to :math:`(0, 1)` via sigmoid, and
+        a small epsilon (``1e-8``) is added before taking logs to prevent
+        ``log(0)`` at extreme values.
+
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+        init_logit (float, optional): Initial logit for success probability.
+            Default: ``0.0`` (corresponds to :math:`p = 0.5`)
+        learn_rate (bool, optional): If ``True``, the rate parameter is learned.
+            Default: ``True``
+
+    Attributes:
+        logit_p (Parameter or Tensor): Logit of success probability, shape :math:`(C,)`.
+
+    Examples::
+
+        >>> dur = GeometricDuration(max_duration=8, num_classes=4)
+        >>> bias = dur()
+        >>> bias.shape
+        torch.Size([8, 4])
     """
 
     def __init__(
@@ -92,6 +181,13 @@ class GeometricDuration(DurationDistribution):
             self.register_buffer("logit_p", torch.full((num_classes,), init_logit))
 
     def forward(self) -> Tensor:
+        r"""forward() -> Tensor
+
+        Compute geometric duration bias.
+
+        Returns:
+            Tensor: Log-probabilities of shape :math:`(K, C)`.
+        """
         # p = sigmoid(logit_p), constrained to (0, 1)
         p = torch.sigmoid(self.logit_p)  # (C,)
 
@@ -110,13 +206,55 @@ class GeometricDuration(DurationDistribution):
 
 
 class NegativeBinomialDuration(DurationDistribution):
-    """Negative binomial duration distribution.
+    r"""Negative binomial duration distribution.
 
-    Generalizes geometric distribution with an additional shape parameter r.
-    P(k) ∝ C(k+r-2, k-1) * p^r * (1-p)^(k-1)
+    Generalizes geometric distribution with an additional shape parameter :math:`r`.
 
-    When r=1, reduces to geometric distribution.
-    Larger r values create more peaked distributions around the mode.
+    .. math::
+        P(k) \propto \binom{k+r-2}{k-1} p^r (1-p)^{k-1}
+
+    When :math:`r=1`, reduces to geometric distribution.
+    Larger :math:`r` values create more peaked distributions around the mode.
+
+    .. warning::
+        Very small values of :math:`r` (e.g., ``init_log_r < -10``) can cause
+        numerical instability due to :func:`torch.lgamma` overflow in the binomial
+        coefficient computation. When this occurs, a :class:`UserWarning` is emitted
+        at runtime.
+
+        If you encounter non-finite values, consider:
+
+        - Using a larger ``init_log_r`` (e.g., ``-5.0`` or higher)
+        - Switching to :class:`GeometricDuration` which is numerically stable
+        - Clamping the learned ``log_r`` parameter during training
+
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+        init_logit (float, optional): Initial logit for success probability.
+            Default: ``0.0``
+        init_log_r (float, optional): Initial log of shape parameter. Values below
+            ``-10`` may cause numerical instability. Default: ``0.0`` (corresponds
+            to :math:`r = 1`)
+        learn_rate (bool, optional): If ``True``, the rate parameter is learned.
+            Default: ``True``
+        learn_shape (bool, optional): If ``True``, the shape parameter is learned.
+            Default: ``True``
+
+    Attributes:
+        logit_p (Parameter or Tensor): Logit of success probability, shape :math:`(C,)`.
+        log_r (Parameter or Tensor): Log of shape parameter, shape :math:`(C,)`.
+
+    Examples::
+
+        >>> dur = NegativeBinomialDuration(max_duration=8, num_classes=4)
+        >>> bias = dur()
+        >>> bias.shape
+        torch.Size([8, 4])
+
+    See Also:
+        :class:`GeometricDuration`: Equivalent to negative binomial with :math:`r=1`,
+            but numerically stable for all parameter values.
     """
 
     def __init__(
@@ -143,6 +281,18 @@ class NegativeBinomialDuration(DurationDistribution):
             self.register_buffer("log_r", torch.full((num_classes,), init_log_r))
 
     def forward(self) -> Tensor:
+        r"""forward() -> Tensor
+
+        Compute negative binomial duration bias.
+
+        Returns:
+            Tensor: Log-probabilities of shape :math:`(K, C)`.
+
+        Warns:
+            UserWarning: If the output contains non-finite values (NaN or Inf),
+                typically caused by very small :math:`r` values. This check is
+                skipped during TorchScript compilation and ``torch.compile``.
+        """
         p = torch.sigmoid(self.logit_p)  # (C,)
         r = torch.exp(self.log_r) + 1e-8  # (C,), ensure positive
 
@@ -170,16 +320,52 @@ class NegativeBinomialDuration(DurationDistribution):
             + (k_expanded - 1) * log_1_minus_p.unsqueeze(0)
         )
 
+        # Warn if numerical instability detected (common with very small r)
+        if not torch.jit.is_scripting() and not torch.compiler.is_compiling():
+            non_finite_count = (~torch.isfinite(log_prob)).sum().item()
+            if non_finite_count > 0:
+                r_min = r.min().item()
+                warnings.warn(
+                    f"NegativeBinomialDuration produced {non_finite_count} non-finite values. "
+                    f"This typically occurs when r is very small (current min r={r_min:.2e}). "
+                    f"Consider using a larger init_log_r or switching to GeometricDuration.",
+                    stacklevel=2,
+                )
+
         return log_prob
 
 
 class PoissonDuration(DurationDistribution):
-    """Poisson-like duration distribution: P(k) ∝ λ^k / k!.
+    r"""Poisson-like duration distribution.
 
-    Models durations centered around the mean λ. Useful when segments
+    Models durations centered around the mean :math:`\lambda`. Useful when segments
     have a characteristic length.
 
-    Note: This is a shifted Poisson (k starts at 1, not 0).
+    .. math::
+        P(k) \propto \frac{\lambda^k}{k!}
+
+    .. note::
+        This is a shifted Poisson (k starts at 1, not 0). A small epsilon (``1e-8``)
+        is added to :math:`\lambda` before taking the log to prevent ``log(0)``
+        when :math:`\lambda \to 0`.
+
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+        init_log_lambda (float, optional): Initial log of rate parameter.
+            Default: ``1.0`` (corresponds to :math:`\lambda \approx 2.7`)
+        learn_rate (bool, optional): If ``True``, the rate parameter is learned.
+            Default: ``True``
+
+    Attributes:
+        log_lambda (Parameter or Tensor): Log of rate parameter, shape :math:`(C,)`.
+
+    Examples::
+
+        >>> dur = PoissonDuration(max_duration=8, num_classes=4)
+        >>> bias = dur()
+        >>> bias.shape
+        torch.Size([8, 4])
     """
 
     def __init__(
@@ -197,6 +383,13 @@ class PoissonDuration(DurationDistribution):
             self.register_buffer("log_lambda", torch.full((num_classes,), init_log_lambda))
 
     def forward(self) -> Tensor:
+        r"""forward() -> Tensor
+
+        Compute Poisson duration bias.
+
+        Returns:
+            Tensor: Log-probabilities of shape :math:`(K, C)`.
+        """
         lam = torch.exp(self.log_lambda)  # (C,)
 
         k = torch.arange(1, self.max_duration + 1, device=lam.device, dtype=lam.dtype)
@@ -216,16 +409,26 @@ class PoissonDuration(DurationDistribution):
 
 
 class CallableDuration(DurationDistribution):
-    """User-provided callable for custom duration distributions.
+    r"""User-provided callable for custom duration distributions.
 
     Allows full flexibility by accepting any function that returns
-    a (K, C) tensor of log-probabilities.
+    a :math:`(K, C)` tensor of log-probabilities.
 
-    Example:
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+        func (Callable): Function with signature ``func(K, C, device) -> Tensor``
+            that returns log-probabilities of shape :math:`(K, C)`.
+
+    Examples::
+
         >>> def my_duration(K, C, device):
         ...     # Custom duration logic
         ...     return torch.zeros(K, C, device=device)
         >>> dur = CallableDuration(8, 4, my_duration)
+        >>> bias = dur()
+        >>> bias.shape
+        torch.Size([8, 4])
     """
 
     def __init__(
@@ -240,15 +443,35 @@ class CallableDuration(DurationDistribution):
         self._device_tracker = nn.Parameter(torch.zeros(1), requires_grad=False)
 
     def forward(self) -> Tensor:
+        r"""forward() -> Tensor
+
+        Call the user-provided function to compute duration bias.
+
+        Returns:
+            Tensor: Duration biases of shape :math:`(K, C)`.
+        """
         device = self._device_tracker.device
         return self._func(self.max_duration, self.num_classes, device)
 
 
 class UniformDuration(DurationDistribution):
-    """Uniform duration distribution (no duration preference).
+    r"""Uniform duration distribution (no duration preference).
 
-    All durations have equal probability: log P(k) = 0 for all k.
+    All durations have equal probability: :math:`\log P(k) = 0` for all k.
     Useful as a baseline or when duration information is uninformative.
+
+    Args:
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+
+    Examples::
+
+        >>> dur = UniformDuration(max_duration=8, num_classes=4)
+        >>> bias = dur()
+        >>> bias.shape
+        torch.Size([8, 4])
+        >>> (bias == 0).all()
+        tensor(True)
     """
 
     def __init__(self, max_duration: int, num_classes: int):
@@ -257,6 +480,13 @@ class UniformDuration(DurationDistribution):
         self.register_buffer("_zeros", torch.zeros(max_duration, num_classes))
 
     def forward(self) -> Tensor:
+        r"""forward() -> Tensor
+
+        Return zero bias (uniform distribution).
+
+        Returns:
+            Tensor: Zeros of shape :math:`(K, C)`.
+        """
         return self._zeros
 
 
@@ -266,25 +496,42 @@ def create_duration_distribution(
     num_classes: int,
     **kwargs,
 ) -> DurationDistribution:
-    """Factory function to create duration distributions.
+    r"""create_duration_distribution(distribution, max_duration, num_classes, **kwargs) -> DurationDistribution
+
+    Factory function to create duration distributions.
 
     Args:
-        distribution: Distribution type. Can be:
-            - None or "learned": LearnedDuration (default)
-            - "geometric": GeometricDuration
-            - "negative_binomial" or "negbin": NegativeBinomialDuration
-            - "poisson": PoissonDuration
-            - "uniform": UniformDuration
-            - A DurationDistribution instance (returned as-is)
-        max_duration: Maximum segment duration K
-        num_classes: Number of classes C
-        **kwargs: Additional arguments passed to the distribution constructor
+        distribution (str, DurationDistribution, optional): Distribution type. Can be:
+
+            - ``None`` or ``"learned"``: :class:`LearnedDuration` (default)
+            - ``"geometric"``: :class:`GeometricDuration`
+            - ``"negative_binomial"`` or ``"negbin"``: :class:`NegativeBinomialDuration`
+            - ``"poisson"``: :class:`PoissonDuration`
+            - ``"uniform"``: :class:`UniformDuration`
+            - A :class:`DurationDistribution` instance (returned as-is)
+
+        max_duration (int): Maximum segment duration :math:`K`.
+        num_classes (int): Number of label classes :math:`C`.
+        **kwargs: Additional arguments passed to the distribution constructor.
 
     Returns:
-        A DurationDistribution instance
+        DurationDistribution: A duration distribution instance.
 
-    Example:
+    Raises:
+        ValueError: If ``distribution`` is an unknown string.
+
+    Examples::
+
+        >>> # Create geometric distribution with custom initial logit
         >>> dur = create_duration_distribution("geometric", 8, 4, init_logit=-1.0)
+        >>> dur
+        GeometricDuration(...)
+
+        >>> # Pass through existing instance
+        >>> existing = LearnedDuration(8, 4)
+        >>> dur = create_duration_distribution(existing, 8, 4)
+        >>> dur is existing
+        True
     """
     if distribution is None or distribution == "learned":
         return LearnedDuration(max_duration, num_classes, **kwargs)

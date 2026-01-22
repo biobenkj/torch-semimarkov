@@ -488,7 +488,9 @@ def semi_crf_streaming_backward_pytorch(
 
                 # grad_duration_bias: per-batch accumulation
                 # marginal.sum(dim=-1) sums over C_src -> (batch, C_dest)
-                grad_duration_bias[:, k, :] += marginal.sum(dim=-1)  # (batch, C_dest)
+                # Clamp k to valid index range (for K=1 case where k=1 but K-1=0)
+                dur_idx = min(k, K - 1)
+                grad_duration_bias[:, dur_idx, :] += marginal.sum(dim=-1)  # (batch, C_dest)
 
                 # grad_proj_start, grad_proj_end
                 if grad_proj_start is not None:

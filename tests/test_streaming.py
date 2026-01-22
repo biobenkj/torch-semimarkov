@@ -271,6 +271,75 @@ class TestGradientCorrectness:
         assert interior_grad_sum.abs().mean() < 0.5, "Interior gradient sums should be small"
 
 
+class TestK1HMMLike:
+    """Test streaming with K=1 (HMM-like, unit segments only)."""
+
+    def test_streaming_k1_produces_finite(self):
+        """Test streaming forward with K=1 produces finite values."""
+        batch, T, K, C = 2, 50, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
+
+        partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
+
+        assert torch.isfinite(partition).all(), "K=1: Partition contains non-finite values"
+        assert partition.shape == (batch,)
+
+    def test_streaming_k1_gradient_flow(self):
+        """Test gradients flow correctly with K=1."""
+        batch, T, K, C = 2, 30, 1, 3
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(batch, T, K, C)
+
+        cum_scores.requires_grad_(True)
+        transition.requires_grad_(True)
+        duration_bias.requires_grad_(True)
+
+        partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
+        partition.sum().backward()
+
+        assert cum_scores.grad is not None, "K=1: cum_scores should have gradient"
+        assert transition.grad is not None, "K=1: transition should have gradient"
+        assert duration_bias.grad is not None, "K=1: duration_bias should have gradient"
+        assert torch.isfinite(cum_scores.grad).all(), "K=1: cum_scores grad non-finite"
+        assert torch.isfinite(transition.grad).all(), "K=1: transition grad non-finite"
+        assert torch.isfinite(duration_bias.grad).all(), "K=1: duration_bias grad non-finite"
+
+    def test_streaming_k1_variable_lengths(self):
+        """Test K=1 with variable sequence lengths."""
+        batch, T, K, C = 4, 40, 1, 3
+        cum_scores, transition, duration_bias, _ = create_streaming_inputs(batch, T, K, C)
+        lengths = torch.tensor([T, T - 10, T - 20, T - 5], dtype=torch.long)
+
+        partition = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
+
+        assert torch.isfinite(partition).all()
+        # Different lengths should give different values
+        assert (
+            len(set(partition.tolist())) > 1
+        ), "K=1: Different lengths should give different values"
+
+    def test_streaming_k1_gradcheck(self):
+        """Verify K=1 gradients using torch.autograd.gradcheck."""
+        batch, T, K, C = 1, 10, 1, 2
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, dtype=torch.float64
+        )
+
+        cum_scores.requires_grad_(True)
+        transition.requires_grad_(True)
+        duration_bias.requires_grad_(True)
+
+        def func(cs, tr, db):
+            return semi_crf_streaming_forward(cs, tr, db, lengths, K)
+
+        torch.autograd.gradcheck(
+            func,
+            (cum_scores, transition, duration_bias),
+            eps=1e-4,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
 class TestNumericalStability:
     """Test numerical stability with extreme values."""
 

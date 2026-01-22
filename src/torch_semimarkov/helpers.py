@@ -9,13 +9,29 @@ from .semirings import LogSemiring
 
 @dataclass
 class Segment:
-    """A segment in a semi-Markov segmentation.
+    r"""A segment in a semi-Markov segmentation.
+
+    Represents a contiguous segment with a label in a sequence. Used by
+    :meth:`~torch_semimarkov.nn.SemiMarkovCRFHead.decode_with_traceback` to
+    return the optimal segmentation.
+
+    Args:
+        start (int): Start position (inclusive).
+        end (int): End position (inclusive).
+        label (int): Segment label (class index).
+        score (float, optional): Segment score contribution. Default: ``0.0``
 
     Attributes:
-        start: Start position (inclusive).
-        end: End position (inclusive).
-        label: Segment label (class index).
-        score: Segment score contribution.
+        start (int): Start position (inclusive).
+        end (int): End position (inclusive).
+        label (int): Segment label (class index).
+        score (float): Segment score contribution.
+
+    Examples::
+
+        >>> seg = Segment(start=0, end=4, label=2, score=1.5)
+        >>> seg.duration
+        5
     """
 
     start: int
@@ -25,18 +41,37 @@ class Segment:
 
     @property
     def duration(self) -> int:
-        """Segment duration (number of positions)."""
+        r"""Segment duration (number of positions).
+
+        Returns:
+            int: Duration computed as ``end - start + 1``.
+        """
         return self.end - self.start + 1
 
 
 @dataclass
 class ViterbiResult:
-    """Result from Viterbi decoding with traceback.
+    r"""Result from Viterbi decoding with traceback.
+
+    Returned by :meth:`~torch_semimarkov.nn.SemiMarkovCRFHead.decode_with_traceback`
+    containing both the best scores and the segment paths.
+
+    Args:
+        scores (Tensor): Best segmentation scores of shape :math:`(\text{batch},)`.
+        segments (List[List[Segment]]): Per-batch list of segments forming the
+            optimal segmentation. Each inner list contains :class:`Segment` objects
+            in order from start to end.
 
     Attributes:
-        scores: Best segmentation scores of shape (batch,).
-        segments: Per-batch list of segments forming the optimal segmentation.
-            Each inner list contains Segment objects in order from start to end.
+        scores (Tensor): Best segmentation scores of shape :math:`(\text{batch},)`.
+        segments (List[List[Segment]]): Per-batch list of optimal segments.
+
+    Examples::
+
+        >>> result = crf.decode_with_traceback(hidden, lengths)
+        >>> print(f"Score: {result.scores[0].item():.2f}")
+        >>> for seg in result.segments[0]:
+        ...     print(f"  [{seg.start}, {seg.end}] label={seg.label}")
     """
 
     scores: Tensor

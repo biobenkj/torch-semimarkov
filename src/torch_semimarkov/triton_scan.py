@@ -3,18 +3,32 @@ r"""Fused Semi-Markov CRF forward scan with pre-computed edge potentials.
 This module provides optimized implementations of the forward scan for Semi-Markov
 CRFs when edge potentials are **pre-computed and materialized in GPU memory**.
 
+.. warning::
+    **Do NOT use this module for training.**
+
+    The ``torch.compile`` path for backward passes has critical limitations:
+
+    - **RecursionError**: Sequences longer than T≈1000 exceed Python's recursion
+      limit in inductor's topological sort
+    - **OOM during backward**: Compiled graphs require 2×+ memory for gradient
+      buffers, causing OOM even when forward pass succeeds
+    - **Compilation time**: 20+ minutes for T=1000, essentially unusable
+
+    For training, use :func:`~torch_semimarkov.streaming.semi_crf_streaming_forward`,
+    which has hand-written Triton backward kernels (no compilation overhead).
+
 .. important::
     **When to use this module vs. streaming API:**
 
-    Use ``triton_scan`` (this module) when:
-        - Edge tensor fits in GPU memory
-        - Edge potentials are pre-computed (e.g., from a neural network)
-        - Moderate sequence lengths (typically T < 10K)
+    Use ``triton_scan`` (this module) only when:
+        - Edge tensor is pre-computed from an external source
+        - Inference only (no gradients needed)
+        - Edge tensor already fits in GPU memory
 
-    Use ``streaming`` module when:
-        - Edge tensor is too large to materialize (T > 10K, large K)
-        - Edges follow the decomposable structure (content + transition)
-        - Very long sequences (T = 100K - 400K+)
+    Use ``streaming`` module (recommended) for:
+        - **Training** (always) - hand-written Triton backward kernels
+        - **Inference** (recommended) - faster than triton_scan even when edge fits
+        - **Very long sequences** (T > 10K) - edge tensor cannot fit
 
     **Memory comparison:**
 
@@ -32,6 +46,22 @@ CRFs when edge potentials are **pre-computed and materialized in GPU memory**.
     :mod:`~torch_semimarkov.streaming` module instead, which computes edges
     on-the-fly from O(T×C) cumulative scores.
 
+    **Performance comparison (forward-only, NVIDIA L40S):**
+
+    Even for inference, streaming is typically faster:
+
+    +-----------------------+---------------------+---------------------+
+    | Configuration         | triton_scan         | streaming           |
+    +=======================+=====================+=====================+
+    | K=100, batch=64       | 127ms, 14GB         | 38ms, 6MB           |
+    +-----------------------+---------------------+---------------------+
+    | K=500, batch=32       | 330ms, 35GB         | 224ms, 3MB          |
+    +-----------------------+---------------------+---------------------+
+
+    The streaming API is faster because computing edges on-the-fly from O(T×C)
+    cumulative scores is faster than loading O(T×K×C²) pre-computed edges from
+    memory (memory bandwidth is the bottleneck, not compute).
+
 API
 ---
 This module takes a **pre-computed edge tensor**::
@@ -48,7 +78,7 @@ Implementation
 --------------
 Three execution paths are provided, automatically selected based on context:
 
-1. **Custom Triton kernel** (GPU inference): Maximum performance (~45x faster),
+1. **Custom Triton kernel** (GPU inference): Maximum performance,
    used when ``requires_grad=False`` and CUDA is available.
 2. **torch.compile** (GPU training): Uses ``torch.compile`` to generate optimized
    Triton kernels for both forward AND backward passes automatically.
@@ -63,10 +93,32 @@ The custom Triton kernel uses a fused scan that:
 Both ``"log"`` (logsumexp for partition function) and ``"max"`` (Viterbi for best
 path score) semirings are supported.
 
+.. warning::
+    **torch.compile is broken for training at production scales.**
+
+    While inference uses the fast custom Triton kernel, training attempts to use
+    ``torch.compile`` for backward passes, which fails in multiple ways:
+
+    - RecursionError with T > 1000 (inductor hits Python recursion limit)
+    - OOM during backward (compiled graphs need 2×+ memory)
+    - 20+ minute compilation times
+
+    **Always use the streaming API for training.**
+
 .. note::
-    The hybrid approach gives optimal performance for both inference and training:
-    blazing fast inference with the custom kernel, and efficient training with
-    automatic backward pass generation via ``torch.compile``.
+    **Pointer arithmetic and int32 overflow:**
+
+    The Triton kernels use 64-bit integers for batch pointer arithmetic to avoid
+    overflow with large edge tensors. Triton's ``tl.program_id()`` returns int32
+    by default, and multiplying by the batch stride can overflow when:
+
+    .. code-block:: text
+
+        batch_idx × stride_eb > 2^31 (~2.1 billion)
+
+    For T=1000, K=100, C=24, the batch stride is ~57.5M elements, so overflow
+    occurs at batch ≥ 38. The streaming API avoids this issue entirely because
+    its input tensors are ~2,400× smaller per batch element (O(T×C) vs O(T×K×C²)).
 
 Examples::
 
@@ -85,7 +137,7 @@ Examples::
 
 See Also
 --------
-:mod:`torch_semimarkov.streaming` : For sequences where edge tensor is too large
+:mod:`torch_semimarkov.streaming` : Recommended for both training and inference
 :class:`torch_semimarkov.SemiMarkov` : High-level API with marginals and sampling
 """
 
@@ -169,7 +221,8 @@ def semi_crf_forward_pytorch(edge, lengths, semiring="log"):
     # Main scan loop
     for n in range(1, N):
         # Number of valid durations at this position
-        k_eff = min(K - 1, n)
+        # max(1, ...) ensures K=1 still processes duration 1
+        k_eff = max(1, min(K - 1, n))
         dur = dur_arange[:k_eff]  # [1, 2, ..., k_eff] as tensor
         start = n - dur  # positions where segments start (tensor)
 
@@ -179,8 +232,9 @@ def semi_crf_forward_pytorch(edge, lengths, semiring="log"):
         beta_prev = beta_ring.index_select(0, ring_idx)  # (k_eff, batch, C)
         beta_prev = beta_prev.permute(1, 0, 2)  # (batch, k_eff, C)
 
-        # Get edge potentials
-        edge_slice = edge[:, start, dur, :, :]  # (batch, k_eff, C, C)
+        # Get edge potentials (clamp dur to valid index range for K=1 case)
+        dur_clamped = torch.clamp(dur, max=K - 1)
+        edge_slice = edge[:, start, dur_clamped, :, :]  # (batch, k_eff, C, C)
 
         # First reduction: over c_prev (source labels)
         if semiring == "log":
@@ -269,6 +323,10 @@ if HAS_TRITON:
         if batch_idx >= batch_size:
             return
 
+        # Cast to int64 for pointer arithmetic to avoid overflow with large batches
+        # (batch_idx * stride can exceed int32 max ~2.1B when batch >= 64 with large tensors)
+        batch_idx_i64 = batch_idx.to(tl.int64)
+
         # 1D indices for labels (padded to power of 2)
         c_idx = tl.arange(0, C_PAD)
         c_mask = c_idx < C  # mask for valid label indices
@@ -279,11 +337,11 @@ if HAS_TRITON:
         c_mask_2d = (c_dst < C) & (c_src < C)  # [C_PAD, C_PAD]
 
         # Load sequence length
-        seq_len = tl.load(lengths_ptr + batch_idx)
+        seq_len = tl.load(lengths_ptr + batch_idx_i64)
 
         # Base pointers
-        edge_base = edge_ptr + batch_idx * stride_eb
-        ring_base = ring_ptr + batch_idx * stride_rb
+        edge_base = edge_ptr + batch_idx_i64 * stride_eb
+        ring_base = ring_ptr + batch_idx_i64 * stride_rb
 
         # Initialize ring buffer: slot 0 = 0.0, rest = NEG_INF
         for k_init in tl.static_range(0, K):
@@ -373,7 +431,7 @@ if HAS_TRITON:
         partition = max_val + tl.log(sum_exp)
 
         # Store result (partition is a scalar)
-        tl.store(out_ptr + batch_idx, partition)
+        tl.store(out_ptr + batch_idx_i64, partition)
 
     @triton.jit
     def semi_crf_scan_kernel_max(
@@ -417,6 +475,10 @@ if HAS_TRITON:
         if batch_idx >= batch_size:
             return
 
+        # Cast to int64 for pointer arithmetic to avoid overflow with large batches
+        # (batch_idx * stride can exceed int32 max ~2.1B when batch >= 64 with large tensors)
+        batch_idx_i64 = batch_idx.to(tl.int64)
+
         # 1D indices for labels (padded to power of 2)
         c_idx = tl.arange(0, C_PAD)
         c_mask = c_idx < C  # mask for valid label indices
@@ -427,11 +489,11 @@ if HAS_TRITON:
         c_mask_2d = (c_dst < C) & (c_src < C)  # [C_PAD, C_PAD]
 
         # Load sequence length
-        seq_len = tl.load(lengths_ptr + batch_idx)
+        seq_len = tl.load(lengths_ptr + batch_idx_i64)
 
         # Base pointers
-        edge_base = edge_ptr + batch_idx * stride_eb
-        ring_base = ring_ptr + batch_idx * stride_rb
+        edge_base = edge_ptr + batch_idx_i64 * stride_eb
+        ring_base = ring_ptr + batch_idx_i64 * stride_rb
 
         # Initialize ring buffer: slot 0 = 0.0, rest = NEG_INF
         for k_init in tl.static_range(0, K):
@@ -514,7 +576,7 @@ if HAS_TRITON:
         partition = tl.max(final_beta_masked, axis=0)
 
         # Store result (partition is a scalar)
-        tl.store(out_ptr + batch_idx, partition)
+        tl.store(out_ptr + batch_idx_i64, partition)
 
     def _next_power_of_2(n):
         """Return the smallest power of 2 >= n."""
@@ -719,14 +781,14 @@ def semi_crf_triton_forward(
     optimal performance in both inference and training:
 
     - **Inference** (no gradients): Uses the custom Triton kernel for maximum
-      speed (~45x faster than naive PyTorch).
+      speed.
     - **Training** (with gradients): Uses ``torch.compile`` on the PyTorch
       implementation, which generates optimized Triton kernels for both forward
       AND backward passes automatically.
 
-    This hybrid approach gives you the best of both worlds: blazing fast inference
+    This hybrid approach gives you the best of both worlds: fast inference
     with the custom kernel, and efficient training with automatic backward
-    pass generation.
+    pass generation. However, torch.compile can be flaky at times.
 
     See :class:`~torch_semimarkov.SemiMarkov` for the full Semi-Markov CRF model
     with additional functionality like marginals and sampling.

@@ -56,7 +56,7 @@ def test_max_semiring_pytorch_matches_semimarkov():
 
     # Reference: SemiMarkov with MaxSemiring
     model = SemiMarkov(MaxSemiring)
-    ref, _ = model.logpartition(edge, lengths=lengths)
+    ref, _, _ = model.logpartition(edge, lengths=lengths)
 
     # Test: triton_scan with max semiring
     out = semi_crf_forward_pytorch(edge, lengths, semiring="max")
@@ -296,3 +296,110 @@ def test_triton_both_semirings_cuda_sequential():
 
     # Max should be <= Log for same inputs
     assert (result_max <= result_log + 1e-5).all(), "Max should be <= Log"
+
+
+# =============================================================================
+# Edge Case Tests (T=1, T=2, K=1)
+# =============================================================================
+
+
+def test_triton_scan_t2_minimal_sequence():
+    """Test with T=2 (minimal sequence, single transition)."""
+    torch.manual_seed(100)
+    batch, T, K, C = 2, 2, 3, 2
+    edge = torch.randn(batch, T - 1, K, C, C, requires_grad=True)
+    lengths = torch.full((batch,), T, dtype=torch.long)
+
+    out = semi_crf_triton_forward(edge, lengths)
+    ref = semi_crf_forward_pytorch(edge.detach(), lengths)
+
+    assert torch.allclose(out, ref, atol=1e-6), f"T=2: max diff {(out - ref).abs().max()}"
+    assert torch.isfinite(out).all(), "T=2: Non-finite output"
+
+    # Test gradients
+    out.sum().backward()
+    assert edge.grad is not None, "T=2: Should have gradients"
+    assert torch.isfinite(edge.grad).all(), "T=2: Non-finite gradients"
+
+
+def test_triton_scan_t2_max_semiring():
+    """Test T=2 with max semiring (Viterbi)."""
+    torch.manual_seed(101)
+    batch, T, K, C = 2, 2, 3, 2
+    edge = torch.randn(batch, T - 1, K, C, C, requires_grad=True)
+    lengths = torch.full((batch,), T, dtype=torch.long)
+
+    out_log = semi_crf_triton_forward(edge, lengths, semiring="log")
+    out_max = semi_crf_triton_forward(edge.detach(), lengths, semiring="max")
+
+    assert torch.isfinite(out_max).all(), "T=2 max: Non-finite output"
+    assert (out_max <= out_log + 1e-5).all(), "T=2: Max should be <= log"
+
+
+def test_triton_scan_k1_unit_segments():
+    """Test with K=1 (HMM-like behavior, only unit segments)."""
+    torch.manual_seed(102)
+    batch, T, K, C = 2, 10, 1, 3
+    edge = torch.randn(batch, T - 1, K, C, C, requires_grad=True)
+    lengths = torch.full((batch,), T, dtype=torch.long)
+
+    out = semi_crf_triton_forward(edge, lengths)
+    ref = semi_crf_forward_pytorch(edge.detach(), lengths)
+
+    assert torch.allclose(out, ref, atol=1e-6), f"K=1: max diff {(out - ref).abs().max()}"
+    assert torch.isfinite(out).all(), "K=1: Non-finite output"
+
+    # Test gradients
+    out.sum().backward()
+    assert edge.grad is not None, "K=1: Should have gradients"
+    assert torch.isfinite(edge.grad).all(), "K=1: Non-finite gradients"
+
+
+def test_triton_scan_k1_variable_lengths():
+    """Test K=1 with variable sequence lengths."""
+    torch.manual_seed(103)
+    batch, T, K, C = 3, 15, 1, 2
+    edge = torch.randn(batch, T - 1, K, C, C)
+    lengths = torch.tensor([15, 10, 5], dtype=torch.long)
+
+    out = semi_crf_triton_forward(edge, lengths)
+    ref = semi_crf_forward_pytorch(edge, lengths)
+
+    assert torch.allclose(
+        out, ref, atol=1e-6
+    ), f"K=1 var lengths: max diff {(out - ref).abs().max()}"
+
+
+def test_triton_scan_k1_max_semiring():
+    """Test K=1 with max semiring."""
+    torch.manual_seed(104)
+    batch, T, K, C = 2, 10, 1, 3
+    edge = torch.randn(batch, T - 1, K, C, C)
+    lengths = torch.full((batch,), T, dtype=torch.long)
+
+    out_log = semi_crf_triton_forward(edge, lengths, semiring="log")
+    out_max = semi_crf_triton_forward(edge, lengths, semiring="max")
+    ref_max = semi_crf_forward_pytorch(edge, lengths, semiring="max")
+
+    assert torch.allclose(
+        out_max, ref_max, atol=1e-6
+    ), f"K=1 max: max diff {(out_max - ref_max).abs().max()}"
+    assert (out_max <= out_log + 1e-5).all(), "K=1: Max should be <= log"
+
+
+def test_triton_scan_t2_k1_minimal():
+    """Test with both T=2 and K=1 (absolute minimum case)."""
+    torch.manual_seed(105)
+    batch, T, K, C = 2, 2, 1, 2
+    edge = torch.randn(batch, T - 1, K, C, C, requires_grad=True)
+    lengths = torch.full((batch,), T, dtype=torch.long)
+
+    out = semi_crf_triton_forward(edge, lengths)
+    ref = semi_crf_forward_pytorch(edge.detach(), lengths)
+
+    assert torch.allclose(out, ref, atol=1e-6), f"T=2,K=1: max diff {(out - ref).abs().max()}"
+
+    # Test gradients
+    out.sum().backward()
+    assert edge.grad is not None
+    assert torch.isfinite(edge.grad).all()

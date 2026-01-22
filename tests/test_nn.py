@@ -353,6 +353,9 @@ class TestSemiMarkovCRFHeadGPU:
             0, gpu_config["num_classes"], (gpu_config["batch"], gpu_config["T"])
         ).cuda()
 
+        # Retain grad since hidden_states becomes non-leaf after projection in compute_loss
+        hidden_states.retain_grad()
+
         loss = crf.compute_loss(hidden_states, lengths, labels, use_triton=True)
         loss.backward()
 
