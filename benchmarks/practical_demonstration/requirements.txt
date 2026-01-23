@@ -1,0 +1,15 @@
+# Core dependencies (should already be installed with torch-semimarkov)
+torch>=2.0
+numpy
+
+# Gencode benchmark
+pyfaidx>=0.7.0      # For parsing FASTA reference genomes
+
+# TIMIT benchmark  
+librosa>=0.10.0     # For audio feature extraction
+soundfile>=0.12.0   # For reading WAV files
+
+# Optional but recommended
+pandas>=2.0         # For data manipulation
+matplotlib>=3.7     # For visualization
+scipy>=1.10         # For calibration statistics (Spearman correlation)
