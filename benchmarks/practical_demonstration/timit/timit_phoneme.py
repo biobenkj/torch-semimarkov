@@ -1110,6 +1110,8 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    backend: str = "streaming",
+    use_triton: bool = True,
 ) -> float:
     """Train for one epoch."""
     model.train()
@@ -1122,9 +1124,7 @@ def train_epoch(
         lengths = batch["lengths"].to(device)
 
         optimizer.zero_grad()
-        # backend="exact" routes through SemiMarkov class (semimarkov.py)
-        # instead of streaming API - appropriate for T < 10K sequences
-        loss = model.compute_loss(features, lengths, labels, backend="exact")
+        loss = model.compute_loss(features, lengths, labels, backend=backend, use_triton=use_triton)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -1209,6 +1209,9 @@ def train_model(
     learning_rate: float = 1e-3,
     epochs: int = 50,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    backend: str = "streaming",
+    use_triton: bool = True,
+    log_every: int = 1,
 ) -> tuple[TIMITModel, TIMITMetrics]:
     """Train a model and return it with metrics."""
     device = torch.device(device)
@@ -1261,10 +1264,12 @@ def train_model(
     best_metrics = None
 
     for epoch in range(epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, device, backend=backend, use_triton=use_triton
+        )
         scheduler.step()
 
-        if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+        if (epoch + 1) % log_every == 0 or epoch == epochs - 1:
             test_metrics = evaluate(model, test_loader, device)
 
             logger.info(
@@ -1358,6 +1363,23 @@ def main():
     train_parser.add_argument("--epochs", type=int, default=50)
     train_parser.add_argument("--batch-size", type=int, default=32)
     train_parser.add_argument("--lr", type=float, default=1e-3)
+    train_parser.add_argument(
+        "--backend",
+        choices=["exact", "streaming", "auto"],
+        default="streaming",
+        help="CRF backend: exact (materialize edges), streaming (on-the-fly), auto (heuristic)",
+    )
+    train_parser.add_argument(
+        "--no-triton",
+        action="store_true",
+        help="Disable Triton kernels (use PyTorch reference implementation)",
+    )
+    train_parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Log metrics every N epochs (default: 1)",
+    )
 
     # Compare
     compare_parser = subparsers.add_parser("compare", help="Compare linear CRF vs semi-CRF")
@@ -1369,6 +1391,12 @@ def main():
     compare_parser.add_argument("--batch-size", type=int, default=32)
     compare_parser.add_argument(
         "--output-json", type=Path, default=None, help="Save results to JSON file"
+    )
+    compare_parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Log metrics every N epochs (default: 1)",
     )
 
     args = parser.parse_args()
@@ -1391,6 +1419,9 @@ def main():
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
+            backend=args.backend,
+            use_triton=not args.no_triton,
+            log_every=args.log_every,
         )
     elif args.command == "compare":
         results = compare_models(
@@ -1400,6 +1431,7 @@ def main():
             num_layers=args.num_layers,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            log_every=args.log_every,
         )
         if args.output_json:
             from datetime import datetime

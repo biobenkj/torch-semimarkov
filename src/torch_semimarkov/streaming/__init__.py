@@ -161,6 +161,7 @@ from .pytorch_reference import (
     semi_crf_streaming_backward_pytorch,
     semi_crf_streaming_forward_pytorch,
     semi_crf_streaming_marginals_pytorch,
+    semi_crf_streaming_viterbi_with_backpointers,
 )
 
 # Re-export HAS_TRITON for external checks
@@ -187,6 +188,7 @@ __all__ = [
     "semi_crf_streaming_forward_pytorch",
     "semi_crf_streaming_backward_pytorch",
     "semi_crf_streaming_marginals_pytorch",
+    "semi_crf_streaming_viterbi_with_backpointers",
     "compute_edge_block_streaming",
     # Utilities
     "_compute_checkpoint_interval",

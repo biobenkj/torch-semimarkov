@@ -273,6 +273,125 @@ def semi_crf_streaming_forward_pytorch(
     return partition, ring_checkpoints, checkpoint_interval
 
 
+def semi_crf_streaming_viterbi_with_backpointers(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    duration_bias: torch.Tensor,
+    lengths: torch.Tensor,
+    K: int,
+    proj_start: Optional[torch.Tensor] = None,
+    proj_end: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Viterbi forward pass with backpointer tracking for traceback.
+
+    Computes the maximum-scoring path using the max semiring and tracks
+    backpointers for efficient O(T) traceback (instead of O(T*K) recomputation).
+
+    Args:
+        cum_scores (Tensor): Cumulative projected scores of shape
+            :math:`(\text{batch}, T+1, C)`.
+        transition (Tensor): Label transition scores of shape :math:`(C, C)` or
+            :math:`(K, C, C)` for duration-dependent transitions.
+        duration_bias (Tensor): Duration-specific label bias of shape :math:`(K, C)`.
+        lengths (Tensor): Sequence lengths of shape :math:`(\text{batch},)`.
+        K (int): Maximum segment duration.
+        proj_start (Tensor, optional): Start boundary scores.
+        proj_end (Tensor, optional): End boundary scores.
+
+    Returns:
+        tuple: (viterbi_scores, bp_k, bp_c, final_labels) where:
+            - viterbi_scores: Best scores of shape (batch,)
+            - bp_k: Backpointer durations of shape (batch, T, C)
+            - bp_c: Backpointer source labels of shape (batch, T, C)
+            - final_labels: Best final label for each batch of shape (batch,)
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Ring buffer for alpha values: (batch, K, C)
+    alpha_ring = torch.full((batch, K, C), NEG_INF, device=device, dtype=dtype)
+    alpha_ring[:, 0, :] = 0.0  # Initial: all labels equally likely
+
+    # Backpointer storage: (batch, T, C) - stores best (k, c_src) for each (t, c_dest)
+    bp_k = torch.zeros((batch, T, C), dtype=torch.long, device=device)
+    bp_c = torch.zeros((batch, T, C), dtype=torch.long, device=device)
+
+    # Track final alpha for variable lengths
+    final_alpha = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+
+    # Main forward loop
+    for t in range(1, T + 1):
+        active_mask = t <= lengths
+        k_eff = min(K - 1, t)
+
+        # Collect scores for all valid durations
+        scores_list = []
+        k_indices = []
+
+        for k in range(1, max(k_eff + 1, 2)):
+            start = t - k
+            ring_idx = start % K
+            alpha_prev = alpha_ring[:, ring_idx, :]  # (batch, C_src)
+
+            # Compute edge block on-the-fly
+            edge_block = compute_edge_block_streaming(
+                cum_scores, transition, duration_bias, start, k, proj_start, proj_end
+            )  # (batch, C_dest, C_src)
+
+            # scores[c_dest, c_src] = alpha_prev[c_src] + edge[c_dest, c_src]
+            scores = alpha_prev.unsqueeze(-2) + edge_block  # (batch, C_dest, C_src)
+            scores_list.append(scores)
+            k_indices.append(k)
+
+        # Stack: (batch, num_k, C_dest, C_src)
+        scores_stacked = torch.stack(scores_list, dim=1)
+
+        # First: max over c_src -> (batch, num_k, C_dest) + argmax
+        scores_over_src, best_c_src_per_k = torch.max(scores_stacked, dim=-1)
+
+        # Second: max over k -> (batch, C_dest) + argmax
+        alpha_t, best_k_idx = torch.max(scores_over_src, dim=1)
+
+        # Convert k_idx to actual k value and get corresponding c_src
+        # best_k_idx is index into k_indices list (0 to num_k-1)
+        # We need to gather the c_src from best_c_src_per_k using best_k_idx
+        k_values = torch.tensor(k_indices, device=device, dtype=torch.long)
+        best_k = k_values[best_k_idx]  # (batch, C_dest)
+
+        # Gather best c_src: need to index best_c_src_per_k[b, best_k_idx[b, c], c]
+        # best_c_src_per_k: (batch, num_k, C)
+        # best_k_idx: (batch, C)
+        batch_idx = torch.arange(batch, device=device).unsqueeze(1).expand(-1, C)
+        c_idx = torch.arange(C, device=device).unsqueeze(0).expand(batch, -1)
+        best_c_src = best_c_src_per_k[batch_idx, best_k_idx, c_idx]  # (batch, C)
+
+        # Store backpointers (t-1 because bp arrays are 0-indexed for positions 0..T-1)
+        # Position t in the loop corresponds to segments ending at t-1
+        if t <= T:
+            bp_k[:, t - 1, :] = torch.where(active_mask.view(batch, 1), best_k, bp_k[:, t - 1, :])
+            bp_c[:, t - 1, :] = torch.where(
+                active_mask.view(batch, 1), best_c_src, bp_c[:, t - 1, :]
+            )
+
+        # Update ring buffer
+        ring_idx_t = t % K
+        alpha_ring[:, ring_idx_t, :] = torch.where(
+            active_mask.view(batch, 1), alpha_t, alpha_ring[:, ring_idx_t, :]
+        )
+
+        # Track final alpha
+        is_final = t == lengths
+        if is_final.any():
+            final_alpha = torch.where(is_final.view(batch, 1), alpha_t, final_alpha)
+
+    # Compute Viterbi scores and best final labels
+    viterbi_scores, final_labels = torch.max(final_alpha, dim=-1)
+
+    return viterbi_scores, bp_k, bp_c, final_labels
+
+
 def semi_crf_streaming_backward_pytorch(
     cum_scores: torch.Tensor,
     transition: torch.Tensor,

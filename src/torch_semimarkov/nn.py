@@ -30,7 +30,10 @@ from torch import Tensor
 
 from .duration import DurationDistribution, LearnedDuration, create_duration_distribution
 from .helpers import Segment, ViterbiResult, score_gold_vectorized
-from .streaming import semi_crf_streaming_forward
+from .streaming import (
+    semi_crf_streaming_forward,
+    semi_crf_streaming_viterbi_with_backpointers,
+)
 from .streaming.constants import NEG_INF
 from .streaming.pytorch_reference import compute_edge_block_streaming
 from .validation import (
@@ -620,8 +623,9 @@ class SemiMarkovCRFHead(nn.Module):
         hidden_states: Tensor,
         lengths: Tensor,
         max_traceback_length: int = 10000,
+        use_triton: bool = True,
     ) -> ViterbiResult:
-        r"""decode_with_traceback(hidden_states, lengths, max_traceback_length=10000) -> ViterbiResult
+        r"""decode_with_traceback(hidden_states, lengths, max_traceback_length=10000, use_triton=True) -> ViterbiResult
 
         Decode best segmentation with full path reconstruction.
 
@@ -635,6 +639,8 @@ class SemiMarkovCRFHead(nn.Module):
             max_traceback_length (int, optional): Maximum sequence length for
                 traceback. Sequences longer than this will have empty segment
                 lists (score is still computed). Default: ``10000``
+            use_triton (bool, optional): Whether to use Triton kernels for the
+                forward pass. Default: ``True``
 
         Returns:
             ViterbiResult: Named tuple containing:
@@ -677,38 +683,42 @@ class SemiMarkovCRFHead(nn.Module):
         cum_scores = torch.zeros(batch, T + 1, self.num_classes, dtype=torch.float32, device=device)
         cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
-        # Get max scores using streaming API
-        max_scores = semi_crf_streaming_forward(
-            cum_scores,
-            self.transition,
-            self.duration_bias,
-            lengths,
-            self.max_duration,
-            semiring="max",
-            use_triton=False,  # Use PyTorch for traceback compatibility
-        )
+        # Check which sequences need traceback
+        needs_traceback = lengths <= max_traceback_length
+        any_needs_traceback = needs_traceback.any().item()
 
-        # Perform traceback for each sequence
-        all_segments: list[list[Segment]] = []
-
-        for b in range(batch):
-            seq_len = lengths[b].item()
-
-            # Skip traceback for very long sequences
-            if seq_len > max_traceback_length:
-                all_segments.append([])
-                continue
-
-            if seq_len == 0:
-                all_segments.append([])
-                continue
-
-            # Run forward pass with backpointer storage for this sequence
-            segments = self._traceback_single(
-                cum_scores[b : b + 1],
-                seq_len,
+        # Use fast backpointer-based traceback when possible
+        if any_needs_traceback:
+            # Get max scores AND backpointers in a single forward pass
+            max_scores, bp_k, bp_c, final_labels = semi_crf_streaming_viterbi_with_backpointers(
+                cum_scores,
+                self.transition,
+                self.duration_bias,
+                lengths,
+                self.max_duration,
             )
-            all_segments.append(segments)
+
+            # Fast O(T) traceback using backpointers
+            all_segments = self._traceback_from_backpointers(
+                bp_k, bp_c, final_labels, lengths, cum_scores
+            )
+
+            # Clear segments for sequences that exceeded max_traceback_length
+            for b in range(batch):
+                if lengths[b].item() > max_traceback_length:
+                    all_segments[b] = []
+        else:
+            # No sequences need traceback - just compute scores
+            max_scores = semi_crf_streaming_forward(
+                cum_scores,
+                self.transition,
+                self.duration_bias,
+                lengths,
+                self.max_duration,
+                semiring="max",
+                use_triton=use_triton,
+            )
+            all_segments = [[] for _ in range(batch)]
 
         return ViterbiResult(scores=max_scores, segments=all_segments)
 
@@ -811,6 +821,72 @@ class SemiMarkovCRFHead(nn.Module):
         # Reverse to get segments in order
         segments.reverse()
         return segments
+
+    def _traceback_from_backpointers(
+        self,
+        bp_k: Tensor,
+        bp_c: Tensor,
+        final_labels: Tensor,
+        lengths: Tensor,
+        cum_scores: Tensor,
+    ) -> list[list[Segment]]:
+        r"""Fast traceback using pre-computed backpointers.
+
+        This method performs O(T) traceback instead of O(T*K) recomputation
+        by using backpointers computed during the forward pass.
+
+        Args:
+            bp_k (Tensor): Backpointer durations of shape (batch, T, C).
+            bp_c (Tensor): Backpointer source labels of shape (batch, T, C).
+            final_labels (Tensor): Best final label for each batch of shape (batch,).
+            lengths (Tensor): Sequence lengths of shape (batch,).
+            cum_scores (Tensor): Cumulative scores for segment score computation.
+
+        Returns:
+            list[list[Segment]]: Per-batch segment lists.
+        """
+        batch = lengths.shape[0]
+        all_segments: list[list[Segment]] = []
+
+        for b in range(batch):
+            seq_len = lengths[b].item()
+            segments: list[Segment] = []
+
+            if seq_len == 0:
+                all_segments.append(segments)
+                continue
+
+            t = seq_len
+            c = final_labels[b].item()
+
+            while t > 0:
+                # bp_k and bp_c are 0-indexed: position t corresponds to index t-1
+                k = bp_k[b, t - 1, c].item()
+                c_prev = bp_c[b, t - 1, c].item()
+
+                if k == 0:
+                    # Safety check - shouldn't happen with proper forward pass
+                    break
+
+                start = t - k
+                end = t - 1  # Segment is [start, end] inclusive
+
+                # Compute segment score
+                # Always include transition, even for first segment - the forward pass
+                # computes: max_{c_src} [alpha[0, c_src] + segment_score + transition[c_src, c_dest]]
+                # where alpha[0, c_src] = 0, so transition from c_prev is part of the score
+                seg_score = self._compute_segment_score(cum_scores[b], start, end, c, c_prev)
+
+                segments.append(Segment(start=start, end=end, label=c, score=seg_score))
+
+                t = start
+                c = c_prev
+
+            # Reverse to get segments in order
+            segments.reverse()
+            all_segments.append(segments)
+
+        return all_segments
 
     def _compute_segment_score(
         self,
