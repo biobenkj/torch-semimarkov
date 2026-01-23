@@ -290,9 +290,12 @@ class UncertaintyMixin:
 
         # Cumulative scores for content computation
         # Zero-center before cumsum to match streaming preprocessing
-        scores_centered = scores.float() - scores.float().mean(dim=1, keepdim=True)
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(batch, T + 1, C, dtype=torch.float32, device=scores.device)
-        cum_scores[:, 1:] = torch.cumsum(scores_centered, dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         # Build edge tensor with T positions (streaming can access positions 0 to T-1)
         edge = torch.full(
@@ -467,8 +470,9 @@ class UncertaintyMixin:
 
         # Compute entropy using EntropySemiring
         # Force linear scan - binary tree algorithm has numerical issues with EntropySemiring
+        # Edge tensor has T positions, SemiMarkov expects N=T+1, so pass lengths+1
         model = SemiMarkov(EntropySemiring)
-        entropy = model.sum(edge, lengths=lengths, use_linear_scan=True)
+        entropy = model.sum(edge, lengths=lengths + 1, use_linear_scan=True)
 
         return entropy
 
@@ -811,11 +815,14 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
 
         # Build cumulative scores for prefix-sum edge retrieval
         # Zero-center before cumsum to prevent magnitude drift at long sequences
-        scores_centered = scores.float() - scores.float().mean(dim=1, keepdim=True)
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float32, device=scores.device
         )
-        cum_scores[:, 1:] = torch.cumsum(scores_centered, dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         if backend_type == "streaming":
             # Compute partition function via streaming algorithm
@@ -963,10 +970,15 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         else:
             raise ValueError(f"Unknown backend: {backend}. Use 'auto', 'streaming', or 'exact'.")
 
+        # Zero-center before cumsum to prevent magnitude drift at long sequences
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float32, device=scores.device
         )
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         if backend_type == "streaming":
             max_score = semi_crf_streaming_forward(
@@ -1021,8 +1033,13 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         else:
             scores = hidden_states
 
+        # Zero-center before cumsum to prevent magnitude drift at long sequences
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(batch, T + 1, self.num_classes, dtype=torch.float32, device=device)
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         max_scores = semi_crf_streaming_forward(
             cum_scores,
@@ -1165,7 +1182,7 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         content = (cum_scores[end + 1, label] - cum_scores[start, label]).item()
 
         duration = end - start + 1
-        dur_idx = min(duration, self.max_duration) - 1
+        dur_idx = min(duration, self.max_duration - 1)  # Clamp to valid range
         dur_bias = self.duration_bias[dur_idx, label].item()
 
         trans = 0.0

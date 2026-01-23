@@ -273,8 +273,13 @@ class SemiMarkovCRFHead(nn.Module):
         K = self.max_duration
 
         # Cumulative scores for content computation
+        # Zero-center before cumsum to match streaming preprocessing
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(batch, T + 1, C, dtype=torch.float32, device=scores.device)
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         # Build edge tensor with T positions (streaming can access positions 0 to T-1)
         edge = torch.full(
@@ -388,10 +393,15 @@ class SemiMarkovCRFHead(nn.Module):
 
         # Build cumulative scores for prefix-sum edge retrieval
         # CRITICAL: Use float32 for numerical stability at T > 100K
+        # Zero-center before cumsum to prevent magnitude drift at long sequences
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float32, device=scores.device
         )
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         if backend_type == "streaming":
             # Compute partition function via streaming algorithm
@@ -544,10 +554,15 @@ class SemiMarkovCRFHead(nn.Module):
             raise ValueError(f"Unknown backend: {backend}. Use 'auto', 'streaming', or 'exact'.")
 
         # Build cumulative scores
+        # Zero-center before cumsum to prevent magnitude drift at long sequences
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float32, device=scores.device
         )
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         if backend_type == "streaming":
             # Use max semiring for Viterbi
@@ -612,8 +627,13 @@ class SemiMarkovCRFHead(nn.Module):
             scores = hidden_states
 
         # Build cumulative scores
+        # Zero-center before cumsum to prevent magnitude drift at long sequences
+        # Skip for T=1 since mean of single value zeros out content scores
+        scores_float = scores.float()
+        if T > 1:
+            scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(batch, T + 1, self.num_classes, dtype=torch.float32, device=device)
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
         # Get max scores using streaming API
         max_scores = semi_crf_streaming_forward(
