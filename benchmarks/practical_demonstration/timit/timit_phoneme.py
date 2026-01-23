@@ -678,16 +678,69 @@ def preprocess_timit(
 # =============================================================================
 
 
+def compute_normalization_stats(data_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute per-dimension mean and std from training data.
+
+    Args:
+        data_path: Path to JSONL data file
+
+    Returns:
+        mean: (feature_dim,) array of per-dimension means
+        std: (feature_dim,) array of per-dimension standard deviations
+    """
+    all_features = []
+    with open(data_path) as f:
+        for line in f:
+            utt = json.loads(line)
+            features = np.array(utt["features"], dtype=np.float32)
+            all_features.append(features)
+
+    all_features = np.concatenate(all_features, axis=0)
+    mean = all_features.mean(axis=0)
+    std = all_features.std(axis=0)
+    # Avoid division by zero for constant features
+    std = np.maximum(std, 1e-8)
+    return mean, std
+
+
 class TIMITDataset(Dataset):
     """Dataset for TIMIT phoneme segmentation."""
 
-    def __init__(self, data_path: Path, max_length: int | None = None):
+    def __init__(
+        self,
+        data_path: Path,
+        max_length: int | None = None,
+        normalize: bool = True,
+        mean: np.ndarray | None = None,
+        std: np.ndarray | None = None,
+    ):
+        """
+        Initialize TIMIT dataset.
+
+        Args:
+            data_path: Path to JSONL data file
+            max_length: Optional maximum sequence length (truncates longer sequences)
+            normalize: Whether to apply z-score normalization to features
+            mean: Pre-computed per-dimension means (if None and normalize=True, computed from data)
+            std: Pre-computed per-dimension stds (if None and normalize=True, computed from data)
+        """
         self.max_length = max_length
+        self.normalize = normalize
+        self.mean = mean
+        self.std = std
         self.utterances = []
 
         with open(data_path) as f:
             for line in f:
                 self.utterances.append(json.loads(line))
+
+        # Compute stats from this dataset if not provided and normalization is requested
+        if self.normalize and self.mean is None:
+            logger.info("Computing normalization statistics from data...")
+            self.mean, self.std = compute_normalization_stats(data_path)
+            logger.info(f"  Mean range: [{self.mean.min():.2f}, {self.mean.max():.2f}]")
+            logger.info(f"  Std range: [{self.std.min():.2f}, {self.std.max():.2f}]")
 
         logger.info(f"Loaded {len(self.utterances)} utterances from {data_path}")
 
@@ -699,6 +752,10 @@ class TIMITDataset(Dataset):
 
         features = np.array(utt["features"], dtype=np.float32)
         labels = np.array(utt["labels"], dtype=np.int64)
+
+        # Apply z-score normalization
+        if self.normalize and self.mean is not None:
+            features = (features - self.mean) / self.std
 
         # Truncate if needed
         if self.max_length and len(features) > self.max_length:
@@ -727,11 +784,11 @@ def collate_timit(batch: list[dict]) -> dict[str, Tensor]:
         lab = b["labels"]
         seq_len = b["length"].item()
 
-        # Pad
+        # Pad (use 0 for labels since CRF ignores positions beyond lengths)
         if seq_len < max_len:
             pad_len = max_len - seq_len
             feat = F.pad(feat, (0, 0, 0, pad_len))
-            lab = F.pad(lab, (0, pad_len), value=-100)
+            lab = F.pad(lab, (0, pad_len), value=0)
 
         features.append(feat)
         labels.append(lab)
@@ -822,10 +879,27 @@ class TIMITModel(nn.Module):
         return self.crf(hidden, lengths)
 
     def compute_loss(
-        self, features: Tensor, lengths: Tensor, labels: Tensor, use_streaming: bool = False
+        self,
+        features: Tensor,
+        lengths: Tensor,
+        labels: Tensor,
+        backend: str = "exact",
+        use_triton: bool = False,
     ) -> Tensor:
+        """
+        Compute NLL loss for phoneme segmentation.
+
+        Args:
+            features: Input features (batch, T, input_dim)
+            lengths: Sequence lengths (batch,)
+            labels: Per-position labels (batch, T)
+            backend: "exact", "streaming", or "auto"
+            use_triton: Whether to use Triton kernels (streaming only)
+        """
         hidden = self.encoder(features)
-        return self.crf.compute_loss(hidden, lengths, labels, use_streaming=use_streaming)
+        return self.crf.compute_loss(
+            hidden, lengths, labels, backend=backend, use_triton=use_triton
+        )
 
     def decode(self, features: Tensor, lengths: Tensor):
         hidden = self.encoder(features)
@@ -1048,9 +1122,9 @@ def train_epoch(
         lengths = batch["lengths"].to(device)
 
         optimizer.zero_grad()
-        # use_streaming=False routes through SemiMarkov class (semimarkov.py)
+        # backend="exact" routes through SemiMarkov class (semimarkov.py)
         # instead of streaming API - appropriate for T < 10K sequences
-        loss = model.compute_loss(features, lengths, labels, use_streaming=False)
+        loss = model.compute_loss(features, lengths, labels, backend="exact")
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -1139,9 +1213,17 @@ def train_model(
     """Train a model and return it with metrics."""
     device = torch.device(device)
 
-    # Load data
-    train_dataset = TIMITDataset(data_dir / "train.jsonl")
-    test_dataset = TIMITDataset(data_dir / "test.jsonl")
+    # Load data with normalization
+    # Training dataset computes normalization stats from its own data
+    train_dataset = TIMITDataset(data_dir / "train.jsonl", normalize=True)
+
+    # Test dataset uses training stats to ensure consistent normalization
+    test_dataset = TIMITDataset(
+        data_dir / "test.jsonl",
+        normalize=True,
+        mean=train_dataset.mean,
+        std=train_dataset.std,
+    )
 
     # Determine feature dimension from first sample
     sample = train_dataset[0]
