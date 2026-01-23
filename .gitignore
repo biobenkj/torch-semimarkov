@@ -79,3 +79,6 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# internal docs
+.triton_docs

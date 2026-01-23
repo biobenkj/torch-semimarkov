@@ -1373,13 +1373,10 @@ def evaluate(
             all_predictions.append(pred_labels)
             all_references.append(ref_labels)
 
-            if is_pytorch_crf:
-                # Convert frame-level predictions to segments for segment metrics
-                pred_segs = labels_to_segments(pred_labels)
-            else:
-                pred_segs = [
-                    SegmentAnnotation(s.start, s.end + 1, s.label) for s in result.segments[i]
-                ]
+            # Both paths use labels_to_segments for consistent segment merging
+            # This ensures consecutive frames with the same label are merged into single segments
+            # (critical for K=1 semimarkov which returns per-frame segments from Viterbi)
+            pred_segs = labels_to_segments(pred_labels)
             true_segs = labels_to_segments(ref_labels)
 
             all_pred_segments.append(pred_segs)

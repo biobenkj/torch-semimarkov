@@ -694,8 +694,10 @@ class SemiMarkovCRFHead(nn.Module):
 
         # Use fast backpointer-based traceback when possible
         if any_needs_traceback:
-            # Determine if we can use Triton (GPU path)
-            can_use_triton = HAS_TRITON and use_triton and cum_scores.is_cuda
+            # NOTE: Triton backpointer kernel disabled due to memory corruption bug
+            # that causes NaN in subsequent training forward passes (see commit 256db2a).
+            # Using PyTorch reference implementation until root cause is fixed.
+            can_use_triton = False
 
             # Get max scores AND backpointers in a single forward pass
             if can_use_triton:
