@@ -42,6 +42,12 @@ from .streaming.pytorch_reference import compute_edge_block_streaming
 
 # Re-export uncertainty module for convenience
 from .uncertainty import UncertaintyMixin, UncertaintySemiMarkovCRFHead
+from .validation import (
+    validate_device_consistency,
+    validate_hidden_states,
+    validate_labels,
+    validate_lengths,
+)
 
 __all__ = [
     "SemiMarkovCRFHead",
@@ -388,6 +394,11 @@ class SemiMarkovCRFHead(nn.Module):
             - **cum_scores** (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`
               for loss computation.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
 
         # Project to label space if needed
@@ -471,6 +482,14 @@ class SemiMarkovCRFHead(nn.Module):
             Tensor: NLL loss. Scalar if reduction is ``"mean"`` or ``"sum"``,
             shape :math:`(\text{batch},)` if ``"none"``.
         """
+        # Validate labels (hidden_states and lengths validated in forward())
+        validate_labels(
+            labels,
+            self.num_classes,
+            batch_size=hidden_states.shape[0],
+            seq_length=hidden_states.shape[1],
+        )
+
         result = self.forward(hidden_states, lengths, use_triton, backend)
         partition = result["partition"]
         cum_scores = result["cum_scores"]
@@ -550,6 +569,11 @@ class SemiMarkovCRFHead(nn.Module):
             segmentation path, use the :class:`~torch_semimarkov.SemiMarkov` class
             with :class:`~torch_semimarkov.semirings.MaxSemiring` and extract via marginals.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
 
         # Project to label space if needed
@@ -632,6 +656,11 @@ class SemiMarkovCRFHead(nn.Module):
             >>> for seg in result.segments[0]:
             ...     print(f"  [{seg.start}, {seg.end}] label={seg.label}")
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
         device = hidden_states.device
 

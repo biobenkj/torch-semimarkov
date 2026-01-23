@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 
+from ..validation import validate_cum_scores, validate_lengths
 from .pytorch_reference import (
     semi_crf_streaming_backward_pytorch,
     semi_crf_streaming_forward_pytorch,
@@ -361,6 +362,12 @@ def semi_crf_streaming_forward(
     """
     if semiring not in ("log", "max"):
         raise ValueError(f"semiring must be 'log' or 'max', got {semiring!r}")
+
+    # Input validation
+    validate_cum_scores(cum_scores)
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    validate_lengths(lengths, T, batch_size=batch)
 
     # Check if Triton is available and applicable
     # Note: As of Phase 4B, Triton kernels now support boundary projections

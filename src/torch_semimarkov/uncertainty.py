@@ -31,6 +31,12 @@ from .helpers import Segment, ViterbiResult, score_gold_vectorized
 from .streaming import semi_crf_streaming_forward
 from .streaming.constants import NEG_INF
 from .streaming.pytorch_reference import compute_edge_block_streaming
+from .validation import (
+    validate_device_consistency,
+    validate_hidden_states,
+    validate_labels,
+    validate_lengths,
+)
 
 
 class UncertaintyMixin:
@@ -92,6 +98,11 @@ class UncertaintyMixin:
         Returns:
             Tensor: Boundary probabilities of shape :math:`(\text{batch}, T)`.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         _, T, _ = hidden_states.shape
 
         # Backward compatibility: map use_streaming to backend
@@ -339,6 +350,11 @@ class UncertaintyMixin:
         Returns:
             Tensor: Label probabilities of shape :math:`(\text{batch}, T, C)`.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
 
         # Project to label space
@@ -457,6 +473,11 @@ class UncertaintyMixin:
         from .semimarkov import SemiMarkov
         from .semirings import EntropySemiring
 
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
 
         # Project to label space
@@ -519,6 +540,14 @@ class UncertaintyMixin:
         Returns:
             Tensor: Weighted NLL loss.
         """
+        # Input validation (hidden_states/lengths validated in called methods)
+        validate_labels(
+            labels,
+            self.num_classes,
+            batch_size=hidden_states.shape[0],
+            seq_length=hidden_states.shape[1],
+        )
+
         # First pass: compute uncertainty (no gradients needed)
         with torch.no_grad():
             if focus_mode == "high_uncertainty":
@@ -810,6 +839,11 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
             - **partition** (Tensor): Log partition function of shape :math:`(\text{batch},)`.
             - **cum_scores** (Tensor): Cumulative scores of shape :math:`(\text{batch}, T+1, C)`.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
 
         # Project to label space if needed
@@ -891,6 +925,14 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
             Tensor: NLL loss. Scalar if reduction is ``"mean"`` or ``"sum"``,
             shape :math:`(\text{batch},)` if ``"none"``.
         """
+        # Validate labels (hidden_states and lengths validated in forward())
+        validate_labels(
+            labels,
+            self.num_classes,
+            batch_size=hidden_states.shape[0],
+            seq_length=hidden_states.shape[1],
+        )
+
         result = self.forward(hidden_states, lengths, use_triton, backend)
         partition = result["partition"]
         cum_scores = result["cum_scores"]
@@ -968,6 +1010,11 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
         Returns:
             Tensor: Best score (max over all segmentations) of shape :math:`(\text{batch},)`.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
 
         if self.projection is not None:
@@ -1040,6 +1087,11 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
             O(T × C) memory which may not be feasible. In such cases, the returned
             segments list will be empty but scores are still computed.
         """
+        # Input validation
+        validate_hidden_states(hidden_states)
+        validate_lengths(lengths, hidden_states.shape[1], batch_size=hidden_states.shape[0])
+        validate_device_consistency(hidden_states, lengths, names=["hidden_states", "lengths"])
+
         batch, T, _ = hidden_states.shape
         device = hidden_states.device
 

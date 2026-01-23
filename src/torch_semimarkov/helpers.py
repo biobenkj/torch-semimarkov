@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 
 from .semirings import LogSemiring
+from .validation import validate_cum_scores, validate_labels, validate_lengths
 
 
 @dataclass
@@ -424,8 +425,13 @@ def score_gold_vectorized(
     See Also:
         :meth:`~torch_semimarkov.nn.SemiMarkovCRFHead.compute_loss`: Uses this for NLL computation
     """
+    # Input validation
+    validate_cum_scores(cum_scores)
     batch, T_plus_1, C = cum_scores.shape
     T = T_plus_1 - 1
+    validate_labels(labels, C, batch_size=batch, seq_length=T)
+    validate_lengths(lengths, T, batch_size=batch)
+
     device = cum_scores.device
     dtype = cum_scores.dtype
 
