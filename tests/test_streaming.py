@@ -5,6 +5,8 @@ The streaming API computes edge potentials on-the-fly from cumulative scores,
 enabling memory-efficient inference at chromosome scale (T=400K+).
 """
 
+import warnings
+
 import pytest
 import torch
 
@@ -242,13 +244,16 @@ class TestGradientCorrectness:
             return semi_crf_streaming_forward(cs, tr, db, lengths, K)
 
         # Use smaller epsilon for better numerical stability
-        torch.autograd.gradcheck(
-            func,
-            (cum_scores, transition, duration_bias),
-            eps=1e-4,
-            atol=1e-3,
-            rtol=1e-3,
-        )
+        # Suppress float32 warning since gradcheck requires float64
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="cum_scores should be float32")
+            torch.autograd.gradcheck(
+                func,
+                (cum_scores, transition, duration_bias),
+                eps=1e-4,
+                atol=1e-3,
+                rtol=1e-3,
+            )
 
     def test_gradient_sum_property(self):
         """Verify marginal probabilities sum to approximately 1 per position."""
@@ -331,13 +336,16 @@ class TestK1HMMLike:
         def func(cs, tr, db):
             return semi_crf_streaming_forward(cs, tr, db, lengths, K)
 
-        torch.autograd.gradcheck(
-            func,
-            (cum_scores, transition, duration_bias),
-            eps=1e-4,
-            atol=1e-3,
-            rtol=1e-3,
-        )
+        # Suppress float32 warning since gradcheck requires float64
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="cum_scores should be float32")
+            torch.autograd.gradcheck(
+                func,
+                (cum_scores, transition, duration_bias),
+                eps=1e-4,
+                atol=1e-3,
+                rtol=1e-3,
+            )
 
 
 class TestNumericalStability:
