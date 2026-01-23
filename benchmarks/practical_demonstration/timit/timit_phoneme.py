@@ -1157,6 +1157,71 @@ def compute_segment_metrics(
     }
 
 
+def compute_duration_stats(
+    pred_segments: list[list[SegmentAnnotation]],
+    true_segments: list[list[SegmentAnnotation]],
+) -> dict[str, dict[str, float]]:
+    """
+    Compute per-phoneme duration statistics for predictions vs references.
+
+    Returns dict with:
+        - per_phone: {phone_name: {pred_mean, pred_std, ref_mean, ref_std, mae, count}}
+        - overall: {mean_absolute_error, correlation}
+    """
+    pred_durations = defaultdict(list)
+    ref_durations = defaultdict(list)
+
+    for pred_segs, ref_segs in zip(pred_segments, true_segments, strict=False):
+        for seg in pred_segs:
+            pred_durations[seg.label].append(seg.end - seg.start)
+        for seg in ref_segs:
+            ref_durations[seg.label].append(seg.end - seg.start)
+
+    per_phone = {}
+    all_pred_means = []
+    all_ref_means = []
+
+    for label in range(NUM_PHONES):
+        phone_name = PHONES_39[label]
+        pred_d = np.array(pred_durations[label]) if pred_durations[label] else np.array([0])
+        ref_d = np.array(ref_durations[label]) if ref_durations[label] else np.array([0])
+
+        pred_mean = float(np.mean(pred_d))
+        ref_mean = float(np.mean(ref_d))
+
+        per_phone[phone_name] = {
+            "pred_mean": pred_mean,
+            "pred_std": float(np.std(pred_d)),
+            "ref_mean": ref_mean,
+            "ref_std": float(np.std(ref_d)),
+            "mae": abs(pred_mean - ref_mean),
+            "pred_count": len(pred_durations[label]),
+            "ref_count": len(ref_durations[label]),
+        }
+
+        if ref_durations[label]:  # Only include phones that appear in reference
+            all_pred_means.append(pred_mean)
+            all_ref_means.append(ref_mean)
+
+    # Overall correlation between predicted and reference mean durations
+    if len(all_pred_means) > 1:
+        correlation = float(np.corrcoef(all_pred_means, all_ref_means)[0, 1])
+    else:
+        correlation = 0.0
+
+    overall_mae = float(
+        np.mean([abs(p - r) for p, r in zip(all_pred_means, all_ref_means, strict=True)])
+    )
+
+    return {
+        "per_phone": per_phone,
+        "overall": {
+            "mean_absolute_error": overall_mae,
+            "duration_correlation": correlation,
+        },
+    }
+
+
 def labels_to_segments(labels: list[int]) -> list[SegmentAnnotation]:
     """Convert label sequence to segments."""
     if not labels:
@@ -1188,6 +1253,8 @@ class TIMITMetrics:
     segment_precision: float
     segment_recall: float
     segment_f1: float
+    # Duration analysis
+    duration_stats: dict | None = None
     # Timing metrics (optional, set during training)
     training_time_per_epoch: float = 0.0  # seconds
     total_training_time: float = 0.0  # seconds
@@ -1195,7 +1262,7 @@ class TIMITMetrics:
 
     def to_dict(self) -> dict:
         """Convert metrics to JSON-serializable dict."""
-        return {
+        result = {
             "phone_error_rate": self.phone_error_rate,
             "boundary_precision": self.boundary_precision,
             "boundary_recall": self.boundary_recall,
@@ -1208,6 +1275,9 @@ class TIMITMetrics:
             "total_training_time": self.total_training_time,
             "inference_time": self.inference_time,
         }
+        if self.duration_stats:
+            result["duration_stats"] = self.duration_stats
+        return result
 
 
 # =============================================================================
@@ -1320,6 +1390,7 @@ def evaluate(
     per = compute_phone_error_rate(all_predictions, all_references)
     boundary_metrics = compute_boundary_metrics(all_predictions, all_references)
     segment_metrics = compute_segment_metrics(all_pred_segments, all_true_segments)
+    duration_stats = compute_duration_stats(all_pred_segments, all_true_segments)
 
     metrics = TIMITMetrics(
         phone_error_rate=per,
@@ -1334,6 +1405,7 @@ def evaluate(
         segment_precision=segment_metrics["segment_precision"],
         segment_recall=segment_metrics["segment_recall"],
         segment_f1=segment_metrics["segment_f1"],
+        duration_stats=duration_stats,
     )
     return metrics, elapsed
 
@@ -1452,6 +1524,105 @@ def train_model(
     return model, best_metrics
 
 
+def _print_duration_analysis(results: dict, has_pytorch_crf: bool = False):
+    """Print duration distribution analysis comparing models."""
+    print("\n" + "=" * 60)
+    print("DURATION ANALYSIS (frames @ 10ms)")
+    print("=" * 60)
+    print("\nThis shows how well each model captures phoneme duration patterns.")
+    print("Lower MAE = better duration modeling. Semi-CRF should excel here.\n")
+
+    # Get reference durations from any model (they're all the same)
+    ref_model = "semi_crf"
+    ref_stats = results[ref_model].duration_stats["per_phone"]
+
+    # Select phones to display (most frequent + phonetically interesting)
+    # Prioritize: vowels (long), stops (short), fricatives (medium)
+    interesting_phones = ["aa", "iy", "eh", "ah", "p", "t", "k", "s", "sh", "n", "l", "sil"]
+    display_phones = [p for p in interesting_phones if ref_stats[p]["ref_count"] > 50]
+
+    if has_pytorch_crf:
+        print(
+            f"{'Phone':<6} {'Ref':>6} {'p-crf':>6} {'K=1':>6} {'Semi':>6} │ {'MAE p-crf':>9} {'MAE K=1':>9} {'MAE Semi':>9}"
+        )
+        print("-" * 85)
+
+        p_stats = results["pytorch_crf"].duration_stats["per_phone"]
+        l_stats = results["linear_crf_triton"].duration_stats["per_phone"]
+        s_stats = results["semi_crf"].duration_stats["per_phone"]
+
+        for phone in display_phones:
+            ref_mean = ref_stats[phone]["ref_mean"]
+            p_mean = p_stats[phone]["pred_mean"]
+            l_mean = l_stats[phone]["pred_mean"]
+            s_mean = s_stats[phone]["pred_mean"]
+            p_mae = p_stats[phone]["mae"]
+            l_mae = l_stats[phone]["mae"]
+            s_mae = s_stats[phone]["mae"]
+
+            # Highlight if semi-CRF is better
+            s_marker = "*" if s_mae < p_mae and s_mae < l_mae else " "
+
+            print(
+                f"{phone:<6} {ref_mean:>6.1f} {p_mean:>6.1f} {l_mean:>6.1f} {s_mean:>6.1f} │ "
+                f"{p_mae:>9.2f} {l_mae:>9.2f} {s_mae:>8.2f}{s_marker}"
+            )
+
+        # Overall stats
+        print("-" * 85)
+        p_overall = results["pytorch_crf"].duration_stats["overall"]
+        l_overall = results["linear_crf_triton"].duration_stats["overall"]
+        s_overall = results["semi_crf"].duration_stats["overall"]
+
+        print(
+            f"{'Overall MAE':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{p_overall['mean_absolute_error']:>9.2f} {l_overall['mean_absolute_error']:>9.2f} "
+            f"{s_overall['mean_absolute_error']:>8.2f}"
+        )
+        print(
+            f"{'Duration r':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{p_overall['duration_correlation']:>9.3f} {l_overall['duration_correlation']:>9.3f} "
+            f"{s_overall['duration_correlation']:>8.3f}"
+        )
+    else:
+        print(f"{'Phone':<6} {'Ref':>6} {'K=1':>6} {'Semi':>6} │ {'MAE K=1':>9} {'MAE Semi':>9}")
+        print("-" * 60)
+
+        l_stats = results["linear_crf_triton"].duration_stats["per_phone"]
+        s_stats = results["semi_crf"].duration_stats["per_phone"]
+
+        for phone in display_phones:
+            ref_mean = ref_stats[phone]["ref_mean"]
+            l_mean = l_stats[phone]["pred_mean"]
+            s_mean = s_stats[phone]["pred_mean"]
+            l_mae = l_stats[phone]["mae"]
+            s_mae = s_stats[phone]["mae"]
+
+            s_marker = "*" if s_mae < l_mae else " "
+
+            print(
+                f"{phone:<6} {ref_mean:>6.1f} {l_mean:>6.1f} {s_mean:>6.1f} │ "
+                f"{l_mae:>9.2f} {s_mae:>8.2f}{s_marker}"
+            )
+
+        # Overall stats
+        print("-" * 60)
+        l_overall = results["linear_crf_triton"].duration_stats["overall"]
+        s_overall = results["semi_crf"].duration_stats["overall"]
+
+        print(
+            f"{'Overall MAE':<6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{l_overall['mean_absolute_error']:>9.2f} {s_overall['mean_absolute_error']:>8.2f}"
+        )
+        print(
+            f"{'Duration r':<6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{l_overall['duration_correlation']:>9.3f} {s_overall['duration_correlation']:>8.3f}"
+        )
+
+    print("\n* = Semi-CRF has lowest MAE for this phone")
+    print("Duration r = correlation between predicted and reference mean durations")
+
+
 def compare_models(data_dir: Path, max_duration: int = 30, **kwargs):
     """
     Compare CRF models: pytorch-crf (optional), linear CRF (K=1), and semi-CRF.
@@ -1556,6 +1727,9 @@ def compare_models(data_dir: Path, max_duration: int = 30, **kwargs):
         # Note about K=1 vs pytorch-crf equivalence
         print("\nNote: K=1 Triton and pytorch-crf should produce similar accuracy")
         print("(validates that K=1 is a correct linear CRF implementation)")
+
+        # Duration analysis
+        _print_duration_analysis(results, has_pytorch_crf=True)
     else:
         # Two-way comparison (no pytorch-crf)
         print(f"\n{'Metric':<25} {'K=1 Triton':>15} {'Semi-CRF':>15} {'Δ':>12}")
@@ -1590,6 +1764,9 @@ def compare_models(data_dir: Path, max_duration: int = 30, **kwargs):
         print(
             f"{'Inference time (s)':<25} {l_infer:>15.2f} {s_infer:>15.2f} {s_infer - l_infer:>+12.2f}"
         )
+
+        # Duration analysis
+        _print_duration_analysis(results, has_pytorch_crf=False)
 
     return results
 
