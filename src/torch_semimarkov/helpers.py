@@ -453,6 +453,38 @@ def score_gold_vectorized(
         scores = scores * (lengths > 0).to(dtype)
         return scores
 
+    # Handle K=1 (linear CRF) specially: each frame is its own segment
+    # This ensures gold scoring matches the partition function which assumes
+    # duration-1 segments for K=1
+    if max_duration == 1:
+        # Content: sum of scores[t, label[t]] for all positions
+        # = sum over t of (cum_scores[t+1, label[t]] - cum_scores[t, label[t]])
+        labels_exp = labels.unsqueeze(-1)  # (batch, T, 1)
+        cum_at_pos = cum_scores[:, :-1, :].gather(2, labels_exp).squeeze(-1)  # (batch, T)
+        cum_at_next = cum_scores[:, 1:, :].gather(2, labels_exp).squeeze(-1)  # (batch, T)
+        content_per_pos = cum_at_next - cum_at_pos  # (batch, T)
+
+        # Duration: duration_bias[0, label[t]] for each position
+        dur_per_pos = duration_bias[0, labels]  # (batch, T)
+
+        # Transition: transition[label[t-1], label[t]] for t >= 1
+        # First position has no incoming transition
+        prev_labels = torch.zeros_like(labels)
+        prev_labels[:, 1:] = labels[:, :-1]
+        trans_flat = transition.view(-1)  # (C * C,)
+        trans_indices = prev_labels * C + labels  # (batch, T)
+        trans_per_pos = trans_flat[trans_indices]  # (batch, T)
+        # Zero out first position's transition
+        trans_per_pos[:, 0] = 0
+
+        # Mask for valid positions
+        pos_indices = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+        valid_mask = pos_indices < lengths.unsqueeze(1)  # (batch, T)
+
+        # Sum all components with masking
+        total_per_pos = (content_per_pos + dur_per_pos + trans_per_pos) * valid_mask.to(dtype)
+        return total_per_pos.sum(dim=1)  # (batch,)
+
     # Step 1: Detect segment boundaries (where label changes)
     # changes[b, t] = True if labels[b, t] != labels[b, t+1]
     changes = labels[:, :-1] != labels[:, 1:]  # (batch, T-1)
