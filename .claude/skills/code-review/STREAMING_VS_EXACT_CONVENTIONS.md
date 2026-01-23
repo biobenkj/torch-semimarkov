@@ -189,6 +189,56 @@ The transition matrix has shape `(C_src, C_dest)`:
 
 ---
 
+## Transition Matrix Convention
+
+### Storage: `transition[C_src, C_dest]`
+
+The transition parameter is stored with source-first indexing:
+- `transition[i, j]` = score for transitioning FROM label `i` TO label `j`
+- Shape: `(C, C)`
+- This matches standard CRF literature conventions
+
+### Usage in Edge Computation
+
+When building edge tensors, the transition is **transposed** to match edge orientation:
+
+```python
+# Edge tensor has shape (batch, N, K, C_dest, C_src)
+# transition has shape (C_src, C_dest)
+# We need (C_dest, C_src) for broadcasting
+
+edge[:, n, k] = segment_score.unsqueeze(-1) + transition.T.unsqueeze(0)
+#               (batch, C, 1)               + (1, C_dest, C_src)
+```
+
+### Why Transpose?
+
+The edge tensor indexes as `edge[..., c_dest, c_src]` because:
+1. Forward pass: `alpha[t, c_dest] = logsumexp over c_src of (alpha[t-k, c_src] + edge[..., c_dest, c_src])`
+2. The reduction is over `c_src`, so it should be the last dimension for efficient memory access
+3. This matches the standard HMM/CRF literature orientation
+
+### Usage in Gold Scoring
+
+When scoring gold sequences, the transition is accessed directly without transposition:
+
+```python
+# For a segment transitioning from prev_label to curr_label:
+trans_score = transition[prev_label, curr_label]
+```
+
+### Usage Across Codebase
+
+| Location | Access Pattern | Notes |
+|----------|---------------|-------|
+| `_build_edge_tensor` | `transition.T` | Transposed for edge broadcasting |
+| `compute_edge_block_streaming` | `transition.T` | Same transposition |
+| `score_gold_vectorized` | `transition[prev, curr]` | Direct access |
+| `_compute_segment_score` | `transition[prev, curr]` | Direct access |
+| Triton kernels | Loaded as transposed | For edge computation |
+
+---
+
 ## Loop Bounds Reference
 
 ### Streaming Forward (PyTorch Reference)

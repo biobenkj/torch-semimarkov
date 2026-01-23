@@ -586,12 +586,27 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
 
     Attributes:
         transition (Parameter): Label transition scores of shape :math:`(C, C)`.
+            Uses ``(source, destination)`` indexing: ``transition[i, j]`` is the
+            score for transitioning FROM label ``i`` TO label ``j``.
         duration_dist (DurationDistribution): Duration distribution module.
         projection (Linear or None): Optional projection from encoder hidden dim.
 
     Properties:
         duration_bias: Returns the current duration bias tensor of shape :math:`(K, C)`.
             This is a property for backward compatibility - internally uses ``duration_dist()``.
+
+    Transition Matrix Convention:
+        The transition parameter has shape :math:`(C, C)` with indexing:
+
+        - ``transition[i, j]`` = score for transitioning FROM label ``i`` TO label ``j``
+        - Convention: ``(source, destination)`` ordering
+
+        When building edge potentials internally, the matrix is transposed::
+
+            edge[t, k, c_dest, c_src] = content[c_dest] + dur_bias[k, c_dest]
+                                      + transition[c_src, c_dest]
+
+        This matches the standard CRF transition convention used in the literature.
 
     Examples::
 

@@ -110,6 +110,22 @@ Two critical requirements for T=400K+ sequences:
    smaller than that is completely erased. Zero-centering keeps magnitude
    at √T (~632 for T=400K), preserving signals down to ~10⁻⁴.
 
+Transition Matrix Convention
+----------------------------
+The transition matrix follows ``transition[source, destination]`` convention::
+
+    transition[i, j] = log P(label_j | previous_label_i)
+                     = score for transitioning FROM i TO j
+
+When computing edge potentials, the transition is transposed to match
+the edge tensor orientation ``(C_dest, C_src)``::
+
+    edge[c_dest, c_src] = segment_score[c_dest] + transition.T[c_dest, c_src]
+                        = segment_score[c_dest] + transition[c_src, c_dest]
+
+This transposition ensures efficient memory access during the forward pass,
+where the reduction is over ``c_src`` (the source/previous label).
+
 Usage
 -----
 >>> import torch
