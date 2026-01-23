@@ -408,11 +408,14 @@ def score_gold_vectorized(
 
     # Handle single-position sequences
     if T == 1:
-        # Single segment per batch: content + duration_bias[1, label] (duration=1 uses index 1)
+        # Single segment per batch: content + duration_bias[dur_idx, label]
+        # Duration index convention: min(duration, K-1) where K = max_duration
+        # For K=1: min(1, 0) = 0. For K>1: min(1, K-1) = 1
         label_0 = labels[:, 0]  # (batch,)
         content = cum_scores[:, 1, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
         content -= cum_scores[:, 0, :].gather(1, label_0.unsqueeze(1)).squeeze(1)
-        dur_bias = duration_bias[1, label_0]  # duration=1 uses duration_bias[1]
+        dur_idx = min(1, max_duration - 1)
+        dur_bias = duration_bias[dur_idx, label_0]
         scores = content + dur_bias
         # Zero out scores for zero-length sequences
         scores = scores * (lengths > 0).to(dtype)
@@ -507,11 +510,12 @@ def score_gold_vectorized(
     seg_labels_expanded = seg_labels.unsqueeze(-1)  # (batch, max_segments, 1)
     content_scores = content_all.gather(2, seg_labels_expanded).squeeze(-1)  # (batch, max_segments)
 
-    # Duration scores (duration_bias[k] stores bias for segments of duration k)
-    durations = seg_ends - seg_starts + 1  # (batch, max_segments)
-    dur_indices = durations.clamp(
-        1, max_duration - 1
-    )  # duration k uses index k, clamped to valid range
+    # Duration scores
+    # Duration index convention: duration d uses index min(d, K-1) where K = max_duration
+    # For K=1: all durations map to index 0
+    # For K>1: duration d maps to min(d, K-1)
+    durations = seg_ends - seg_starts + 1  # (batch, max_segments), always >= 1
+    dur_indices = durations.clamp(max=max_duration - 1)
 
     # Gather duration bias: duration_bias[dur_idx, label]
     # duration_bias shape: (K, C), we need (batch, max_segments) values

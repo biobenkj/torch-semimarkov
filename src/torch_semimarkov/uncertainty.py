@@ -630,10 +630,12 @@ class UncertaintySemiMarkovCRFHead(UncertaintyMixin, nn.Module):
             scores = hidden_states
 
         # Build cumulative scores for prefix-sum edge retrieval
+        # Zero-center before cumsum to prevent magnitude drift at long sequences
+        scores_centered = scores.float() - scores.float().mean(dim=1, keepdim=True)
         cum_scores = torch.zeros(
             batch, T + 1, self.num_classes, dtype=torch.float32, device=scores.device
         )
-        cum_scores[:, 1:] = torch.cumsum(scores.float(), dim=1)
+        cum_scores[:, 1:] = torch.cumsum(scores_centered, dim=1)
 
         # Compute partition function via streaming algorithm
         partition = semi_crf_streaming_forward(
