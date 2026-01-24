@@ -441,6 +441,13 @@ class SemiMarkovCRFHead(nn.Module):
         )
         cum_scores[:, 1:] = torch.cumsum(scores_float, dim=1)
 
+        # Debug check for NaN in cumsum (can happen if scores have extreme values)
+        if cum_scores.requires_grad and torch.isnan(cum_scores).any():
+            raise ValueError(
+                "NaN detected in cumulative scores after cumsum. This typically indicates "
+                "extreme values in the input scores or projection layer weights."
+            )
+
         if backend_type == "streaming":
             # Compute partition function via streaming algorithm
             partition = semi_crf_streaming_forward(
@@ -517,6 +524,44 @@ class SemiMarkovCRFHead(nn.Module):
         elif reduction == "sum":
             return nll.sum()
         return nll
+
+    def parameter_penalty(self, p: float = 2.0) -> Tensor:
+        r"""parameter_penalty(p=2.0) -> Tensor
+
+        Compute Lp penalty on CRF parameters to prevent gradient explosion.
+
+        Semi-Markov CRFs have more complex gradient dynamics than standard CRFs
+        due to: (1) edge potentials that scale with segment duration, (2) more
+        learnable parameters (duration_bias, possibly duration-dependent transitions),
+        and (3) partition functions with O(T × K × C²) terms vs O(T × C²).
+
+        Without regularization, these parameters can drift to extreme values over
+        many training epochs, causing numerical overflow in the backward pass
+        marginal computation (exp of extreme log-marginals).
+
+        This method returns a penalty term that should be added to the loss:
+
+        .. math::
+            \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NLL}} + \lambda \cdot \text{penalty}
+
+        where :math:`\lambda` is a hyperparameter (typical values: 0.001 to 0.1).
+
+        Args:
+            p (float): The norm order. Default is 2.0 (L2 regularization).
+                Use p=1.0 for L1 (sparse) regularization.
+
+        Returns:
+            Tensor: Scalar penalty value (sum of Lp norms of CRF parameters).
+
+        Example:
+            >>> crf = SemiMarkovCRFHead(num_classes=10, max_duration=30, hidden_dim=256)
+            >>> loss = crf.compute_loss(hidden, lengths, labels)
+            >>> total_loss = loss + 0.01 * crf.parameter_penalty()
+            >>> total_loss.backward()
+        """
+        penalty = self.transition.norm(p=p).pow(p)
+        penalty = penalty + self.duration_bias.norm(p=p).pow(p)
+        return penalty
 
     def _score_gold(
         self,

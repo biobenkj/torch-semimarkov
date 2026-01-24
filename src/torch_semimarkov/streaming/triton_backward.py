@@ -452,10 +452,18 @@ if HAS_TRITON:
 
                                 # === Compute marginal ===
                                 # log_marginal[c_dst, c_src] = alpha[t, c_src] + edge[c_dst, c_src] + beta[end, c_dst] - log_Z
+                                #
+                                # Clamp inputs to prevent extreme values that could cause numerical issues.
+                                # This is defensive - normally values should be bounded, but stochastic
+                                # training can expose edge cases.
+                                alpha_t_safe = tl.minimum(tl.maximum(alpha_t, -1e6), 1e6)
+                                beta_next_safe = tl.minimum(tl.maximum(beta_next, -1e6), 1e6)
+                                edge_block_safe = tl.minimum(tl.maximum(edge_block, -1e6), 1e6)
+
                                 log_marginal = (
-                                    alpha_t[None, :]  # (1, C_PAD) for c_src
-                                    + edge_block  # (C_PAD, C_PAD)
-                                    + beta_next[:, None]  # (C_PAD, 1) for c_dst
+                                    alpha_t_safe[None, :]  # (1, C_PAD) for c_src
+                                    + edge_block_safe  # (C_PAD, C_PAD)
+                                    + beta_next_safe[:, None]  # (C_PAD, 1) for c_dst
                                     - log_Z
                                 )
                                 # Clamp log_marginal to prevent exp overflow/underflow

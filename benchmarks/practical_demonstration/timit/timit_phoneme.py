@@ -1292,8 +1292,13 @@ def train_epoch(
     device: torch.device,
     backend: str = "streaming",
     use_triton: bool = True,
+    crf_reg: float = 0.0,
 ) -> tuple[float, float]:
     """Train for one epoch.
+
+    Args:
+        crf_reg: L2 regularization coefficient for CRF parameters (Semi-Markov only).
+            Helps prevent gradient explosion from unbounded transition/duration_bias.
 
     Returns:
         Tuple of (average_loss, elapsed_time_seconds).
@@ -1311,6 +1316,11 @@ def train_epoch(
 
         optimizer.zero_grad()
         loss = model.compute_loss(features, lengths, labels, backend=backend, use_triton=use_triton)
+
+        # Add CRF parameter regularization for Semi-Markov models
+        if crf_reg > 0 and isinstance(model, TIMITModel):
+            loss = loss + crf_reg * model.crf.parameter_penalty()
+
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -1420,8 +1430,13 @@ def train_model(
     backend: str = "streaming",
     use_triton: bool = True,
     log_every: int = 1,
+    crf_reg: float = 0.0,
 ) -> tuple[TIMITModel | TIMITModelPytorchCRF, TIMITMetrics]:
-    """Train a model and return it with metrics."""
+    """Train a model and return it with metrics.
+
+    Args:
+        crf_reg: L2 regularization coefficient for CRF parameters (Semi-Markov only).
+    """
     device = torch.device(device)
 
     # Load data with normalization
@@ -1493,7 +1508,13 @@ def train_model(
 
     for epoch in range(epochs):
         train_loss, epoch_time = train_epoch(
-            model, train_loader, optimizer, device, backend=backend, use_triton=use_triton
+            model,
+            train_loader,
+            optimizer,
+            device,
+            backend=backend,
+            use_triton=use_triton,
+            crf_reg=crf_reg,
         )
         total_train_time += epoch_time
         epoch_times.append(epoch_time)
@@ -1805,6 +1826,13 @@ def main():
     train_parser.add_argument("--batch-size", type=int, default=32)
     train_parser.add_argument("--lr", type=float, default=1e-3)
     train_parser.add_argument(
+        "--crf-reg",
+        type=float,
+        default=0.0,
+        help="L2 regularization coefficient for CRF parameters (transition, duration_bias). "
+        "Helps prevent gradient explosion in Semi-Markov CRF training. Typical values: 0.001-0.1",
+    )
+    train_parser.add_argument(
         "--backend",
         choices=["exact", "streaming", "auto"],
         default="streaming",
@@ -1866,6 +1894,7 @@ def main():
             backend=args.backend,
             use_triton=not args.no_triton,
             log_every=args.log_every,
+            crf_reg=args.crf_reg,
         )
     elif args.command == "compare":
         results = compare_models(

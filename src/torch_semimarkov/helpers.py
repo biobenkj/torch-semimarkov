@@ -599,13 +599,19 @@ def score_gold_vectorized(
     trans_scores = trans_flat[trans_indices]  # (batch, max_segments)
 
     # Zero out first segment's transition
+    # Zero out first segment's transition (no predecessor)
+    # Use torch.where to avoid inf * 0 = NaN
     first_seg_mask = torch.zeros_like(seg_mask)
     first_seg_mask[:, 0] = True
-    trans_scores = trans_scores * (~first_seg_mask).to(dtype)
+    trans_scores = torch.where(first_seg_mask, torch.zeros_like(trans_scores), trans_scores)
 
     # Step 4: Sum with masking
+    # Use torch.where instead of multiplication to avoid inf * 0 = NaN
+    # This can happen if parameters drift to extreme values during training
     total_per_segment = content_scores + dur_scores + trans_scores  # (batch, max_segments)
-    total_per_segment = total_per_segment * seg_mask.to(dtype)  # Zero out padded segments
+    total_per_segment = torch.where(
+        seg_mask, total_per_segment, torch.zeros_like(total_per_segment)
+    )
 
     scores = total_per_segment.sum(dim=1)  # (batch,)
 

@@ -123,6 +123,16 @@ class SemiCRFStreaming(torch.autograd.Function):
 
         grad_cum_scores, grad_transition, grad_duration_bias, grad_proj_start, grad_proj_end = grads
 
+        # Validate backward outputs - catch NaN/Inf before they corrupt parameters
+        # This helps debug stochastic NaN issues in training
+        if not torch.isfinite(grad_cum_scores).all():
+            nan_count = torch.isnan(grad_cum_scores).sum().item()
+            inf_count = torch.isinf(grad_cum_scores).sum().item()
+            raise RuntimeError(
+                f"Non-finite values in CRF backward (PyTorch): "
+                f"grad_cum_scores has {nan_count} NaN, {inf_count} Inf"
+            )
+
         # Scale by upstream gradient
         #
         # Per-batch parameters (cum_scores, proj_start, proj_end):
@@ -256,6 +266,16 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 proj_end=proj_end,
             )
         )
+
+        # Validate backward outputs - catch NaN/Inf before they corrupt parameters
+        # This helps debug stochastic NaN issues in Triton kernels
+        if not torch.isfinite(grad_cum_scores).all():
+            nan_count = torch.isnan(grad_cum_scores).sum().item()
+            inf_count = torch.isinf(grad_cum_scores).sum().item()
+            raise RuntimeError(
+                f"Non-finite values in CRF backward (Triton): "
+                f"grad_cum_scores has {nan_count} NaN, {inf_count} Inf"
+            )
 
         return (
             grad_cum_scores,

@@ -574,10 +574,18 @@ def semi_crf_streaming_backward_pytorch(
 
                 # === Gradient computation ===
                 # log_marginal[c_dest, c_src] = alpha[t, c_src] + edge[c_dest, c_src] + beta[end, c_dest] - log_Z
+                #
+                # Clamp inputs to prevent extreme values that could cause numerical issues.
+                # This is defensive - normally values should be bounded, but during training
+                # with stochastic batches, edge cases can occur.
+                alpha_t_safe = torch.clamp(alpha_t, min=-1e6, max=1e6)
+                beta_next_safe = torch.clamp(beta_next, min=-1e6, max=1e6)
+                edge_block_safe = torch.clamp(edge_block, min=-1e6, max=1e6)
+
                 log_marginal = (
-                    alpha_t.unsqueeze(-2)  # (batch, 1, C_src)
-                    + edge_block  # (batch, C_dest, C_src)
-                    + beta_next.unsqueeze(-1)  # (batch, C_dest, 1)
+                    alpha_t_safe.unsqueeze(-2)  # (batch, 1, C_src)
+                    + edge_block_safe  # (batch, C_dest, C_src)
+                    + beta_next_safe.unsqueeze(-1)  # (batch, C_dest, 1)
                     - log_Z.view(batch, 1, 1)
                 )
                 # Clamp log_marginal to prevent exp overflow/underflow
@@ -830,10 +838,15 @@ def semi_crf_streaming_marginals_pytorch(
                 )
 
                 # Compute marginal probability for this segment
+                # Clamp inputs to prevent extreme values
+                alpha_t_safe = torch.clamp(alpha_t, min=-1e6, max=1e6)
+                beta_next_safe = torch.clamp(beta_next, min=-1e6, max=1e6)
+                edge_block_safe = torch.clamp(edge_block, min=-1e6, max=1e6)
+
                 log_marginal = (
-                    alpha_t.unsqueeze(-2)  # (batch, 1, C_src)
-                    + edge_block  # (batch, C_dest, C_src)
-                    + beta_next.unsqueeze(-1)  # (batch, C_dest, 1)
+                    alpha_t_safe.unsqueeze(-2)  # (batch, 1, C_src)
+                    + edge_block_safe  # (batch, C_dest, C_src)
+                    + beta_next_safe.unsqueeze(-1)  # (batch, C_dest, 1)
                     - log_Z.view(batch, 1, 1)
                 )
                 # Clamp log_marginal to prevent exp overflow/underflow
