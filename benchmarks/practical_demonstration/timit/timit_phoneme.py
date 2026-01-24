@@ -801,9 +801,19 @@ class TIMITDataset(Dataset):
         }
 
 
-def collate_timit(batch: list[dict]) -> dict[str, Tensor]:
-    """Collate TIMIT batch with padding."""
-    max_len = max(b["length"].item() for b in batch)
+def collate_timit(batch: list[dict], fixed_length: int | None = None) -> dict[str, Tensor]:
+    """Collate TIMIT batch with padding.
+
+    Args:
+        batch: List of sample dictionaries.
+        fixed_length: If provided, force all sequences to this exact length.
+            Sequences shorter are padded, longer are truncated. This is useful
+            for debugging to eliminate variable-length boundary handling issues.
+    """
+    if fixed_length is not None:
+        max_len = fixed_length
+    else:
+        max_len = max(b["length"].item() for b in batch)
 
     features = []
     labels = []
@@ -815,15 +825,30 @@ def collate_timit(batch: list[dict]) -> dict[str, Tensor]:
         lab = b["labels"]
         seq_len = b["length"].item()
 
-        # Pad (use 0 for labels since CRF ignores positions beyond lengths)
-        if seq_len < max_len:
-            pad_len = max_len - seq_len
-            feat = F.pad(feat, (0, 0, 0, pad_len))
-            lab = F.pad(lab, (0, pad_len), value=0)
+        # Handle fixed length: truncate or pad
+        if fixed_length is not None:
+            if seq_len > fixed_length:
+                # Truncate
+                feat = feat[:fixed_length]
+                lab = lab[:fixed_length]
+                seq_len = fixed_length
+            elif seq_len < fixed_length:
+                # Pad
+                pad_len = fixed_length - seq_len
+                feat = F.pad(feat, (0, 0, 0, pad_len))
+                lab = F.pad(lab, (0, pad_len), value=0)
+            # For fixed length, report the fixed length as the actual length
+            lengths.append(torch.tensor(fixed_length, dtype=torch.long))
+        else:
+            # Variable length: just pad to max_len in batch
+            if seq_len < max_len:
+                pad_len = max_len - seq_len
+                feat = F.pad(feat, (0, 0, 0, pad_len))
+                lab = F.pad(lab, (0, pad_len), value=0)
+            lengths.append(b["length"])
 
         features.append(feat)
         labels.append(lab)
-        lengths.append(b["length"])
         utterance_ids.append(b["utterance_id"])
 
     return {
@@ -832,6 +857,22 @@ def collate_timit(batch: list[dict]) -> dict[str, Tensor]:
         "lengths": torch.stack(lengths),
         "utterance_ids": utterance_ids,
     }
+
+
+def make_collate_fn(fixed_length: int | None = None):
+    """Create a collate function with optional fixed length.
+
+    Args:
+        fixed_length: If provided, force all sequences to this length.
+
+    Returns:
+        A collate function suitable for DataLoader.
+    """
+
+    def collate_fn(batch: list[dict]) -> dict[str, Tensor]:
+        return collate_timit(batch, fixed_length=fixed_length)
+
+    return collate_fn
 
 
 # =============================================================================
@@ -1431,11 +1472,13 @@ def train_model(
     use_triton: bool = True,
     log_every: int = 1,
     crf_reg: float = 0.0,
+    fixed_length: int | None = None,
 ) -> tuple[TIMITModel | TIMITModelPytorchCRF, TIMITMetrics]:
     """Train a model and return it with metrics.
 
     Args:
         crf_reg: L2 regularization coefficient for CRF parameters (Semi-Markov only).
+        fixed_length: If provided, force all sequences to this length (for debugging).
     """
     device = torch.device(device)
 
@@ -1455,11 +1498,16 @@ def train_model(
     sample = train_dataset[0]
     input_dim = sample["features"].shape[-1]
 
+    # Create collate function (with optional fixed length for debugging)
+    collate_fn = make_collate_fn(fixed_length=fixed_length)
+    if fixed_length is not None:
+        logger.info(f"Using fixed sequence length: {fixed_length}")
+
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_timit
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_timit
+        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
     )
 
     # Build model
@@ -1519,6 +1567,22 @@ def train_model(
         total_train_time += epoch_time
         epoch_times.append(epoch_time)
         scheduler.step()
+
+        # Log CRF parameter magnitudes for debugging gradient explosion
+        if isinstance(model, TIMITModel):
+            trans_max = model.crf.transition.abs().max().item()
+            dur_max = model.crf.duration_bias.abs().max().item()
+            logger.debug(
+                f"Epoch {epoch+1} CRF params: "
+                f"transition_max={trans_max:.4f}, duration_bias_max={dur_max:.4f}"
+            )
+            # Warn if parameters are drifting to extreme values
+            if trans_max > 20 or dur_max > 20:
+                logger.warning(
+                    f"Epoch {epoch+1}: CRF parameters drifting high! "
+                    f"trans_max={trans_max:.2f}, dur_max={dur_max:.2f}. "
+                    f"Consider increasing --crf-reg."
+                )
 
         if (epoch + 1) % log_every == 0 or epoch == epochs - 1:
             test_metrics, inference_time = evaluate(model, test_loader, device)
@@ -1849,6 +1913,13 @@ def main():
         default=1,
         help="Log metrics every N epochs (default: 1)",
     )
+    train_parser.add_argument(
+        "--fixed-length",
+        type=int,
+        default=None,
+        help="Force all sequences to this fixed length (for debugging boundary handling). "
+        "Sequences shorter are padded, longer are truncated.",
+    )
 
     # Compare
     compare_parser = subparsers.add_parser(
@@ -1895,6 +1966,7 @@ def main():
             use_triton=not args.no_triton,
             log_every=args.log_every,
             crf_reg=args.crf_reg,
+            fixed_length=args.fixed_length,
         )
     elif args.command == "compare":
         results = compare_models(

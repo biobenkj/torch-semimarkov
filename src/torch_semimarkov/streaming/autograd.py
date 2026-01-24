@@ -107,6 +107,17 @@ class SemiCRFStreaming(torch.autograd.Function):
             proj_end,
         ) = ctx.saved_tensors
 
+        # Validate partition from forward pass before running backward
+        # If partition is already NaN/Inf, backward will produce garbage
+        if not torch.isfinite(partition).all():
+            nan_count = torch.isnan(partition).sum().item()
+            inf_count = torch.isinf(partition).sum().item()
+            raise RuntimeError(
+                f"Non-finite partition from forward pass (PyTorch): "
+                f"{nan_count} NaN, {inf_count} Inf. "
+                f"Check forward pass numerical stability."
+            )
+
         grads = semi_crf_streaming_backward_pytorch(
             cum_scores,
             transition,
@@ -248,6 +259,17 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             proj_start,
             proj_end,
         ) = ctx.saved_tensors
+
+        # Validate partition from forward pass before running backward
+        # If partition is already NaN/Inf, backward will produce garbage
+        if not torch.isfinite(partition).all():
+            nan_count = torch.isnan(partition).sum().item()
+            inf_count = torch.isinf(partition).sum().item()
+            raise RuntimeError(
+                f"Non-finite partition from forward pass (Triton): "
+                f"{nan_count} NaN, {inf_count} Inf. "
+                f"Check forward pass numerical stability."
+            )
 
         # Use Triton backward kernel for gradient computation
         # The kernel already scales by grad_output internally

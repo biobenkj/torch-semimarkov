@@ -281,21 +281,28 @@ if HAS_TRITON:
                 scores = tl.where(c_mask_2d, scores, NEG_INF)
 
                 # Logsumexp over c_src (axis=1) -> (C_PAD,)
-                # Add epsilon guard to prevent log(0) = -inf when sum underflows
+                # Guard against all-NEG_INF case to prevent undefined arithmetic
+                # When max_scores == NEG_INF, scores - max_scores would be 0 (incorrect)
                 max_scores = tl.max(scores, axis=1)
-                score_for_k = max_scores + tl.log(
-                    tl.sum(tl.exp(scores - max_scores[:, None]), axis=1) + 1e-10
+                is_all_neginf = max_scores < (NEG_INF + 1.0)
+                max_scores_safe = tl.where(is_all_neginf, 0.0, max_scores)
+                log_sum_exp = tl.log(
+                    tl.sum(tl.exp(scores - max_scores_safe[:, None]), axis=1) + 1e-10
                 )
+                score_for_k = tl.where(is_all_neginf, NEG_INF, max_scores + log_sum_exp)
 
                 # Mask invalid durations and labels
                 score_for_k = tl.where(k_valid & c_mask, score_for_k, NEG_INF)
 
                 # Accumulate into alpha_t via logsumexp
-                # Add epsilon guard for consistency with backward kernel
+                # Guard against both inputs being NEG_INF to prevent undefined arithmetic
                 max_alpha = tl.maximum(alpha_t, score_for_k)
-                alpha_t = max_alpha + tl.log(
-                    tl.exp(alpha_t - max_alpha) + tl.exp(score_for_k - max_alpha) + 1e-10
+                is_both_neginf = (alpha_t < (NEG_INF + 1.0)) & (score_for_k < (NEG_INF + 1.0))
+                max_alpha_safe = tl.where(is_both_neginf, 0.0, max_alpha)
+                log_sum_exp_acc = tl.log(
+                    tl.exp(alpha_t - max_alpha_safe) + tl.exp(score_for_k - max_alpha_safe) + 1e-10
                 )
+                alpha_t = tl.where(is_both_neginf, NEG_INF, max_alpha + log_sum_exp_acc)
 
             # Mask inactive sequences
             alpha_t = tl.where(active & c_mask, alpha_t, NEG_INF)
@@ -338,12 +345,14 @@ if HAS_TRITON:
             final_alpha = tl.where(is_final & c_mask, alpha_t, final_alpha)
 
         # Final reduction: logsumexp over labels
-        # Add epsilon guard to prevent log(0) = -inf
+        # Guard against all-NEG_INF case to prevent undefined arithmetic
         final_alpha_masked = tl.where(c_mask, final_alpha, NEG_INF)
         max_val = tl.max(final_alpha_masked, axis=0)
-        exp_fa = tl.where(c_mask, tl.exp(final_alpha - max_val), 0.0)
+        is_final_neginf = max_val < (NEG_INF + 1.0)
+        max_val_safe = tl.where(is_final_neginf, 0.0, max_val)
+        exp_fa = tl.where(c_mask, tl.exp(final_alpha - max_val_safe), 0.0)
         sum_exp = tl.sum(exp_fa, axis=0)
-        partition = max_val + tl.log(sum_exp + 1e-10)
+        partition = tl.where(is_final_neginf, NEG_INF, max_val + tl.log(sum_exp + 1e-10))
 
         # Store result
         tl.store(out_ptr + batch_idx, partition)

@@ -341,18 +341,33 @@ if HAS_TRITON:
                                 scores = tl.where(c_mask_2d, scores, NEG_INF)
 
                                 # Logsumexp over c_src
+                                # Guard against all-NEG_INF case to prevent undefined arithmetic
                                 max_scores = tl.max(scores, axis=1)
-                                score_for_k = max_scores + tl.log(
-                                    tl.sum(tl.exp(scores - max_scores[:, None]), axis=1) + 1e-10
+                                is_all_neginf = max_scores < (NEG_INF + 1.0)
+                                max_scores_safe = tl.where(is_all_neginf, 0.0, max_scores)
+                                log_sum_exp = tl.log(
+                                    tl.sum(tl.exp(scores - max_scores_safe[:, None]), axis=1)
+                                    + 1e-10
+                                )
+                                score_for_k = tl.where(
+                                    is_all_neginf, NEG_INF, max_scores + log_sum_exp
                                 )
                                 score_for_k = tl.where(c_mask, score_for_k, NEG_INF)
 
                                 # Accumulate via logsumexp
+                                # Guard against both inputs being NEG_INF
                                 max_alpha = tl.maximum(alpha_t, score_for_k)
-                                alpha_t = max_alpha + tl.log(
-                                    tl.exp(alpha_t - max_alpha)
-                                    + tl.exp(score_for_k - max_alpha)
+                                is_both_neginf = (alpha_t < (NEG_INF + 1.0)) & (
+                                    score_for_k < (NEG_INF + 1.0)
+                                )
+                                max_alpha_safe = tl.where(is_both_neginf, 0.0, max_alpha)
+                                log_sum_exp_acc = tl.log(
+                                    tl.exp(alpha_t - max_alpha_safe)
+                                    + tl.exp(score_for_k - max_alpha_safe)
                                     + 1e-10
+                                )
+                                alpha_t = tl.where(
+                                    is_both_neginf, NEG_INF, max_alpha + log_sum_exp_acc
                                 )
 
                         # Store recomputed alpha
@@ -567,17 +582,35 @@ if HAS_TRITON:
                                 scores_for_beta = tl.where(c_mask_2d, scores_for_beta, NEG_INF)
 
                                 # Logsumexp over c_dst (axis 0)
+                                # Guard against all-NEG_INF case to prevent undefined arithmetic
                                 max_beta_k = tl.max(scores_for_beta, axis=0)
-                                beta_k = max_beta_k + tl.log(
-                                    tl.sum(tl.exp(scores_for_beta - max_beta_k[None, :]), axis=0)
+                                is_all_neginf_beta = max_beta_k < (NEG_INF + 1.0)
+                                max_beta_k_safe = tl.where(is_all_neginf_beta, 0.0, max_beta_k)
+                                log_sum_exp_beta = tl.log(
+                                    tl.sum(
+                                        tl.exp(scores_for_beta - max_beta_k_safe[None, :]), axis=0
+                                    )
                                     + 1e-10
+                                )
+                                beta_k = tl.where(
+                                    is_all_neginf_beta, NEG_INF, max_beta_k + log_sum_exp_beta
                                 )
                                 beta_k = tl.where(c_mask, beta_k, NEG_INF)
 
                                 # Accumulate into new_beta via logsumexp over k
+                                # Guard against both inputs being NEG_INF
                                 max_new = tl.maximum(new_beta, beta_k)
-                                new_beta = max_new + tl.log(
-                                    tl.exp(new_beta - max_new) + tl.exp(beta_k - max_new) + 1e-10
+                                is_both_neginf_beta = (new_beta < (NEG_INF + 1.0)) & (
+                                    beta_k < (NEG_INF + 1.0)
+                                )
+                                max_new_safe = tl.where(is_both_neginf_beta, 0.0, max_new)
+                                log_sum_exp_new = tl.log(
+                                    tl.exp(new_beta - max_new_safe)
+                                    + tl.exp(beta_k - max_new_safe)
+                                    + 1e-10
+                                )
+                                new_beta = tl.where(
+                                    is_both_neginf_beta, NEG_INF, max_new + log_sum_exp_new
                                 )
 
                         # Store beta[t] to ring buffer
