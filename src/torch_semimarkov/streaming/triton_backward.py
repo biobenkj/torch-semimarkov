@@ -458,6 +458,9 @@ if HAS_TRITON:
                                     + beta_next[:, None]  # (C_PAD, 1) for c_dst
                                     - log_Z
                                 )
+                                # Clamp log_marginal to prevent exp overflow/underflow
+                                # float32 exp() overflows at ~88.7, underflows at ~-87.3
+                                log_marginal = tl.minimum(tl.maximum(log_marginal, -80.0), 80.0)
                                 marginal = tl.exp(log_marginal)  # (C_PAD, C_PAD)
                                 marginal = tl.where(c_mask_2d, marginal, 0.0)
 

@@ -281,18 +281,20 @@ if HAS_TRITON:
                 scores = tl.where(c_mask_2d, scores, NEG_INF)
 
                 # Logsumexp over c_src (axis=1) -> (C_PAD,)
+                # Add epsilon guard to prevent log(0) = -inf when sum underflows
                 max_scores = tl.max(scores, axis=1)
                 score_for_k = max_scores + tl.log(
-                    tl.sum(tl.exp(scores - max_scores[:, None]), axis=1)
+                    tl.sum(tl.exp(scores - max_scores[:, None]), axis=1) + 1e-10
                 )
 
                 # Mask invalid durations and labels
                 score_for_k = tl.where(k_valid & c_mask, score_for_k, NEG_INF)
 
                 # Accumulate into alpha_t via logsumexp
+                # Add epsilon guard for consistency with backward kernel
                 max_alpha = tl.maximum(alpha_t, score_for_k)
                 alpha_t = max_alpha + tl.log(
-                    tl.exp(alpha_t - max_alpha) + tl.exp(score_for_k - max_alpha)
+                    tl.exp(alpha_t - max_alpha) + tl.exp(score_for_k - max_alpha) + 1e-10
                 )
 
             # Mask inactive sequences
@@ -336,11 +338,12 @@ if HAS_TRITON:
             final_alpha = tl.where(is_final & c_mask, alpha_t, final_alpha)
 
         # Final reduction: logsumexp over labels
+        # Add epsilon guard to prevent log(0) = -inf
         final_alpha_masked = tl.where(c_mask, final_alpha, NEG_INF)
         max_val = tl.max(final_alpha_masked, axis=0)
         exp_fa = tl.where(c_mask, tl.exp(final_alpha - max_val), 0.0)
         sum_exp = tl.sum(exp_fa, axis=0)
-        partition = max_val + tl.log(sum_exp)
+        partition = max_val + tl.log(sum_exp + 1e-10)
 
         # Store result
         tl.store(out_ptr + batch_idx, partition)

@@ -580,6 +580,9 @@ def semi_crf_streaming_backward_pytorch(
                     + beta_next.unsqueeze(-1)  # (batch, C_dest, 1)
                     - log_Z.view(batch, 1, 1)
                 )
+                # Clamp log_marginal to prevent exp overflow/underflow
+                # float32 exp() overflows at ~88.7, underflows at ~-87.3
+                log_marginal = torch.clamp(log_marginal, min=-80.0, max=80.0)
                 marginal = torch.exp(log_marginal)
                 marginal = torch.where(
                     valid_mask.view(batch, 1, 1), marginal, torch.zeros_like(marginal)
@@ -833,6 +836,8 @@ def semi_crf_streaming_marginals_pytorch(
                     + beta_next.unsqueeze(-1)  # (batch, C_dest, 1)
                     - log_Z.view(batch, 1, 1)
                 )
+                # Clamp log_marginal to prevent exp overflow/underflow
+                log_marginal = torch.clamp(log_marginal, min=-80.0, max=80.0)
                 marginal = torch.exp(log_marginal)
                 marginal = torch.where(
                     valid_mask.view(batch, 1, 1), marginal, torch.zeros_like(marginal)

@@ -410,6 +410,15 @@ class SemiMarkovCRFHead(nn.Module):
         else:
             scores = hidden_states
 
+        # Debug check for gradient corruption after projection
+        # This catches NaN propagation from corrupted model parameters early
+        if scores.requires_grad and torch.isnan(scores).any():
+            raise ValueError(
+                "NaN detected in projected scores. This typically indicates gradient "
+                "corruption from a previous backward pass. Check if model parameters "
+                "contain NaN values (e.g., via torch.isnan(param).any() for each param)."
+            )
+
         # Select backend
         if backend == "auto":
             backend_type, use_triton_final = self._select_backend(T, "log", use_triton)
