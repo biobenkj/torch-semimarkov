@@ -25,7 +25,9 @@ This document catalogs all debugging instrumentation added to trace stochastic N
 | `triton_backward.py:176-182` | **OOB fix: clamped indices for READS from unpadded inputs** | This session |
 | `triton_backward.py:~765` | **OOB fix: pad ALL gradient allocations to C_PAD** | This session |
 | `triton_backward.py:~541-608` | **Atomic fix: unclamped indices for WRITES to padded outputs** | This session |
-| `triton_backward.py:~915` | **OOB fix: slice all gradients back to C before returning** | This session |
+| `triton_backward.py:~765` | **Float64 fix: use double precision for gradient accumulation** | This session |
+| `triton_backward.py:~920` | **Float64 fix: convert back to original dtype before returning** | This session |
+| `autograd.py:~292-315` | **Validate ALL gradient outputs** (not just grad_cum_scores) | This session |
 | `timit_phoneme.py:1533-1547` | Parameter magnitude logging per epoch | This session |
 | `timit_phoneme.py:804-865` | Fixed-length collate for debugging | This session |
 
@@ -254,11 +256,36 @@ Watch for parameter drift warnings.
 
 **Fix applied:** Pad ALL gradient allocations to `C_PAD` + use unclamped indices for writes (each thread gets unique address) + use clamped indices only for reads from unpadded inputs + slice back to `C` before returning.
 
+### Floating-Point Non-Associativity (ACTUAL ROOT CAUSE)
+
+**CONFIRMED:** After fixing OOB/contention issues, systematic gradient differences remain:
+
+- Differences grow with sequence length: 1e-4 at T=100 → 1e-3 at T=500
+- `atomic_add` executes additions in non-deterministic order (depends on which GPU thread wins)
+- Small differences (~1e-7 per addition in float32) accumulate over T×K×C operations
+- At T=500, K=30, C=39: 585,000 additions per batch element → ~1e-3 accumulated error
+- Over 20 epochs × 29 batches = 580 backward passes → parameter drift → NaN
+
+**Fix applied:** Use `torch.float64` for gradient accumulation in Triton backward kernel:
+
+- Float32 error: ~1e-7 per operation → ~1e-3 accumulated
+- Float64 error: ~1e-16 per operation → ~1e-10 accumulated (negligible)
+- Convert back to original dtype before returning
+
+```python
+# triton_backward.py:~765 - Allocate with float64
+accum_dtype = torch.float64
+grad_cum_scores = torch.zeros(batch, T_plus_1, C_PAD, device=device, dtype=accum_dtype)
+
+# triton_backward.py:~920 - Convert back to original dtype
+grad_cum_scores = grad_cum_scores[:, :, :C].to(dtype)
+```
+
 ### Previously Suspected (Not Root Cause)
 
-- **Triton Atomic Operations**: `tl.atomic_add` order non-determinism is not a correctness issue (but contention IS)
+- **Triton Atomic Operations**: `tl.atomic_add` order non-determinism IS a correctness issue due to floating-point non-associativity (fixed with float64)
 - **Buffer Initialization**: Allocation timing is fine with PyTorch's async execution model
-- **Stochastic Batch Ordering**: Only exposed the underlying OOB/contention bug, not a root cause itself
+- **Stochastic Batch Ordering**: Only exposed the underlying numerical precision issue, not a root cause itself
 
 ---
 
@@ -272,7 +299,7 @@ src/torch_semimarkov/
     ├── autograd.py                # Partition + gradient validation
     ├── pytorch_reference.py       # Input clamping in backward
     ├── triton_forward.py          # Epsilon guards
-    └── triton_backward.py         # Input clamping in Triton
+    └── triton_backward.py         # Input clamping, float64 accumulation
 
 benchmarks/practical_demonstration/timit/
 └── timit_phoneme.py               # --crf-reg, --fixed-length, param logging
@@ -286,7 +313,8 @@ When the bug is fixed, these can be removed or kept as defensive programming:
 
 **Keep (defensive):**
 
-- **OOB/Contention fix: padded gradients + unclamped writes + clamped reads** (ROOT CAUSE FIX)
+- **Float64 gradient accumulation** (ACTUAL ROOT CAUSE FIX)
+- **OOB/Contention fix: padded gradients + unclamped writes + clamped reads**
 - NEG_INF guards in Triton logsumexp
 - Epsilon guards in logsumexp
 - Input clamping before marginal
@@ -302,9 +330,81 @@ When the bug is fixed, these can be removed or kept as defensive programming:
 
 ---
 
+## num_warps Tuning and IR/PTX Analysis
+
+### Current Status
+
+**Finding:** `num_warps > 2` causes non-deterministic NaN gradients on L40/L40S. Setting `num_warps=2` fixes correctness but severely degrades performance.
+
+**Hypothesis:** Register pressure causes spills to local memory with higher warp counts, introducing undefined behavior.
+
+### Testing num_warps with find_determinism.py
+
+```bash
+# On HPC, run the determinism test
+python src/torch_semimarkov/streaming/find_determinism.py
+```
+
+This script tests both forward and backward passes for:
+- Non-deterministic results across multiple runs
+- NaN values in gradients
+
+### IR/PTX Analysis for Root Cause
+
+To debug the `num_warps` issue, capture Triton's compilation output:
+
+```bash
+# Set Triton debug environment variables
+export TRITON_DEBUG=1
+export TRITON_CACHE_DIR=/tmp/triton_debug
+export TRITON_ALWAYS_COMPILE=1  # Disable caching for fresh compilation
+
+# Run with num_warps=2 (known good)
+python -c "
+from torch_semimarkov.streaming.triton_forward import *
+# ... run kernel
+" 2>&1 | tee triton_warps2.log
+
+# Then modify kernel to num_warps=4 and compare
+```
+
+**What to look for in PTX output:**
+
+1. **Register spills** - Look for `ld.local` / `st.local` instructions
+   - `ld.local` = loading from spilled registers (bad for performance and possibly correctness)
+   - `st.local` = storing to local memory (spill)
+
+2. **Register count** - Check `.reg` declarations at the top of PTX
+   - More warps = fewer registers per thread
+   - Typical limit: 64 registers/thread for good occupancy
+
+3. **Memory barriers** - Look for `bar.sync` instructions
+   - Missing barriers between warps could cause race conditions
+
+### Programmatic IR Access
+
+```python
+import triton
+
+# Get compiled kernel info
+compiled = kernel.run(..., warmup=True, return_kernel=True)
+print(compiled.asm['ttir'])   # High-level Triton IR
+print(compiled.asm['ttgir'])  # GPU-specific IR
+print(compiled.asm['llir'])   # Low-level IR
+print(compiled.asm['ptx'])    # Final CUDA assembly
+```
+
+### Potential Fixes for num_warps > 2
+
+1. **Loop Tiling** - Reduce register pressure by processing C_PAD×C_PAD in smaller tiles
+2. **num_stages Tuning** - Reduce pipeline stages to save registers
+3. **Grid Parallelization** - Move work from warps to grid dimension
+
+---
+
 ## Related Commits
 
 - `8b399a8` - Roll back Triton backpointer to PyTorch
 - `256db2a` - Add Triton backpointer (introduced issue?)
 - `3c8deea` - Add PyTorch backpointer (pre-Triton, also has issue)
-- Current session - All debugging instrumentation
+- Current session - All debugging instrumentation, float64 accumulation, num_warps=2

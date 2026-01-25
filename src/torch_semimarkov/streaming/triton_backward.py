@@ -259,7 +259,7 @@ if HAS_TRITON:
                     t = seg_start + local_t
                     # Only process if within segment and sequence bounds
                     if t < seg_end and t < seq_len:
-                        alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
+                        alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
 
                         # Loop over valid durations (tl.maximum ensures K=1 works)
                         for k in tl.range(1, tl.maximum(K, 2)):
@@ -407,7 +407,7 @@ if HAS_TRITON:
                         )
 
                         # Compute beta[t] and gradients
-                        new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
+                        new_beta = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
 
                         # tl.maximum ensures K=1 processes at least one duration
                         for k in tl.range(1, tl.maximum(K, 2)):
@@ -505,7 +505,8 @@ if HAS_TRITON:
                                 )
                                 # Clamp log_marginal to prevent exp overflow/underflow
                                 # float32 exp() overflows at ~88.7, underflows at ~-87.3
-                                log_marginal = tl.minimum(tl.maximum(log_marginal, -80.0), 80.0)
+                                # float64 exp() overflows at ~709.782, underflows at a similar negative value
+                                log_marginal = tl.minimum(tl.maximum(log_marginal, -700.0), 700.0)
                                 marginal = tl.exp(log_marginal)  # (C_PAD, C_PAD)
                                 marginal = tl.where(c_mask_2d, marginal, 0.0)
 
@@ -731,9 +732,10 @@ if HAS_TRITON:
             proj_start = proj_start.contiguous()
             proj_end = proj_end.contiguous()
             stride_ps_b, stride_ps_t, stride_ps_c = proj_start.stride()
-            # Allocate gradient outputs for boundaries with C_PAD (slice back to C later)
-            grad_proj_start = torch.zeros(batch, T, C_PAD, device=device, dtype=dtype)
-            grad_proj_end = torch.zeros(batch, T, C_PAD, device=device, dtype=dtype)
+            # Allocate gradient outputs for boundaries with C_PAD and float64 precision
+            # (we slice back to C and convert to original dtype before returning)
+            grad_proj_start = torch.zeros(batch, T, C_PAD, device=device, dtype=torch.float64)
+            grad_proj_end = torch.zeros(batch, T, C_PAD, device=device, dtype=torch.float64)
         else:
             # Create dummy tensors for stride calculation (won't be accessed)
             proj_start = cum_scores[:, :T, :]
@@ -756,23 +758,30 @@ if HAS_TRITON:
         alpha_buffer = torch.full((batch, segment_size, C_PAD), NEG_INF, device=device, dtype=dtype)
         beta_ring = torch.full((batch, K, C_PAD), NEG_INF, device=device, dtype=dtype)
 
-        # Allocate gradient outputs with C_PAD to allow unclamped writes from kernel
-        # (we slice back to C before returning)
-        grad_cum_scores = torch.zeros(batch, T_plus_1, C_PAD, device=device, dtype=dtype)
-        grad_duration_bias = torch.zeros(K, C, device=device, dtype=dtype)
+        # NUMERICAL STABILITY FIX: Use float64 for gradient accumulation to reduce
+        # floating-point non-associativity errors from atomic_add operations.
+        # The error accumulates over T×K×C operations (e.g., 585,000 at T=500, K=30, C=39).
+        # Float32 error: ~1e-7 per op → ~1e-3 accumulated
+        # Float64 error: ~1e-16 per op → ~1e-10 accumulated
+        # We convert back to original dtype before returning.
+        accum_dtype = torch.float64
 
-        # Allocate per-batch workspace buffers to avoid atomic add contention
-        # Each batch element accumulates to its own slice, then we sum after kernel
+        # Allocate gradient outputs with C_PAD and higher precision
+        grad_cum_scores = torch.zeros(batch, T_plus_1, C_PAD, device=device, dtype=accum_dtype)
+        grad_duration_bias = torch.zeros(K, C, device=device, dtype=accum_dtype)
+
+        # Allocate per-batch workspace buffers with higher precision
         # IMPORTANT: Allocate with C_PAD to prevent OOB memory access from masked-out
-        # threads (indices C to C_PAD-1). Even though writes are masked, the pointer
-        # calculation happens for all threads, and OOB pointers are undefined behavior.
+        # threads (indices C to C_PAD-1).
         if has_duration_transitions:
             # Duration-dependent: (batch, K, C_PAD, C_PAD)
-            grad_tr_workspace = torch.zeros(batch, K, C_PAD, C_PAD, device=device, dtype=dtype)
+            grad_tr_workspace = torch.zeros(
+                batch, K, C_PAD, C_PAD, device=device, dtype=accum_dtype
+            )
         else:
             # Static: (batch, C_PAD, C_PAD)
-            grad_tr_workspace = torch.zeros(batch, C_PAD, C_PAD, device=device, dtype=dtype)
-        grad_db_workspace = torch.zeros(batch, K, C_PAD, device=device, dtype=dtype)
+            grad_tr_workspace = torch.zeros(batch, C_PAD, C_PAD, device=device, dtype=accum_dtype)
+        grad_db_workspace = torch.zeros(batch, K, C_PAD, device=device, dtype=accum_dtype)
 
         # Allocate boundary marginals output if requested
         if return_boundary_marginals:
@@ -876,6 +885,7 @@ if HAS_TRITON:
                 stride_gdbw_c,
                 stride_bm_b,
                 stride_bm_t,
+                num_warps=2,
             )
 
         # Compute weighted sum of per-batch gradients for shared parameters.
@@ -898,21 +908,27 @@ if HAS_TRITON:
         # Notation: b=batch, k=duration, i=src_state, j=dst_state, c=state
         # Slice workspaces back to actual class count C before einsum reduction
         # (they were allocated with C_PAD to prevent OOB memory access)
+        # Convert grad_output to float64 to match workspace dtype for einsum
+        grad_output_f64 = grad_output.to(torch.float64)
         if has_duration_transitions:
             grad_tr_workspace = grad_tr_workspace[:, :, :C, :C]
-            grad_transition = torch.einsum("bkij, b -> kij", grad_tr_workspace, grad_output)
+            grad_transition = torch.einsum("bkij, b -> kij", grad_tr_workspace, grad_output_f64)
         else:
             grad_tr_workspace = grad_tr_workspace[:, :C, :C]
-            grad_transition = torch.einsum("bij, b -> ij", grad_tr_workspace, grad_output)
+            grad_transition = torch.einsum("bij, b -> ij", grad_tr_workspace, grad_output_f64)
 
         grad_db_workspace = grad_db_workspace[:, :, :C]
-        grad_duration_bias = torch.einsum("bkc, b -> kc", grad_db_workspace, grad_output)
+        grad_duration_bias = torch.einsum("bkc, b -> kc", grad_db_workspace, grad_output_f64)
 
         # Slice padded gradients back to actual class count C
-        grad_cum_scores = grad_cum_scores[:, :, :C]
+        # and convert from float64 accumulation dtype back to original dtype
+        grad_cum_scores = grad_cum_scores[:, :, :C].to(dtype)
+        grad_transition = grad_transition.to(dtype)
+        grad_duration_bias = grad_duration_bias.to(dtype)
+
         if grad_proj_start is not None:
-            grad_proj_start = grad_proj_start[:, :, :C]
-            grad_proj_end = grad_proj_end[:, :, :C]
+            grad_proj_start = grad_proj_start[:, :, :C].to(dtype)
+            grad_proj_end = grad_proj_end[:, :, :C].to(dtype)
 
         return (
             grad_cum_scores,

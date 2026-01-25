@@ -851,7 +851,7 @@ if HAS_TRITON:
         else:
             checkpoint_interval = max(checkpoint_interval, K)
 
-        num_checkpoints = (T + checkpoint_interval - 1) // checkpoint_interval + 1
+        num_checkpoints = (T + checkpoint_interval - 1) // checkpoint_interval
 
         # Pad C to next power of 2
         C_PAD = _next_power_of_2(C)
@@ -953,6 +953,7 @@ if HAS_TRITON:
                 stride_ckpt_n,
                 stride_ckpt_k,
                 stride_ckpt_c,
+                num_warps=2,
             )
 
         # Trim padding from checkpoints for return
@@ -1009,7 +1010,7 @@ if HAS_TRITON:
         else:
             checkpoint_interval = max(checkpoint_interval, K)
 
-        num_checkpoints = (T + checkpoint_interval - 1) // checkpoint_interval + 1
+        num_checkpoints = (T + checkpoint_interval - 1) // checkpoint_interval
 
         # Pad C to next power of 2
         C_PAD = _next_power_of_2(C)
@@ -1112,6 +1113,7 @@ if HAS_TRITON:
                 stride_bp_b,
                 stride_bp_t,
                 stride_bp_c,
+                num_warps=2,
             )
 
         return partition, bp_k, bp_c, final_labels

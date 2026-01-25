@@ -289,15 +289,33 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             )
         )
 
-        # Validate backward outputs - catch NaN/Inf before they corrupt parameters
+        # Validate ALL backward outputs - catch NaN/Inf before they corrupt parameters
         # This helps debug stochastic NaN issues in Triton kernels
-        if not torch.isfinite(grad_cum_scores).all():
-            nan_count = torch.isnan(grad_cum_scores).sum().item()
-            inf_count = torch.isinf(grad_cum_scores).sum().item()
-            raise RuntimeError(
-                f"Non-finite values in CRF backward (Triton): "
-                f"grad_cum_scores has {nan_count} NaN, {inf_count} Inf"
-            )
+        for name, tensor in [
+            ("grad_cum_scores", grad_cum_scores),
+            ("grad_transition", grad_transition),
+            ("grad_duration_bias", grad_duration_bias),
+        ]:
+            if not torch.isfinite(tensor).all():
+                nan_count = torch.isnan(tensor).sum().item()
+                inf_count = torch.isinf(tensor).sum().item()
+                raise RuntimeError(
+                    f"Non-finite values in CRF backward (Triton): "
+                    f"{name} has {nan_count} NaN, {inf_count} Inf"
+                )
+
+        if grad_proj_start is not None:
+            for name, tensor in [
+                ("grad_proj_start", grad_proj_start),
+                ("grad_proj_end", grad_proj_end),
+            ]:
+                if not torch.isfinite(tensor).all():
+                    nan_count = torch.isnan(tensor).sum().item()
+                    inf_count = torch.isinf(tensor).sum().item()
+                    raise RuntimeError(
+                        f"Non-finite values in CRF backward (Triton): "
+                        f"{name} has {nan_count} NaN, {inf_count} Inf"
+                    )
 
         return (
             grad_cum_scores,
