@@ -86,6 +86,9 @@ class SemiMarkovCRFHead(nn.Module):
             - A :class:`~torch_semimarkov.duration.DurationDistribution` instance
 
             Default: ``None`` (uses learned duration bias)
+        num_warps (int, optional): Number of warps per block for Triton kernels.
+            Higher values increase parallelism but also register pressure.
+            Recommended range: 2-8. Default: ``4``
 
     Attributes:
         transition (Parameter): Label transition scores of shape :math:`(C, C)`.
@@ -157,11 +160,13 @@ class SemiMarkovCRFHead(nn.Module):
         init_scale: float = 0.1,
         duration_distribution: Optional[Union[str, DurationDistribution]] = None,
         edge_memory_threshold: float = 8e9,
+        num_warps: int = 4,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.max_duration = max_duration
         self.edge_memory_threshold = edge_memory_threshold
+        self.num_warps = num_warps
 
         # CRF parameters
         self.transition = nn.Parameter(torch.randn(num_classes, num_classes) * init_scale)
@@ -458,6 +463,7 @@ class SemiMarkovCRFHead(nn.Module):
                 self.max_duration,
                 semiring="log",
                 use_triton=use_triton_final,
+                num_warps=self.num_warps,
             )
         else:
             # Use exact backend via semimarkov.py
@@ -670,6 +676,7 @@ class SemiMarkovCRFHead(nn.Module):
                 self.max_duration,
                 semiring="max",
                 use_triton=use_triton_final,
+                num_warps=self.num_warps,
             )
         else:
             # Use exact backend via semimarkov.py
@@ -790,6 +797,7 @@ class SemiMarkovCRFHead(nn.Module):
                 self.max_duration,
                 semiring="max",
                 use_triton=use_triton,
+                num_warps=self.num_warps,
             )
             all_segments = [[] for _ in range(batch)]
 

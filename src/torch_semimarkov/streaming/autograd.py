@@ -217,6 +217,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         semiring: str = "log",
         proj_start: Optional[torch.Tensor] = None,
         proj_end: Optional[torch.Tensor] = None,
+        num_warps: int = 4,
     ) -> torch.Tensor:
         # Use Triton kernel for forward
         partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
@@ -228,6 +229,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             semiring,
             proj_start=proj_start.detach() if proj_start is not None else None,
             proj_end=proj_end.detach() if proj_end is not None else None,
+            num_warps=num_warps,
         )
 
         # Save for backward
@@ -244,6 +246,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         ctx.K = K
         ctx.semiring = semiring
         ctx.checkpoint_interval = checkpoint_interval
+        ctx.num_warps = num_warps
 
         return partition
 
@@ -286,6 +289,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 grad_output,
                 proj_start=proj_start,
                 proj_end=proj_end,
+                num_warps=ctx.num_warps,
             )
         )
 
@@ -326,6 +330,7 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             None,  # semiring
             grad_proj_start,
             grad_proj_end,
+            None,  # num_warps
         )
 
 
@@ -340,8 +345,9 @@ def semi_crf_streaming_forward(
     proj_end: Optional[torch.Tensor] = None,
     use_triton: bool = True,
     use_compile: bool = False,  # Deprecated, kept for API compatibility
+    num_warps: int = 4,
 ) -> torch.Tensor:
-    r"""semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K, semiring="log", proj_start=None, proj_end=None, use_triton=True) -> Tensor
+    r"""semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K, semiring="log", proj_start=None, proj_end=None, use_triton=True, num_warps=4) -> Tensor
 
     Compute Semi-CRF partition function with streaming edge computation.
 
@@ -381,6 +387,9 @@ def semi_crf_streaming_forward(
             :math:`(\text{batch}, T, C)`. Default: ``None``
         use_triton (bool, optional): If ``True``, use Triton kernels when available.
             Default: ``True``
+        num_warps (int, optional): Number of warps per block for Triton kernels.
+            Higher values increase parallelism but also register pressure.
+            Recommended range: 2-8. Default: ``4``
 
     Returns:
         Tensor: Log partition function (or max score) of shape :math:`(\text{batch},)`.
@@ -456,6 +465,7 @@ def semi_crf_streaming_forward(
                 semiring,
                 proj_start,
                 proj_end,
+                num_warps,
             )
         else:
             # Pure PyTorch path
@@ -482,6 +492,7 @@ def semi_crf_streaming_forward(
                 semiring,
                 proj_start=proj_start,
                 proj_end=proj_end,
+                num_warps=num_warps,
             )
             return partition
         else:

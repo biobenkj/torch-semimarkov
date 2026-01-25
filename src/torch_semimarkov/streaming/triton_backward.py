@@ -775,8 +775,10 @@ if HAS_TRITON:
         proj_start: torch.Tensor = None,
         proj_end: torch.Tensor = None,
         return_boundary_marginals: bool = False,
+        num_warps: int = 4,
+        validate_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""launch_streaming_triton_backward(cum_scores, transition, duration_bias, lengths, log_Z, ring_checkpoints, checkpoint_interval, grad_output, proj_start=None, proj_end=None, return_boundary_marginals=False) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+        r"""launch_streaming_triton_backward(cum_scores, transition, duration_bias, lengths, log_Z, ring_checkpoints, checkpoint_interval, grad_output, proj_start=None, proj_end=None, return_boundary_marginals=False, num_warps=4, validate_cache=True) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
         Launch the Triton backward kernel with proper buffer allocation.
 
@@ -802,6 +804,11 @@ if HAS_TRITON:
                 :math:`(\text{batch}, T, C)`. Default: ``None``
             return_boundary_marginals (bool, optional): If ``True``, also compute
                 and return boundary marginals. Default: ``False``
+            num_warps (int, optional): Number of warps per block for Triton kernel.
+                Higher values increase parallelism but also register pressure.
+                Recommended range: 2-8. Default: ``4``
+            validate_cache (bool, optional): If True, validate Triton cache
+                consistency and warn on config changes. Default: ``True``
 
         Returns:
             tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]: Tuple of:
@@ -815,6 +822,13 @@ if HAS_TRITON:
                 - **boundary_marginals** (Tensor or None): Shape :math:`(\text{batch}, T)`
                   if ``return_boundary_marginals=True``.
         """
+        from .triton_cache import TritonConfig, update_cache_sentinel, validate_triton_cache
+
+        # Validate cache if requested (include TILE_C for backward kernel)
+        if validate_cache:
+            config = TritonConfig(num_warps=num_warps, tile_c=16)
+            validate_triton_cache(config)
+            update_cache_sentinel(config)
         batch, T_plus_1, C = cum_scores.shape
         T = T_plus_1 - 1
         K = duration_bias.shape[0]
@@ -1000,7 +1014,7 @@ if HAS_TRITON:
                 stride_bm_b,
                 stride_bm_t,
                 TILE_C=16,
-                num_warps=4,
+                num_warps=num_warps,
             )
 
         # Compute weighted sum of per-batch gradients for shared parameters.

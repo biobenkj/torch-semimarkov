@@ -809,8 +809,10 @@ if HAS_TRITON:
         checkpoint_interval: int = None,
         proj_start: torch.Tensor = None,
         proj_end: torch.Tensor = None,
+        num_warps: int = 4,
+        validate_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        r"""launch_streaming_triton_kernel(cum_scores, transition, duration_bias, lengths, K, semiring="log", checkpoint_interval=None, proj_start=None, proj_end=None) -> tuple[Tensor, Tensor, int]
+        r"""launch_streaming_triton_kernel(cum_scores, transition, duration_bias, lengths, K, semiring="log", checkpoint_interval=None, proj_start=None, proj_end=None, num_warps=4, validate_cache=True) -> tuple[Tensor, Tensor, int]
 
         Launch the streaming Triton kernel with proper buffer allocation.
 
@@ -832,6 +834,11 @@ if HAS_TRITON:
                 :math:`(\text{batch}, T, C)`. Default: ``None``
             proj_end (Tensor, optional): End boundary scores of shape
                 :math:`(\text{batch}, T, C)`. Default: ``None``
+            num_warps (int, optional): Number of warps per block for Triton kernel.
+                Higher values increase parallelism but also register pressure.
+                Recommended range: 2-8. Default: ``4``
+            validate_cache (bool, optional): If True, validate Triton cache
+                consistency and warn on config changes. Default: ``True``
 
         Returns:
             tuple[Tensor, Tensor, int]: Tuple of:
@@ -841,6 +848,13 @@ if HAS_TRITON:
                   :math:`(\text{batch}, \text{num\_ckpts}, K, C)`.
                 - **checkpoint_interval** (int): Actual interval used.
         """
+        from .triton_cache import TritonConfig, update_cache_sentinel, validate_triton_cache
+
+        # Validate cache if requested
+        if validate_cache:
+            config = TritonConfig(num_warps=num_warps)
+            validate_triton_cache(config)
+            update_cache_sentinel(config)
         batch, T_plus_1, C = cum_scores.shape
         T = T_plus_1 - 1
         device = cum_scores.device
@@ -954,7 +968,7 @@ if HAS_TRITON:
                 stride_ckpt_n,
                 stride_ckpt_k,
                 stride_ckpt_c,
-                num_warps=4,
+                num_warps=num_warps,
             )
 
         # Trim padding from checkpoints for return
@@ -971,6 +985,8 @@ if HAS_TRITON:
         checkpoint_interval: int = None,
         proj_start: torch.Tensor = None,
         proj_end: torch.Tensor = None,
+        num_warps: int = 4,
+        validate_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""Launch Triton max kernel with backpointer tracking for Viterbi decoding.
 
@@ -988,6 +1004,11 @@ if HAS_TRITON:
                 If ``None``, uses :math:`\sqrt{T \times K}`. Default: ``None``
             proj_start (Tensor, optional): Start boundary scores. Default: ``None``
             proj_end (Tensor, optional): End boundary scores. Default: ``None``
+            num_warps (int, optional): Number of warps per block for Triton kernel.
+                Higher values increase parallelism but also register pressure.
+                Recommended range: 2-8. Default: ``4``
+            validate_cache (bool, optional): If True, validate Triton cache
+                consistency and warn on config changes. Default: ``True``
 
         Returns:
             tuple[Tensor, Tensor, Tensor, Tensor]: Tuple of:
@@ -1000,6 +1021,13 @@ if HAS_TRITON:
                 - **final_labels** (Tensor): Best final label of shape
                   :math:`(\text{batch},)`.
         """
+        from .triton_cache import TritonConfig, update_cache_sentinel, validate_triton_cache
+
+        # Validate cache if requested
+        if validate_cache:
+            config = TritonConfig(num_warps=num_warps)
+            validate_triton_cache(config)
+            update_cache_sentinel(config)
         batch, T_plus_1, C = cum_scores.shape
         T = T_plus_1 - 1
         device = cum_scores.device
@@ -1114,7 +1142,7 @@ if HAS_TRITON:
                 stride_bp_b,
                 stride_bp_t,
                 stride_bp_c,
-                num_warps=4,
+                num_warps=num_warps,
             )
 
         return partition, bp_k, bp_c, final_labels
