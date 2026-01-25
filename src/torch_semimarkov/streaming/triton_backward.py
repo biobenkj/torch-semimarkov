@@ -627,6 +627,9 @@ if HAS_TRITON:
                                     # Note: We use atomic_add here because scatter with constexpr
                                     # indices is not supported in Triton. This is still more efficient
                                     # than the non-tiled version since we write (TILE_C,) per tile.
+                                    # FUTURE OPTIMIZATION: Accumulate locally across all k and tiles,
+                                    # then write once after the k-loop. Requires restructuring loops
+                                    # (tile outside k, or C_PAD-sized local accumulator with scatter).
                                     tl.atomic_add(
                                         grad_cs_base
                                         + t * stride_gcs_t
@@ -894,8 +897,10 @@ if HAS_TRITON:
         # We convert back to original dtype before returning.
         accum_dtype = torch.float64
 
-        # Allocate gradient outputs with C_PAD and higher precision
-        grad_cum_scores = torch.zeros(batch, T_plus_1, C_PAD, device=device, dtype=accum_dtype)
+        # Allocate gradient outputs with C_PAD
+        # grad_cum_scores uses float32: each batch writes to its own slice (no cross-batch atomics)
+        # so float32 precision is sufficient. This reduces memory bandwidth by 50%.
+        grad_cum_scores = torch.zeros(batch, T_plus_1, C_PAD, device=device, dtype=torch.float32)
         grad_duration_bias = torch.zeros(K, C, device=device, dtype=accum_dtype)
 
         # Allocate per-batch workspace buffers with higher precision
@@ -1013,7 +1018,7 @@ if HAS_TRITON:
                 stride_gdbw_c,
                 stride_bm_b,
                 stride_bm_t,
-                TILE_C=16,
+                TILE_C=32,  # Increased from 16 to reduce tile iterations (4→2 for C_PAD=64)
                 num_warps=num_warps,
             )
 
@@ -1050,7 +1055,8 @@ if HAS_TRITON:
         grad_duration_bias = torch.einsum("bkc, b -> kc", grad_db_workspace, grad_output_f64)
 
         # Slice padded gradients back to actual class count C
-        # and convert from float64 accumulation dtype back to original dtype
+        # grad_cum_scores: float32 → original dtype (may be no-op if dtype is float32)
+        # grad_transition/grad_duration_bias: float64 → original dtype
         grad_cum_scores = grad_cum_scores[:, :, :C].to(dtype)
         grad_transition = grad_transition.to(dtype)
         grad_duration_bias = grad_duration_bias.to(dtype)
