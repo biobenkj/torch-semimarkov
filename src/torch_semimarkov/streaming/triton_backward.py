@@ -1018,7 +1018,7 @@ if HAS_TRITON:
                 stride_gdbw_c,
                 stride_bm_b,
                 stride_bm_t,
-                TILE_C=32,  # Increased from 16 to reduce tile iterations (4→2 for C_PAD=64)
+                TILE_C=16,  # DO NOT INCREASE - TILE_C=32 causes register spills (14x slowdown)
                 num_warps=num_warps,
             )
 
