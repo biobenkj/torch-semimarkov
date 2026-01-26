@@ -9,12 +9,6 @@ Gradients computed via marginal probabilities:
 .. math::
     P(\text{segment}) = \frac{\exp(\alpha + \text{edge} + \beta)}{\exp(\log Z)}
 
-Memory vs Stability Tradeoff
-----------------------------
-This kernel supports configurable precision via ``accum_dtype`` parameter.
-The ~120K atomic_add operations per batch accumulate floating-point error that causes
-NaN/Inf at batch sizes >= 128 when using float32.
-
 **Configuration:**
 
 - ``accum_dtype=torch.float64`` (default): Stable at batch >= 128, ~1.5x memory, ~2x slower
