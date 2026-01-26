@@ -19,12 +19,22 @@ class SemiMarkovCRFHead(nn.Module):
         init_scale: float = 0.1,       # Parameter initialization scale
         duration_distribution: str = None,  # "learned", "geometric", "poisson", etc.
         edge_memory_threshold: float = 8e9,  # Memory threshold for backend selection (8GB)
+        accum_dtype: torch.dtype = torch.float64,  # Gradient accumulation precision
+        num_warps: int = 4,            # Triton kernel parallelism (2-8 recommended)
     ):
         """
         CRF head for Semi-Markov sequence labeling.
 
         Compatible with DDP - gradients sync automatically via standard PyTorch.
         Memory: O(KC) independent of sequence length T.
+
+        Transition Matrix Convention:
+            transition[i, j] = score for transitioning FROM label i TO label j.
+
+        Note:
+            For T > 100K, use float32 precision for numerical stability.
+            Use accum_dtype=torch.float64 (default) for batch >= 128.
+            Use accum_dtype=torch.float32 for lower memory at batch <= 64.
         """
 
     def forward(
@@ -32,7 +42,7 @@ class SemiMarkovCRFHead(nn.Module):
         hidden_states,  # (batch, T, hidden_dim) or (batch, T, C)
         lengths,        # (batch,) sequence lengths
         use_triton=True,
-        backend="auto",  # "auto", "streaming", or "exact"
+        backend="auto",  # "auto", "streaming", "exact", or "binary_tree_sharded"
     ) -> dict:
         """
         Compute partition function.
@@ -42,6 +52,7 @@ class SemiMarkovCRFHead(nn.Module):
                 - "auto": Select based on memory heuristic (default)
                 - "streaming": Force streaming backend (genome-scale)
                 - "exact": Force exact backend via semimarkov.py
+                - "binary_tree_sharded": Memory-efficient reference with checkpointing
 
         Returns:
             dict with 'partition' (batch,) and 'cum_scores' (batch, T+1, C)
@@ -53,7 +64,7 @@ class SemiMarkovCRFHead(nn.Module):
         lengths,
         labels,         # (batch, T) per-position labels
         use_triton=True,
-        backend="auto",  # "auto", "streaming", or "exact"
+        backend="auto",  # "auto", "streaming", "exact", or "binary_tree_sharded"
         reduction="mean",
     ) -> Tensor:
         """Compute negative log-likelihood loss."""
@@ -63,7 +74,7 @@ class SemiMarkovCRFHead(nn.Module):
         hidden_states,
         lengths,
         use_triton=True,
-        backend="auto",  # "auto", "streaming", or "exact"
+        backend="auto",  # "auto", "streaming", "exact", or "binary_tree_sharded"
     ) -> Tensor:
         """Viterbi decoding - returns best score (batch,)."""
 
@@ -72,8 +83,16 @@ class SemiMarkovCRFHead(nn.Module):
         hidden_states,
         lengths,
         max_traceback_length=10000,
+        use_triton=True,
     ) -> ViterbiResult:
         """Viterbi with path reconstruction. Returns (scores, segments)."""
+
+    def parameter_penalty(self, p: float = 2.0) -> Tensor:
+        """
+        Compute Lp penalty on CRF parameters for regularization.
+
+        Returns: ||transition||_p^p + ||duration_bias||_p^p
+        """
 ```
 
 **Example usage:**
@@ -106,7 +125,89 @@ loss.backward()
 result = crf.decode_with_traceback(hidden, lengths)
 for seg in result.segments[0]:
     print(f"[{seg.start}, {seg.end}] label={seg.label}")
+
+# Regularization
+reg_loss = loss + 0.01 * crf.parameter_penalty()
 ```
+
+## Code Execution Flow
+
+Understanding how data flows through the CRF head helps with debugging and optimization.
+
+### Training Flow (compute_loss)
+
+```text
+hidden_states (batch, T, hidden_dim)
+       │
+       ▼ [projection layer, if hidden_dim provided]
+   scores (batch, T, C)
+       │
+       ▼ [zero-center for numerical stability]
+   scores_centered = scores - scores.mean(dim=1)
+       │
+       ▼ [cumulative sum in float32]
+   cum_scores (batch, T+1, C)
+       │
+       ▼ [backend selection based on edge_memory_threshold]
+       │
+       ├── streaming (T*K*C² > threshold)
+       │        │
+       │        ▼
+       │   semi_crf_streaming_forward()
+       │        │
+       │        ▼ [Triton kernel with O(KC) ring buffer]
+       │   partition (batch,)
+       │
+       └── exact (T*K*C² ≤ threshold)
+                │
+                ▼
+           _build_edge_tensor() → edge (batch, T, K, C, C)
+                │
+                ▼
+           SemiMarkov.logpartition()
+                │
+                ▼
+           partition (batch,)
+       │
+       ▼ [score gold segmentation via label changes]
+   gold_score = score_gold_vectorized(cum_scores, labels, ...)
+       │
+       ▼
+   NLL = partition - gold_score
+```
+
+### Inference Flow (decode_with_traceback)
+
+```text
+hidden_states (batch, T, hidden_dim)
+       │
+       ▼ [same preprocessing as training]
+   cum_scores (batch, T+1, C)
+       │
+       ▼ [streaming Viterbi with backpointer storage]
+   semi_crf_streaming_viterbi_with_backpointers()
+       │
+       ├── max_scores (batch,)
+       ├── bp_k (batch, T, C)  ← best duration at each (position, label)
+       ├── bp_c (batch, T, C)  ← best source label at each (position, label)
+       └── final_labels (batch,)
+       │
+       ▼ [O(T) traceback using backpointers]
+   _traceback_from_backpointers()
+       │
+       ▼
+   ViterbiResult(scores, List[List[Segment]])
+```
+
+### Key Files
+
+| Component | File |
+| --------- | ---- |
+| CRF head module | [nn.py](../src/torch_semimarkov/nn.py) |
+| Streaming kernels | [streaming/autograd.py](../src/torch_semimarkov/streaming/autograd.py) |
+| Triton forward | [streaming/triton_forward.py](../src/torch_semimarkov/streaming/triton_forward.py) |
+| Triton backward | [streaming/triton_backward.py](../src/torch_semimarkov/streaming/triton_backward.py) |
+| Gold scoring | [helpers.py](../src/torch_semimarkov/helpers.py) |
 
 ## UncertaintySemiMarkovCRFHead
 
@@ -120,6 +221,7 @@ class UncertaintySemiMarkovCRFHead(SemiMarkovCRFHead):
     SemiMarkovCRFHead with uncertainty methods.
 
     Additional methods for boundary confidence and active learning.
+    Inherits all parameters from SemiMarkovCRFHead including accum_dtype and num_warps.
     """
 
     def compute_boundary_marginals(
@@ -165,6 +267,20 @@ class UncertaintySemiMarkovCRFHead(SemiMarkovCRFHead):
         Returns: (batch,) entropy estimates
         """
 
+    def compute_entropy_exact(
+        self,
+        hidden_states,
+        lengths,
+    ) -> Tensor:
+        """
+        Exact entropy via EntropySemiring (T < 10K only).
+
+        Computes H(P) = -sum_y P(y) log P(y) using the entropy semiring.
+        Requires building the full edge tensor, so only works for short sequences.
+
+        Returns: (batch,) exact entropy values
+        """
+
     def compute_loss_uncertainty_weighted(
         self,
         hidden_states,
@@ -195,6 +311,10 @@ boundary_probs = model.compute_boundary_marginals(hidden, lengths)
 # Force streaming backend for genome-scale sequences
 boundary_probs = model.compute_boundary_marginals(hidden, lengths, backend="streaming")
 
+# Entropy computation
+entropy_approx = model.compute_entropy_streaming(hidden, lengths)  # T > 10K
+entropy_exact = model.compute_entropy_exact(hidden, lengths)       # T < 10K
+
 # Uncertainty-weighted training for active learning
 loss = model.compute_loss_uncertainty_weighted(hidden, lengths, labels)
 ```
@@ -218,12 +338,22 @@ def semi_crf_streaming_forward(
     max_duration,     # K
     semiring="log",   # "log" (partition) or "max" (Viterbi)
     use_triton=True,  # Use Triton kernel if available
+    accum_dtype=torch.float64,  # Gradient accumulation precision
+    num_warps=4,      # Triton kernel parallelism (2-8 recommended)
 ) -> Tensor:
     """
     Memory-efficient Semi-CRF forward with on-the-fly edge computation.
 
     Memory: O(T*C) for cum_scores vs O(T*K*C^2) for edge tensor
     - T=400K, K=3K, C=24: 38 MB vs 2.76 TB
+
+    Args:
+        accum_dtype: Dtype for gradient accumulation in backward pass.
+            Use torch.float64 (default) for numerical stability at batch >= 128.
+            Use torch.float32 for lower memory at batch <= 64.
+        num_warps: Number of warps per block for Triton kernels.
+            Higher values increase parallelism but also register pressure.
+            Recommended range: 2-8. Default: 4
 
     Returns:
         partition: (batch,) log partition function or Viterbi score
@@ -247,6 +377,80 @@ cum_scores[:, 1:] = torch.cumsum(projected.float(), dim=1)
 partition = semi_crf_streaming_forward(
     cum_scores, transition, duration_bias, lengths, max_duration
 )
+```
+
+## Streaming Internals (Advanced)
+
+Low-level components of the streaming API for advanced use cases.
+
+### compute_edge_block_streaming
+
+Compute edge potentials for a single (position, duration) pair on-the-fly:
+
+```python
+from torch_semimarkov.streaming import compute_edge_block_streaming
+
+def compute_edge_block_streaming(
+    cum_scores,      # (batch, T+1, C)
+    transition,      # (C, C)
+    duration_bias,   # (K, C)
+    start: int,      # Segment start position
+    k: int,          # Segment duration
+) -> Tensor:
+    """
+    Compute edge block for segment [start, start+k) on-the-fly.
+
+    Returns: (batch, C_dest, C_src) edge potentials
+    """
+```
+
+### Autograd Functions
+
+PyTorch autograd functions for streaming Semi-CRF with custom backward passes:
+
+```python
+from torch_semimarkov.streaming import SemiCRFStreaming, SemiCRFStreamingTriton
+
+# Pure PyTorch (CPU or GPU without Triton)
+class SemiCRFStreaming(torch.autograd.Function):
+    """
+    O(KC) memory streaming forward-backward.
+
+    Uses gradient checkpointing to recompute alpha values during backward,
+    trading compute for memory.
+    """
+
+# Triton-accelerated (GPU with Triton)
+class SemiCRFStreamingTriton(torch.autograd.Function):
+    """
+    O(KC) memory with hand-written Triton backward kernels.
+
+    Provides faster backward pass by avoiding torch.compile overhead.
+    """
+```
+
+### Triton Launchers (Conditionally Available)
+
+When Triton is installed, these low-level kernel launchers are available:
+
+```python
+from torch_semimarkov.streaming import HAS_TRITON
+
+if HAS_TRITON:
+    from torch_semimarkov.streaming import (
+        launch_streaming_triton_kernel,      # Forward pass
+        launch_streaming_triton_backward,    # Backward pass
+        launch_streaming_triton_kernel_max_bp,  # Viterbi with backpointers
+        semi_crf_streaming_viterbi_triton,   # Full Viterbi decoding
+    )
+```
+
+### Constants
+
+```python
+from torch_semimarkov.streaming import NEG_INF
+
+NEG_INF  # Large negative value for log-space operations (-1e38)
 ```
 
 ## Duration Distributions
@@ -459,6 +663,165 @@ class ViterbiResult(NamedTuple):
     segments: List[List[Segment]]  # Per-batch segment lists
 ```
 
+## Sparse Matrix Backends (Experimental)
+
+These classes provide memory-efficient sparse representations for Semi-Markov
+structures. They are primarily used for benchmarking and experimentation.
+
+### BandedMatrix
+
+Lightweight banded matrix representation for CPU/PyTorch operations:
+
+```python
+from torch_semimarkov import BandedMatrix
+
+@dataclass
+class BandedMatrix:
+    """
+    Banded matrix representation for memory-efficient sparse operations.
+
+    Stores only the non-zero diagonals of a banded matrix in a compact format.
+    Supports log-semiring and max-semiring matrix multiplication.
+    """
+    data: Tensor   # (batch, n, lu+ld+1)
+    lu: int        # Number of upper diagonals
+    ld: int        # Number of lower diagonals
+    fill: float = 0.0
+
+    @classmethod
+    def from_dense(cls, dense, lu, ld, fill=0.0) -> BandedMatrix:
+        """Extract banded view from dense square matrix."""
+
+    def to_dense(self) -> Tensor:
+        """Expand back to dense matrix."""
+
+    def transpose(self) -> BandedMatrix:
+        """Transpose the banded matrix."""
+
+    def multiply_log(self, other) -> BandedMatrix:
+        """Log-semiring matrix multiplication."""
+
+    def multiply_max(self, other) -> BandedMatrix:
+        """Max-semiring matrix multiplication."""
+```
+
+**Example:**
+
+```python
+from torch_semimarkov import BandedMatrix
+
+# Create banded matrix from dense
+dense = torch.randn(2, 10, 10)
+banded = BandedMatrix.from_dense(dense, lu=2, ld=2)
+print(banded.data.shape)  # (2, 10, 5)
+
+# Convert back to dense
+reconstructed = banded.to_dense()
+```
+
+### BlockTriangularMatrix
+
+Block-triangular sparse representation exploiting duration constraint `k1 + k2 <= span`:
+
+```python
+from torch_semimarkov import BlockTriangularMatrix, block_triang_matmul
+
+@dataclass
+class BlockTriangularMatrix:
+    """
+    Block-triangular matrix over duration states.
+
+    Stores only blocks (k1, k2) satisfying the duration constraint,
+    reducing memory from O(K²C²) to O(K(K+1)/2 * C²).
+    """
+    values: Tensor        # (batch, num_blocks, C, C)
+    block_indices: Tensor # (num_blocks, 2) - (k1, k2) coordinates
+    K: int
+    C: int
+
+    @classmethod
+    def from_dense(cls, dense, K, C, span, duration_mask=None) -> BlockTriangularMatrix:
+        """Compress dense to block-triangular representation."""
+
+    def to_dense(self, semiring=None) -> Tensor:
+        """Expand back to dense matrix."""
+
+def block_triang_matmul(left, right, semiring, span) -> BlockTriangularMatrix:
+    """Sparse semiring matrix multiplication."""
+```
+
+**Example:**
+
+```python
+from torch_semimarkov import BlockTriangularMatrix
+
+dense = torch.randn(2, 12, 12)  # K=4, C=3
+bt = BlockTriangularMatrix.from_dense(dense, K=4, C=3, span=4)
+print(bt.values.shape)  # (2, 10, 3, 3) - only 10 blocks satisfy k1+k2 <= 4
+```
+
+## Banded Utilities
+
+Utilities for analyzing and optimizing banded matrix structures:
+
+```python
+from torch_semimarkov import (
+    measure_effective_bandwidth,
+    snake_ordering,
+    rcm_ordering_from_adjacency,
+    apply_permutation,
+)
+
+def measure_effective_bandwidth(adj, fill_value=None) -> int:
+    """
+    Compute maximum distance from diagonal of any non-fill entry.
+
+    Args:
+        adj: Adjacency matrix (n, n) or (batch, n, n), or BandedMatrix
+        fill_value: Value representing empty/non-edges (auto-detected if None)
+
+    Returns:
+        Maximum distance from diagonal
+    """
+
+def snake_ordering(K, C) -> Tensor:
+    """
+    Generate snake ordering permutation for (K, C) state space.
+
+    Interleaves low and high duration states to reduce bandwidth:
+    [0, K-1, 1, K-2, 2, K-3, ...] for each label.
+
+    Returns: Permutation tensor of shape (K*C,)
+    """
+
+def rcm_ordering_from_adjacency(adj) -> tuple[Tensor, bool]:
+    """
+    Compute Reverse Cuthill-McKee ordering (requires SciPy).
+
+    Minimizes bandwidth of sparse matrices.
+
+    Returns: (permutation, success) - success=False if SciPy unavailable
+    """
+
+def apply_permutation(potentials, perm) -> Tensor:
+    """Apply permutation to both dimensions of a matrix."""
+```
+
+**Example:**
+
+```python
+from torch_semimarkov import measure_effective_bandwidth, snake_ordering
+
+adj = torch.eye(5)
+print(measure_effective_bandwidth(adj))  # 0
+
+adj[0, 4] = 1  # Add off-diagonal entry
+print(measure_effective_bandwidth(adj))  # 4
+
+# Generate snake ordering for K=10, C=3
+perm = snake_ordering(10, 3)
+```
+
 ## Memory Comparison
 
 | Scenario | Edge tensor size | Streaming API size |
@@ -478,5 +841,9 @@ class ViterbiResult(NamedTuple):
 
 ## See Also
 
-- [Backends and Triton kernel](backends.md) - Detailed kernel behavior and options
-- [Integration guide](workflow_integration.md) - End-to-end training examples
+- [Backends and Triton kernel](backends.md) - Detailed kernel behavior and backend selection
+- [Integration guide](workflow_integration.md) - End-to-end training examples with BERT, Mamba, CNNs
+- [Streaming internals](streaming_internals.md) - Low-level algorithm details and numerical stability
+- [Uncertainty and focused learning](uncertainty_and_focused_learning.md) - Boundary confidence and active learning
+- [Parameter guide: T, K, C](parameter_guide.md) - Understanding sequence length, duration, and state dimensions
+- [Semirings guide](semirings.md) - Mathematical context for semiring operations

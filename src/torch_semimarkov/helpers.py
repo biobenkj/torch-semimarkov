@@ -30,48 +30,60 @@ class ViterbiResult:
     segments: list[list[Segment]]
 
 
-class Chart:
-    """DP chart tensor with semiring initialization and gradient tracking."""
-
-    def __init__(self, size, potentials, semiring):
-        c = torch.zeros(
-            *((semiring.size(),) + size), dtype=potentials.dtype, device=potentials.device
-        )
-        c[:] = semiring.zero.view((semiring.size(),) + len(size) * (1,))
-        self.data = c
-        self.grad = self.data.detach().clone().fill_(0.0)
-
-    def __getitem__(self, ind):
-        slice_all = slice(None)
-        return self.data[(slice_all, slice_all) + ind]
-
-    def __setitem__(self, ind, new):
-        slice_all = slice(None)
-        self.data[(slice_all, slice_all) + ind] = new
-
-
 class _Struct:
-    """Base class for structured prediction with semiring DP algorithms."""
+    """Base class for structured prediction with semiring DP algorithms.
+
+    Provides common infrastructure for semiring-parameterized dynamic programming:
+    chart allocation, scoring, marginal computation, and binary tree utilities.
+
+    Args:
+        semiring: Semiring class defining zero, one, sum, and prod operations.
+            Defaults to LogSemiring for partition function computation.
+    """
 
     def __init__(self, semiring=LogSemiring):
         self.semiring = semiring
 
     def score(self, potentials, parts, batch_dims=None):
-        """Score a structure given potentials and binary parts indicator."""
+        """Score a structure given potentials and binary parts indicator.
+
+        Args:
+            potentials: Log-potentials tensor.
+            parts: Binary indicator tensor (same shape as potentials).
+            batch_dims: List of batch dimension indices. Defaults to [0].
+
+        Returns:
+            Semiring product of selected potentials, shape determined by batch_dims.
+        """
         if batch_dims is None:
             batch_dims = [0]
         score = torch.mul(potentials, parts)
         batch = tuple(score.shape[b] for b in batch_dims)
         return self.semiring.prod(score.view(batch + (-1,)))
 
-    def _bin_length(self, length):
-        """Return (log_N, bin_N) for binary tree with padded power-of-2 length."""
+    def _bin_length(self, length: int) -> tuple[int, int]:
+        """Compute binary tree parameters for given sequence length.
+
+        Args:
+            length: Original sequence length.
+
+        Returns:
+            Tuple of (log_N, bin_N) where log_N is the tree depth and
+            bin_N is the padded power-of-2 length.
+        """
         log_N = int(math.ceil(math.log(length, 2)))
         bin_N = int(math.pow(2, log_N))
         return log_N, bin_N
 
     def _get_dimension(self, edge):
-        """Extract dimensions from edge potentials and enable gradients."""
+        """Extract dimensions from edge potentials and enable gradients.
+
+        Args:
+            edge: Edge potentials tensor or list of tensors.
+
+        Returns:
+            Shape tuple from edge (or first element if list).
+        """
         if isinstance(edge, list):
             for t in edge:
                 t.requires_grad_(True)
@@ -80,12 +92,33 @@ class _Struct:
             edge.requires_grad_(True)
             return edge.shape
 
-    def _chart(self, size, potentials, force_grad):
-        """Allocate a single DP chart tensor."""
+    def _chart(self, size: tuple, potentials: Tensor, force_grad: bool) -> Tensor:
+        """Allocate a single DP chart tensor.
+
+        Args:
+            size: Shape tuple for the chart (excluding semiring dimension).
+            potentials: Reference tensor for dtype and device.
+            force_grad: Whether to enable gradients on the chart.
+
+        Returns:
+            Chart tensor of shape (semiring.size(), *size) initialized to semiring.zero.
+        """
         return self._make_chart(1, size, potentials, force_grad)[0]
 
-    def _make_chart(self, N, size, potentials, force_grad=False):
-        """Allocate N DP chart tensors initialized to semiring.zero."""
+    def _make_chart(
+        self, N: int, size: tuple, potentials: Tensor, force_grad: bool = False
+    ) -> list:
+        """Allocate N DP chart tensors initialized to semiring.zero.
+
+        Args:
+            N: Number of chart tensors to allocate.
+            size: Shape tuple for each chart (excluding semiring dimension).
+            potentials: Reference tensor for dtype and device.
+            force_grad: Whether to enable gradients (only if potentials doesn't require grad).
+
+        Returns:
+            List of N chart tensors, each of shape (semiring.size(), *size).
+        """
         chart = []
         for _ in range(N):
             c = torch.zeros(

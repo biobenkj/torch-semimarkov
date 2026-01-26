@@ -142,11 +142,11 @@ This library follows **destination-first** convention for edge tensors, where `e
 
 ### Triton Kernel
 
-When Triton is installed, torch-semimarkov uses fused GPU kernels that significantly accelerate both forward and backward passes.
+When Triton is installed, torch-semimarkov uses custom GPU kernels with fused edge computation that significantly accelerate both forward and backward passes.
 
 **How it works:**
 
-The streaming API computes edge potentials on-the-fly from cumulative scores rather than materializing the full `O(T × K × C²)` edge tensor. The Triton kernel fuses this computation with the forward scan:
+The streaming API computes edge potentials on-the-fly from cumulative scores rather than materializing the full `O(T × K × C²)` edge tensor. The Triton kernel fuses this edge computation with the DP scan:
 
 ```
 # Edge computed on-the-fly (never materialized):
@@ -157,7 +157,7 @@ edge[t, k, c_dst, c_src] = content + duration_bias[k, c] + transition[c_src, c_d
 Key optimizations:
 - **Fused edge computation** — computes edges on-the-fly via prefix-sum, avoiding the full edge tensor
 - **O(KC) memory** — ring buffer for DP state, independent of sequence length
-- **Custom backward kernel** — custom Triton kernel for gradients, not autograd
+- **Separate forward/backward kernels** — the forward-backward algorithm requires computing marginals from both α (forward) and β (backward) messages, so these are necessarily separate kernel launches with checkpointing
 - **Checkpointing** — trades compute for memory by recomputing alpha values during backward
 
 **Usage:**
