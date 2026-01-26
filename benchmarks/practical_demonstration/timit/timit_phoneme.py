@@ -1282,6 +1282,318 @@ def labels_to_segments(labels: list[int]) -> list[SegmentAnnotation]:
     return segments
 
 
+# =============================================================================
+# Enhanced Duration Analysis Functions
+# =============================================================================
+
+
+def load_corpus_duration_stats(data_dir: Path) -> dict:
+    """Load raw TIMIT duration statistics from preprocessing.
+
+    Args:
+        data_dir: Path to preprocessed TIMIT data directory
+
+    Returns:
+        Dictionary with per-phoneme statistics from train_segment_stats.json
+    """
+    stats_file = data_dir / "train_segment_stats.json"
+    if not stats_file.exists():
+        logger.warning(f"Corpus stats file not found: {stats_file}")
+        return {}
+
+    with open(stats_file) as f:
+        return json.load(f)
+
+
+def compute_kl_divergence(
+    pred_durations: list[int], ref_durations: list[int], max_dur: int = 50
+) -> float:
+    """Compute KL divergence between predicted and reference duration distributions.
+
+    Args:
+        pred_durations: List of predicted segment durations
+        ref_durations: List of reference segment durations
+        max_dur: Maximum duration for histogram binning
+
+    Returns:
+        KL divergence D_KL(pred || ref), or 0 if insufficient data
+    """
+    if len(pred_durations) < 5 or len(ref_durations) < 5:
+        return 0.0
+
+    # Bin durations into histogram
+    bins = range(1, max_dur + 2)
+    pred_hist, _ = np.histogram(pred_durations, bins=bins, density=True)
+    ref_hist, _ = np.histogram(ref_durations, bins=bins, density=True)
+
+    # Add smoothing to avoid log(0)
+    eps = 1e-10
+    pred_hist = pred_hist + eps
+    ref_hist = ref_hist + eps
+
+    # Normalize
+    pred_hist = pred_hist / pred_hist.sum()
+    ref_hist = ref_hist / ref_hist.sum()
+
+    # KL divergence: D_KL(pred || ref) = sum(pred * log(pred / ref))
+    return float(np.sum(pred_hist * np.log(pred_hist / ref_hist)))
+
+
+def compute_js_divergence(
+    pred_durations: list[int], ref_durations: list[int], max_dur: int = 50
+) -> float:
+    """Compute Jensen-Shannon divergence (symmetric alternative to KL).
+
+    Args:
+        pred_durations: List of predicted segment durations
+        ref_durations: List of reference segment durations
+        max_dur: Maximum duration for histogram binning
+
+    Returns:
+        JS divergence, or 0 if insufficient data
+    """
+    if len(pred_durations) < 5 or len(ref_durations) < 5:
+        return 0.0
+
+    # Bin durations into histogram
+    bins = range(1, max_dur + 2)
+    pred_hist, _ = np.histogram(pred_durations, bins=bins, density=True)
+    ref_hist, _ = np.histogram(ref_durations, bins=bins, density=True)
+
+    # Add smoothing
+    eps = 1e-10
+    pred_hist = pred_hist + eps
+    ref_hist = ref_hist + eps
+
+    # Normalize
+    pred_hist = pred_hist / pred_hist.sum()
+    ref_hist = ref_hist / ref_hist.sum()
+
+    # Midpoint distribution
+    m = (pred_hist + ref_hist) / 2
+
+    # JS divergence = (KL(pred || m) + KL(ref || m)) / 2
+    kl_pm = np.sum(pred_hist * np.log(pred_hist / m))
+    kl_rm = np.sum(ref_hist * np.log(ref_hist / m))
+
+    return float((kl_pm + kl_rm) / 2)
+
+
+def compute_enhanced_duration_stats(
+    pred_segments: list[list[SegmentAnnotation]],
+    true_segments: list[list[SegmentAnnotation]],
+    max_dur: int = 50,
+) -> dict:
+    """Compute enhanced duration statistics including KL divergence.
+
+    Returns dict with:
+        - per_phone: {phone_name: {..., kl_div, js_div}}
+        - overall: {..., weighted_kl, weighted_js}
+    """
+    pred_durations = defaultdict(list)
+    ref_durations = defaultdict(list)
+
+    for pred_segs, ref_segs in zip(pred_segments, true_segments, strict=False):
+        for seg in pred_segs:
+            pred_durations[seg.label].append(seg.end - seg.start)
+        for seg in ref_segs:
+            ref_durations[seg.label].append(seg.end - seg.start)
+
+    per_phone = {}
+    all_pred_means = []
+    all_ref_means = []
+    weighted_kl = 0.0
+    weighted_js = 0.0
+    total_ref_count = 0
+
+    for label in range(NUM_PHONES):
+        phone_name = PHONES_39[label]
+        pred_d = list(pred_durations[label]) if pred_durations[label] else [0]
+        ref_d = list(ref_durations[label]) if ref_durations[label] else [0]
+
+        pred_mean = float(np.mean(pred_d))
+        ref_mean = float(np.mean(ref_d))
+
+        # Compute KL and JS divergence
+        kl_div = compute_kl_divergence(pred_d, ref_d, max_dur)
+        js_div = compute_js_divergence(pred_d, ref_d, max_dur)
+
+        per_phone[phone_name] = {
+            "pred_mean": pred_mean,
+            "pred_std": float(np.std(pred_d)),
+            "ref_mean": ref_mean,
+            "ref_std": float(np.std(ref_d)),
+            "mae": abs(pred_mean - ref_mean),
+            "pred_count": len(pred_durations[label]),
+            "ref_count": len(ref_durations[label]),
+            "kl_divergence": kl_div,
+            "js_divergence": js_div,
+        }
+
+        if ref_durations[label]:
+            all_pred_means.append(pred_mean)
+            all_ref_means.append(ref_mean)
+            # Weighted by reference count
+            weighted_kl += kl_div * len(ref_durations[label])
+            weighted_js += js_div * len(ref_durations[label])
+            total_ref_count += len(ref_durations[label])
+
+    # Overall correlation
+    if len(all_pred_means) > 1:
+        correlation = float(np.corrcoef(all_pred_means, all_ref_means)[0, 1])
+    else:
+        correlation = 0.0
+
+    overall_mae = float(
+        np.mean([abs(p - r) for p, r in zip(all_pred_means, all_ref_means, strict=True)])
+    )
+
+    return {
+        "per_phone": per_phone,
+        "overall": {
+            "mean_absolute_error": overall_mae,
+            "duration_correlation": correlation,
+            "weighted_kl_divergence": weighted_kl / total_ref_count if total_ref_count > 0 else 0,
+            "weighted_js_divergence": weighted_js / total_ref_count if total_ref_count > 0 else 0,
+        },
+    }
+
+
+def export_duration_analysis(results: dict, corpus_stats: dict, output_path: Path):
+    """Export detailed duration analysis to JSON and CSV.
+
+    Args:
+        results: Dictionary of model results (each with TIMITMetrics)
+        corpus_stats: Raw TIMIT corpus statistics from preprocessing
+        output_path: Base path for output files (will create .json and .csv)
+    """
+    import csv
+
+    output = {
+        "corpus_stats": corpus_stats,
+        "model_comparisons": {},
+    }
+
+    for model_name, metrics in results.items():
+        if hasattr(metrics, "duration_stats") and metrics.duration_stats:
+            output["model_comparisons"][model_name] = {
+                "per_phone": metrics.duration_stats["per_phone"],
+                "overall": metrics.duration_stats["overall"],
+            }
+
+    # JSON export
+    json_path = output_path.with_suffix(".json")
+    with open(json_path, "w") as f:
+        json.dump(output, f, indent=2)
+    logger.info(f"Duration analysis JSON saved to {json_path}")
+
+    # CSV export (flattened per-phoneme table)
+    csv_path = output_path.with_suffix(".csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "phone",
+                "corpus_mean",
+                "corpus_std",
+                "corpus_p95",
+                "model",
+                "pred_mean",
+                "pred_std",
+                "mae",
+                "kl_div",
+            ]
+        )
+
+        for phone in PHONES_39:
+            corpus = corpus_stats.get(phone, {})
+            corpus_mean = corpus.get("mean", 0)
+            corpus_std = corpus.get("std", 0)
+            corpus_p95 = corpus.get("p95", 0)
+
+            for model_name, metrics in results.items():
+                if hasattr(metrics, "duration_stats") and metrics.duration_stats:
+                    phone_stats = metrics.duration_stats["per_phone"].get(phone, {})
+                    writer.writerow(
+                        [
+                            phone,
+                            f"{corpus_mean:.2f}",
+                            f"{corpus_std:.2f}",
+                            f"{corpus_p95:.2f}",
+                            model_name,
+                            f"{phone_stats.get('pred_mean', 0):.2f}",
+                            f"{phone_stats.get('pred_std', 0):.2f}",
+                            f"{phone_stats.get('mae', 0):.2f}",
+                            f"{phone_stats.get('kl_divergence', 0):.4f}",
+                        ]
+                    )
+
+    logger.info(f"Duration analysis CSV saved to {csv_path}")
+
+
+def plot_duration_distributions(
+    results: dict, corpus_stats: dict, output_dir: Path, max_dur: int = 50
+):
+    """Generate per-phoneme duration distribution plots.
+
+    Args:
+        results: Dictionary of model results
+        corpus_stats: Raw TIMIT corpus statistics
+        output_dir: Directory for output plots
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not installed, skipping duration plots")
+        return
+
+    # Select interesting phonemes (vowels, stops, fricatives)
+    phones_to_plot = ["aa", "iy", "p", "t", "s", "sil"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+    for ax, phone in zip(axes.flat, phones_to_plot, strict=False):
+        # Plot corpus reference if available
+        corpus = corpus_stats.get(phone, {})
+        if corpus:
+            ax.axvline(
+                corpus.get("mean", 0),
+                color="black",
+                linestyle="--",
+                linewidth=2,
+                label=f"TIMIT (μ={corpus.get('mean', 0):.1f})",
+            )
+
+        # Plot each model's predicted distribution
+        colors = ["blue", "green", "red", "orange"]
+        for (model_name, metrics), color in zip(results.items(), colors, strict=False):
+            if hasattr(metrics, "duration_stats") and metrics.duration_stats:
+                phone_stats = metrics.duration_stats["per_phone"].get(phone, {})
+                pred_mean = phone_stats.get("pred_mean", 0)
+                pred_std = phone_stats.get("pred_std", 1)
+
+                # Draw normal approximation
+                x = np.linspace(max(0, pred_mean - 3 * pred_std), pred_mean + 3 * pred_std, 100)
+                y = np.exp(-0.5 * ((x - pred_mean) / pred_std) ** 2) / (
+                    pred_std * np.sqrt(2 * np.pi)
+                )
+                ax.plot(x, y, color=color, label=f"{model_name} (μ={pred_mean:.1f})")
+
+        ax.set_title(f"/{phone}/")
+        ax.set_xlabel("Duration (frames)")
+        ax.set_ylabel("Density")
+        ax.legend(fontsize=8)
+        ax.set_xlim(0, max_dur)
+
+    plt.suptitle("Duration Distributions: TIMIT Corpus vs Model Predictions")
+    plt.tight_layout()
+
+    output_path = output_dir / "duration_distributions.png"
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    logger.info(f"Duration plot saved to {output_path}")
+
+
 @dataclass
 class TIMITMetrics:
     """Metrics for TIMIT evaluation."""
@@ -1607,110 +1919,139 @@ def train_model(
 
 
 def _print_duration_analysis(results: dict, has_pytorch_crf: bool = False):
-    """Print duration distribution analysis comparing models."""
+    """Print duration distribution analysis comparing models (4-way)."""
     print("\n" + "=" * 60)
     print("DURATION ANALYSIS (frames @ 10ms)")
     print("=" * 60)
     print("\nThis shows how well each model captures phoneme duration patterns.")
-    print("Lower MAE = better duration modeling. Semi-CRF should excel here.\n")
+    print("Lower MAE = better duration modeling. Semi-CRF should excel here.")
+    print("Semi Sharded and Semi Triton should have similar MAE (validates Triton).\n")
 
-    # Get reference durations from any model (they're all the same)
-    ref_model = "semi_crf"
+    # Get reference durations from semi_crf_triton (or sharded, they should be same)
+    ref_model = "semi_crf_triton"
     ref_stats = results[ref_model].duration_stats["per_phone"]
 
     # Select phones to display (most frequent + phonetically interesting)
-    # Prioritize: vowels (long), stops (short), fricatives (medium)
     interesting_phones = ["aa", "iy", "eh", "ah", "p", "t", "k", "s", "sh", "n", "l", "sil"]
     display_phones = [p for p in interesting_phones if ref_stats[p]["ref_count"] > 50]
 
+    # Get stats from all models
+    l_stats = results["linear_crf_triton"].duration_stats["per_phone"]
+    sh_stats = results["semi_crf_sharded"].duration_stats["per_phone"]
+    tr_stats = results["semi_crf_triton"].duration_stats["per_phone"]
+    p_stats = results["pytorch_crf"].duration_stats["per_phone"] if has_pytorch_crf else None
+
     if has_pytorch_crf:
         print(
-            f"{'Phone':<6} {'Ref':>6} {'p-crf':>6} {'K=1':>6} {'Semi':>6} │ {'MAE p-crf':>9} {'MAE K=1':>9} {'MAE Semi':>9}"
+            f"{'Phone':<6} {'Ref':>6} {'p-crf':>6} {'K=1':>6} {'Sh':>6} {'Tr':>6} │ "
+            f"{'MAE p':>6} {'MAE K1':>7} {'MAE Sh':>7} {'MAE Tr':>7}"
         )
-        print("-" * 85)
-
-        p_stats = results["pytorch_crf"].duration_stats["per_phone"]
-        l_stats = results["linear_crf_triton"].duration_stats["per_phone"]
-        s_stats = results["semi_crf"].duration_stats["per_phone"]
+        print("-" * 90)
 
         for phone in display_phones:
             ref_mean = ref_stats[phone]["ref_mean"]
             p_mean = p_stats[phone]["pred_mean"]
             l_mean = l_stats[phone]["pred_mean"]
-            s_mean = s_stats[phone]["pred_mean"]
+            sh_mean = sh_stats[phone]["pred_mean"]
+            tr_mean = tr_stats[phone]["pred_mean"]
             p_mae = p_stats[phone]["mae"]
             l_mae = l_stats[phone]["mae"]
-            s_mae = s_stats[phone]["mae"]
+            sh_mae = sh_stats[phone]["mae"]
+            tr_mae = tr_stats[phone]["mae"]
 
-            # Highlight if semi-CRF is better
-            s_marker = "*" if s_mae < p_mae and s_mae < l_mae else " "
+            # Highlight if semi-CRF is better than linear
+            best_semi_mae = min(sh_mae, tr_mae)
+            s_marker = "*" if best_semi_mae < p_mae and best_semi_mae < l_mae else " "
 
             print(
-                f"{phone:<6} {ref_mean:>6.1f} {p_mean:>6.1f} {l_mean:>6.1f} {s_mean:>6.1f} │ "
-                f"{p_mae:>9.2f} {l_mae:>9.2f} {s_mae:>8.2f}{s_marker}"
+                f"{phone:<6} {ref_mean:>6.1f} {p_mean:>6.1f} {l_mean:>6.1f} "
+                f"{sh_mean:>6.1f} {tr_mean:>6.1f} │ "
+                f"{p_mae:>6.2f} {l_mae:>7.2f} {sh_mae:>7.2f} {tr_mae:>6.2f}{s_marker}"
             )
 
         # Overall stats
-        print("-" * 85)
+        print("-" * 90)
         p_overall = results["pytorch_crf"].duration_stats["overall"]
         l_overall = results["linear_crf_triton"].duration_stats["overall"]
-        s_overall = results["semi_crf"].duration_stats["overall"]
+        sh_overall = results["semi_crf_sharded"].duration_stats["overall"]
+        tr_overall = results["semi_crf_triton"].duration_stats["overall"]
 
         print(
-            f"{'Overall MAE':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
-            f"{p_overall['mean_absolute_error']:>9.2f} {l_overall['mean_absolute_error']:>9.2f} "
-            f"{s_overall['mean_absolute_error']:>8.2f}"
+            f"{'MAE':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{p_overall['mean_absolute_error']:>6.2f} "
+            f"{l_overall['mean_absolute_error']:>7.2f} "
+            f"{sh_overall['mean_absolute_error']:>7.2f} "
+            f"{tr_overall['mean_absolute_error']:>6.2f}"
         )
         print(
-            f"{'Duration r':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
-            f"{p_overall['duration_correlation']:>9.3f} {l_overall['duration_correlation']:>9.3f} "
-            f"{s_overall['duration_correlation']:>8.3f}"
+            f"{'Corr':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{p_overall['duration_correlation']:>6.3f} "
+            f"{l_overall['duration_correlation']:>7.3f} "
+            f"{sh_overall['duration_correlation']:>7.3f} "
+            f"{tr_overall['duration_correlation']:>6.3f}"
         )
     else:
-        print(f"{'Phone':<6} {'Ref':>6} {'K=1':>6} {'Semi':>6} │ {'MAE K=1':>9} {'MAE Semi':>9}")
-        print("-" * 60)
-
-        l_stats = results["linear_crf_triton"].duration_stats["per_phone"]
-        s_stats = results["semi_crf"].duration_stats["per_phone"]
+        print(
+            f"{'Phone':<6} {'Ref':>6} {'K=1':>6} {'Sh':>6} {'Tr':>6} │ "
+            f"{'MAE K1':>7} {'MAE Sh':>7} {'MAE Tr':>7}"
+        )
+        print("-" * 70)
 
         for phone in display_phones:
             ref_mean = ref_stats[phone]["ref_mean"]
             l_mean = l_stats[phone]["pred_mean"]
-            s_mean = s_stats[phone]["pred_mean"]
+            sh_mean = sh_stats[phone]["pred_mean"]
+            tr_mean = tr_stats[phone]["pred_mean"]
             l_mae = l_stats[phone]["mae"]
-            s_mae = s_stats[phone]["mae"]
+            sh_mae = sh_stats[phone]["mae"]
+            tr_mae = tr_stats[phone]["mae"]
 
-            s_marker = "*" if s_mae < l_mae else " "
+            best_semi_mae = min(sh_mae, tr_mae)
+            s_marker = "*" if best_semi_mae < l_mae else " "
 
             print(
-                f"{phone:<6} {ref_mean:>6.1f} {l_mean:>6.1f} {s_mean:>6.1f} │ "
-                f"{l_mae:>9.2f} {s_mae:>8.2f}{s_marker}"
+                f"{phone:<6} {ref_mean:>6.1f} {l_mean:>6.1f} "
+                f"{sh_mean:>6.1f} {tr_mean:>6.1f} │ "
+                f"{l_mae:>7.2f} {sh_mae:>7.2f} {tr_mae:>6.2f}{s_marker}"
             )
 
         # Overall stats
-        print("-" * 60)
+        print("-" * 70)
         l_overall = results["linear_crf_triton"].duration_stats["overall"]
-        s_overall = results["semi_crf"].duration_stats["overall"]
+        sh_overall = results["semi_crf_sharded"].duration_stats["overall"]
+        tr_overall = results["semi_crf_triton"].duration_stats["overall"]
 
         print(
-            f"{'Overall MAE':<6} {'-':>6} {'-':>6} {'-':>6} │ "
-            f"{l_overall['mean_absolute_error']:>9.2f} {s_overall['mean_absolute_error']:>8.2f}"
+            f"{'MAE':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{l_overall['mean_absolute_error']:>7.2f} "
+            f"{sh_overall['mean_absolute_error']:>7.2f} "
+            f"{tr_overall['mean_absolute_error']:>6.2f}"
         )
         print(
-            f"{'Duration r':<6} {'-':>6} {'-':>6} {'-':>6} │ "
-            f"{l_overall['duration_correlation']:>9.3f} {s_overall['duration_correlation']:>8.3f}"
+            f"{'Corr':<6} {'-':>6} {'-':>6} {'-':>6} {'-':>6} │ "
+            f"{l_overall['duration_correlation']:>7.3f} "
+            f"{sh_overall['duration_correlation']:>7.3f} "
+            f"{tr_overall['duration_correlation']:>6.3f}"
         )
 
     print("\n* = Semi-CRF has lowest MAE for this phone")
-    print("Duration r = correlation between predicted and reference mean durations")
+    print("Sh = Semi-CRF Sharded (baseline), Tr = Semi-CRF Triton (optimized)")
+    print("Corr = correlation between predicted and reference mean durations")
 
 
 def compare_models(data_dir: Path, max_duration: int = 30, **kwargs):
     """
-    Compare CRF models: pytorch-crf (optional), linear CRF (K=1), and semi-CRF.
+    Compare CRF models in a 4-way comparison validating Triton implementations.
 
-    If pytorch-crf is installed, runs a three-way comparison. Otherwise, runs
-    a two-way comparison between torch-semimarkov K=1 and K>1.
+    Models compared:
+    1. pytorch-crf (optional): External linear CRF baseline
+    2. K=1 Triton: Linear CRF via torch-semimarkov streaming kernel
+    3. Semi-CRF sharded: K>1 with sharded binary tree (reference baseline)
+    4. Semi-CRF Triton: K>1 with Triton streaming kernel (optimized)
+
+    Validates:
+    - linear_crf_triton ≈ pytorch_crf (Triton K=1 matches external linear CRF)
+    - semi_crf_triton ≈ semi_crf_sharded (Triton K>1 matches reference semi-CRF)
     """
     results = {}
 
@@ -1731,126 +2072,235 @@ def compare_models(data_dir: Path, max_duration: int = 30, **kwargs):
     logger.info("=" * 60)
     logger.info("Training LINEAR CRF (torch-semimarkov K=1, Triton)")
     logger.info("=" * 60)
-    _, linear_metrics = train_model(data_dir, model_type="linear", **kwargs)
+    _, linear_metrics = train_model(
+        data_dir, model_type="linear", backend="streaming", use_triton=True, **kwargs
+    )
     results["linear_crf_triton"] = linear_metrics
 
-    # 3. torch-semimarkov K>1 (semi-CRF)
+    # 3. Semi-CRF with sharded binary tree (reference baseline)
     logger.info("=" * 60)
-    logger.info(f"Training SEMI-CRF (torch-semimarkov K={max_duration})")
+    logger.info(f"Training SEMI-CRF SHARDED (K={max_duration}, binary tree baseline)")
     logger.info("=" * 60)
-    _, semicrf_metrics = train_model(
-        data_dir, model_type="semicrf", max_duration=max_duration, **kwargs
+    _, sharded_metrics = train_model(
+        data_dir,
+        model_type="semicrf",
+        max_duration=max_duration,
+        backend="binary_tree_sharded",
+        use_triton=False,
+        **kwargs,
     )
-    results["semi_crf"] = semicrf_metrics
+    results["semi_crf_sharded"] = sharded_metrics
+
+    # 4. Semi-CRF with Triton streaming (optimized)
+    logger.info("=" * 60)
+    logger.info(f"Training SEMI-CRF TRITON (K={max_duration}, streaming kernel)")
+    logger.info("=" * 60)
+    _, triton_metrics = train_model(
+        data_dir,
+        model_type="semicrf",
+        max_duration=max_duration,
+        backend="streaming",
+        use_triton=True,
+        **kwargs,
+    )
+    results["semi_crf_triton"] = triton_metrics
+
+    # Load corpus duration statistics for comparison with raw TIMIT
+    corpus_stats = load_corpus_duration_stats(data_dir)
 
     # Print comparison
     logger.info("\n" + "=" * 60)
-    if HAS_TORCHCRF:
-        logger.info("COMPARISON: pytorch-crf vs K=1 Triton vs Semi-CRF")
-    else:
-        logger.info("COMPARISON: K=1 Triton vs Semi-CRF")
+    logger.info("4-WAY COMPARISON: Linear CRF vs Semi-CRF (baseline vs Triton)")
     logger.info("=" * 60)
 
-    if HAS_TORCHCRF:
-        # Three-way comparison
-        print(
-            f"\n{'Metric':<25} {'pytorch-crf':>15} {'K=1 Triton':>15} "
-            f"{'Semi-CRF':>15} {'Δ vs baseline':>15}"
-        )
-        print("-" * 85)
+    # Print 4-way comparison table
+    _print_four_way_comparison(results, has_pytorch_crf=HAS_TORCHCRF)
 
-        # PER (lower is better)
-        p_per = results["pytorch_crf"].phone_error_rate
-        l_per = results["linear_crf_triton"].phone_error_rate
-        s_per = results["semi_crf"].phone_error_rate
-        print(
-            f"{'Phone Error Rate':<25} {p_per:>15.4f} {l_per:>15.4f} "
-            f"{s_per:>15.4f} {s_per - p_per:>+15.4f}"
-        )
+    # Duration analysis (with raw TIMIT stats)
+    _print_duration_analysis(results, has_pytorch_crf=HAS_TORCHCRF)
 
-        # F1 scores (higher is better)
-        for metric in ["boundary_f1", "segment_f1"]:
-            p_val = getattr(results["pytorch_crf"], metric)
-            l_val = getattr(results["linear_crf_triton"], metric)
-            s_val = getattr(results["semi_crf"], metric)
-            print(
-                f"{metric:<25} {p_val:>15.4f} {l_val:>15.4f} "
-                f"{s_val:>15.4f} {s_val - p_val:>+15.4f}"
-            )
-
-        print("\nBoundary F1 at different tolerances:")
-        for tol in [0, 1, 2]:
-            p_val = results["pytorch_crf"].boundary_f1_tolerances.get(tol, 0)
-            l_val = results["linear_crf_triton"].boundary_f1_tolerances.get(tol, 0)
-            s_val = results["semi_crf"].boundary_f1_tolerances.get(tol, 0)
-            print(
-                f"  tol={tol:<2} {p_val:>15.4f} {l_val:>15.4f} "
-                f"{s_val:>15.4f} {s_val - p_val:>+15.4f}"
-            )
-
-        # Timing metrics
-        print("\nTiming (lower is better):")
-        p_time = results["pytorch_crf"].training_time_per_epoch
-        l_time = results["linear_crf_triton"].training_time_per_epoch
-        s_time = results["semi_crf"].training_time_per_epoch
-        print(
-            f"{'Train time (s/epoch)':<25} {p_time:>15.2f} {l_time:>15.2f} "
-            f"{s_time:>15.2f} {l_time - p_time:>+15.2f}*"
-        )
-        p_infer = results["pytorch_crf"].inference_time
-        l_infer = results["linear_crf_triton"].inference_time
-        s_infer = results["semi_crf"].inference_time
-        print(
-            f"{'Inference time (s)':<25} {p_infer:>15.2f} {l_infer:>15.2f} "
-            f"{s_infer:>15.2f} {l_infer - p_infer:>+15.2f}*"
-        )
-        print("* Δ shows K=1 Triton vs pytorch-crf (negative = faster)")
-
-        # Note about K=1 vs pytorch-crf equivalence
-        print("\nNote: K=1 Triton and pytorch-crf should produce similar accuracy")
-        print("(validates that K=1 is a correct linear CRF implementation)")
-
-        # Duration analysis
-        _print_duration_analysis(results, has_pytorch_crf=True)
-    else:
-        # Two-way comparison (no pytorch-crf)
-        print(f"\n{'Metric':<25} {'K=1 Triton':>15} {'Semi-CRF':>15} {'Δ':>12}")
-        print("-" * 67)
-
-        # PER (lower is better)
-        l_per = results["linear_crf_triton"].phone_error_rate
-        s_per = results["semi_crf"].phone_error_rate
-        print(f"{'Phone Error Rate':<25} {l_per:>15.4f} {s_per:>15.4f} {s_per - l_per:>+12.4f}")
-
-        # F1 scores (higher is better)
-        for metric in ["boundary_f1", "segment_f1"]:
-            l_val = getattr(results["linear_crf_triton"], metric)
-            s_val = getattr(results["semi_crf"], metric)
-            print(f"{metric:<25} {l_val:>15.4f} {s_val:>15.4f} {s_val - l_val:>+12.4f}")
-
-        print("\nBoundary F1 at different tolerances:")
-        for tol in [0, 1, 2]:
-            l_val = results["linear_crf_triton"].boundary_f1_tolerances.get(tol, 0)
-            s_val = results["semi_crf"].boundary_f1_tolerances.get(tol, 0)
-            print(f"  tol={tol:<2} {l_val:>15.4f} {s_val:>15.4f} {s_val - l_val:>+12.4f}")
-
-        # Timing metrics
-        print("\nTiming (lower is better):")
-        l_time = results["linear_crf_triton"].training_time_per_epoch
-        s_time = results["semi_crf"].training_time_per_epoch
-        print(
-            f"{'Train time (s/epoch)':<25} {l_time:>15.2f} {s_time:>15.2f} {s_time - l_time:>+12.2f}"
-        )
-        l_infer = results["linear_crf_triton"].inference_time
-        s_infer = results["semi_crf"].inference_time
-        print(
-            f"{'Inference time (s)':<25} {l_infer:>15.2f} {s_infer:>15.2f} {s_infer - l_infer:>+12.2f}"
-        )
-
-        # Duration analysis
-        _print_duration_analysis(results, has_pytorch_crf=False)
+    # Print corpus comparison if stats available
+    if corpus_stats:
+        _print_corpus_comparison(results, corpus_stats)
 
     return results
+
+
+def _print_corpus_comparison(results: dict, corpus_stats: dict):
+    """Print comparison between model predictions and raw TIMIT corpus statistics."""
+    print("\n" + "=" * 60)
+    print("COMPARISON WITH RAW TIMIT CORPUS")
+    print("=" * 60)
+    print("\nThis compares model predictions directly against corpus statistics")
+    print("from train_segment_stats.json (computed during preprocessing).\n")
+
+    # Select interesting phonemes
+    interesting_phones = ["aa", "iy", "eh", "ah", "p", "t", "s", "sil"]
+    display_phones = [p for p in interesting_phones if p in corpus_stats]
+
+    print(f"{'Phone':<6} {'Corpus':>12} {'Semi Triton':>12} {'Diff':>10} {'Semi vs Lin':>12}")
+    print(f"{'':6} {'mean±std':>12} {'mean±std':>12} {'(frames)':>10} {'improvement':>12}")
+    print("-" * 65)
+
+    semi_metrics = results["semi_crf_triton"]
+    linear_metrics = results["linear_crf_triton"]
+
+    for phone in display_phones:
+        corpus = corpus_stats.get(phone, {})
+        corpus_mean = corpus.get("mean", 0)
+        corpus_std = corpus.get("std", 0)
+
+        semi_stats = semi_metrics.duration_stats["per_phone"].get(phone, {})
+        linear_stats = linear_metrics.duration_stats["per_phone"].get(phone, {})
+
+        semi_mean = semi_stats.get("pred_mean", 0)
+        semi_std = semi_stats.get("pred_std", 0)
+        semi_mae = semi_stats.get("mae", 0)
+        linear_mae = linear_stats.get("mae", 0)
+
+        # Improvement: how much better semi-CRF is vs linear
+        improvement = linear_mae - semi_mae
+
+        print(
+            f"{phone:<6} {corpus_mean:>5.1f}±{corpus_std:<4.1f} "
+            f"{semi_mean:>5.1f}±{semi_std:<4.1f} "
+            f"{semi_mean - corpus_mean:>+10.1f} {improvement:>+12.2f}"
+        )
+
+    print("-" * 65)
+    print("Positive 'Semi vs Lin improvement' = Semi-CRF captures duration better")
+
+
+def _print_four_way_comparison(results: dict, has_pytorch_crf: bool = False):
+    """Print 4-way comparison table."""
+    # Header
+    if has_pytorch_crf:
+        print(
+            f"\n{'Metric':<20} {'pytorch-crf':>12} {'K=1 Triton':>12} "
+            f"{'Semi Sharded':>12} {'Semi Triton':>12} {'Δ Linear':>10} {'Δ Semi':>10}"
+        )
+        print("-" * 100)
+    else:
+        print(
+            f"\n{'Metric':<20} {'K=1 Triton':>12} "
+            f"{'Semi Sharded':>12} {'Semi Triton':>12} {'Δ Semi':>10}"
+        )
+        print("-" * 80)
+
+    # Get metrics
+    l_metrics = results["linear_crf_triton"]
+    sh_metrics = results["semi_crf_sharded"]
+    tr_metrics = results["semi_crf_triton"]
+    p_metrics = results.get("pytorch_crf")
+
+    # Phone Error Rate (lower is better)
+    if has_pytorch_crf:
+        delta_linear = l_metrics.phone_error_rate - p_metrics.phone_error_rate
+        delta_semi = tr_metrics.phone_error_rate - sh_metrics.phone_error_rate
+        print(
+            f"{'Phone Error Rate':<20} {p_metrics.phone_error_rate:>12.4f} "
+            f"{l_metrics.phone_error_rate:>12.4f} {sh_metrics.phone_error_rate:>12.4f} "
+            f"{tr_metrics.phone_error_rate:>12.4f} {delta_linear:>+10.4f} {delta_semi:>+10.4f}"
+        )
+    else:
+        delta_semi = tr_metrics.phone_error_rate - sh_metrics.phone_error_rate
+        print(
+            f"{'Phone Error Rate':<20} {l_metrics.phone_error_rate:>12.4f} "
+            f"{sh_metrics.phone_error_rate:>12.4f} {tr_metrics.phone_error_rate:>12.4f} "
+            f"{delta_semi:>+10.4f}"
+        )
+
+    # F1 scores (higher is better)
+    for metric_name, display_name in [("boundary_f1", "Boundary F1"), ("segment_f1", "Segment F1")]:
+        l_val = getattr(l_metrics, metric_name)
+        sh_val = getattr(sh_metrics, metric_name)
+        tr_val = getattr(tr_metrics, metric_name)
+
+        if has_pytorch_crf:
+            p_val = getattr(p_metrics, metric_name)
+            delta_linear = l_val - p_val
+            delta_semi = tr_val - sh_val
+            print(
+                f"{display_name:<20} {p_val:>12.4f} {l_val:>12.4f} "
+                f"{sh_val:>12.4f} {tr_val:>12.4f} {delta_linear:>+10.4f} {delta_semi:>+10.4f}"
+            )
+        else:
+            delta_semi = tr_val - sh_val
+            print(
+                f"{display_name:<20} {l_val:>12.4f} "
+                f"{sh_val:>12.4f} {tr_val:>12.4f} {delta_semi:>+10.4f}"
+            )
+
+    # Boundary F1 tolerances
+    print("\nBoundary F1 at different tolerances:")
+    for tol in [0, 1, 2]:
+        l_val = l_metrics.boundary_f1_tolerances.get(tol, 0)
+        sh_val = sh_metrics.boundary_f1_tolerances.get(tol, 0)
+        tr_val = tr_metrics.boundary_f1_tolerances.get(tol, 0)
+
+        if has_pytorch_crf:
+            p_val = p_metrics.boundary_f1_tolerances.get(tol, 0)
+            delta_linear = l_val - p_val
+            delta_semi = tr_val - sh_val
+            print(
+                f"  tol={tol:<2} {p_val:>12.4f} {l_val:>12.4f} "
+                f"{sh_val:>12.4f} {tr_val:>12.4f} {delta_linear:>+10.4f} {delta_semi:>+10.4f}"
+            )
+        else:
+            delta_semi = tr_val - sh_val
+            print(
+                f"  tol={tol:<2} {l_val:>12.4f} "
+                f"{sh_val:>12.4f} {tr_val:>12.4f} {delta_semi:>+10.4f}"
+            )
+
+    # Timing comparison
+    print("\nTiming (lower is better):")
+    l_time = l_metrics.training_time_per_epoch
+    sh_time = sh_metrics.training_time_per_epoch
+    tr_time = tr_metrics.training_time_per_epoch
+
+    if has_pytorch_crf:
+        p_time = p_metrics.training_time_per_epoch
+        speedup_linear = p_time / l_time if l_time > 0 else 0
+        speedup_semi = sh_time / tr_time if tr_time > 0 else 0
+        print(
+            f"{'Train (s/epoch)':<20} {p_time:>12.2f} {l_time:>12.2f} "
+            f"{sh_time:>12.2f} {tr_time:>12.2f} {speedup_linear:>9.2f}x {speedup_semi:>9.2f}x"
+        )
+    else:
+        speedup_semi = sh_time / tr_time if tr_time > 0 else 0
+        print(
+            f"{'Train (s/epoch)':<20} {l_time:>12.2f} "
+            f"{sh_time:>12.2f} {tr_time:>12.2f} {speedup_semi:>9.2f}x"
+        )
+
+    l_infer = l_metrics.inference_time
+    sh_infer = sh_metrics.inference_time
+    tr_infer = tr_metrics.inference_time
+
+    if has_pytorch_crf:
+        p_infer = p_metrics.inference_time
+        speedup_linear = p_infer / l_infer if l_infer > 0 else 0
+        speedup_semi = sh_infer / tr_infer if tr_infer > 0 else 0
+        print(
+            f"{'Inference (s)':<20} {p_infer:>12.2f} {l_infer:>12.2f} "
+            f"{sh_infer:>12.2f} {tr_infer:>12.2f} {speedup_linear:>9.2f}x {speedup_semi:>9.2f}x"
+        )
+    else:
+        speedup_semi = sh_infer / tr_infer if tr_infer > 0 else 0
+        print(
+            f"{'Inference (s)':<20} {l_infer:>12.2f} "
+            f"{sh_infer:>12.2f} {tr_infer:>12.2f} {speedup_semi:>9.2f}x"
+        )
+
+    # Validation notes
+    print("\n" + "=" * 60)
+    print("VALIDATION SUMMARY")
+    print("=" * 60)
+    if has_pytorch_crf:
+        print("Linear CRF: K=1 Triton should match pytorch-crf accuracy (Δ Linear ≈ 0)")
+    print("Semi-CRF: Triton should match sharded baseline accuracy (Δ Semi ≈ 0)")
+    print("Timing: Triton speedup shown as multiplier (e.g., 2.0x = twice as fast)")
 
 
 # =============================================================================
@@ -1898,9 +2348,10 @@ def main():
     )
     train_parser.add_argument(
         "--backend",
-        choices=["exact", "streaming", "auto"],
+        choices=["streaming", "binary_tree_sharded", "exact", "auto"],
         default="streaming",
-        help="CRF backend: exact (materialize edges), streaming (on-the-fly), auto (heuristic)",
+        help="CRF backend: streaming (Triton), binary_tree_sharded (sharded matmuls), "
+        "exact (edge tensor), auto (heuristic)",
     )
     train_parser.add_argument(
         "--no-triton",
@@ -1940,6 +2391,18 @@ def main():
         type=int,
         default=1,
         help="Log metrics every N epochs (default: 1)",
+    )
+    compare_parser.add_argument(
+        "--export-duration",
+        type=Path,
+        default=None,
+        help="Export duration analysis to this path (creates .json and .csv files)",
+    )
+    compare_parser.add_argument(
+        "--plot-dir",
+        type=Path,
+        default=None,
+        help="Directory for duration distribution plots (requires matplotlib)",
     )
 
     args = parser.parse_args()
@@ -1992,7 +2455,8 @@ def main():
                     "batch_size": args.batch_size,
                 },
                 "linear_crf_triton": results["linear_crf_triton"].to_dict(),
-                "semi_crf": results["semi_crf"].to_dict(),
+                "semi_crf_sharded": results["semi_crf_sharded"].to_dict(),
+                "semi_crf_triton": results["semi_crf_triton"].to_dict(),
             }
             # Include pytorch-crf results if available
             if "pytorch_crf" in results:
@@ -2001,6 +2465,18 @@ def main():
             with open(args.output_json, "w") as f:
                 json.dump(output, f, indent=2)
             logger.info(f"Results saved to {args.output_json}")
+
+        # Export duration analysis if requested
+        if args.export_duration:
+            corpus_stats = load_corpus_duration_stats(args.data_dir)
+            args.export_duration.parent.mkdir(parents=True, exist_ok=True)
+            export_duration_analysis(results, corpus_stats, args.export_duration)
+
+        # Generate duration plots if requested
+        if args.plot_dir:
+            corpus_stats = load_corpus_duration_stats(args.data_dir)
+            args.plot_dir.mkdir(parents=True, exist_ok=True)
+            plot_duration_distributions(results, corpus_stats, args.plot_dir)
 
 
 if __name__ == "__main__":

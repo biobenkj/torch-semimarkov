@@ -39,6 +39,7 @@ def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> d
     # ----------------------------------------
     if backend in (
         "binary_tree",
+        "binary_tree_sharded",
         "banded",
         "block_triangular",
         "linear_scan",
@@ -58,6 +59,20 @@ def estimate_memory_breakdown(T: int, K: int, C: int, B: int, backend: str) -> d
             workspace_bytes = matmul_workspace * B
             # Autograd: saves all intermediate results for backward
             autograd_bytes = potentials_bytes + dp_state_bytes
+
+        elif backend == "binary_tree_sharded":
+            # Same algorithm as binary_tree but using CheckpointShardSemiring
+            # which splits the O((KC)^3) matmul into smaller shards
+            # This reduces peak memory at the cost of more serial computation
+            log_levels = max(1, int(math.ceil(math.log2(N))))
+            shard_size = 10000  # default shard size from checkpoint.py
+            # DP state: same as binary_tree
+            dp_state_bytes = B * KC * KC * float_bytes * log_levels
+            # Workspace is reduced because we shard the matmul
+            # Instead of (KC)^2 all at once, we do it in chunks
+            workspace_bytes = B * min(KC * KC, shard_size) * float_bytes
+            # Autograd still needs to save inputs but recomputes forward in backward
+            autograd_bytes = potentials_bytes + dp_state_bytes // 2  # ~half of non-sharded
 
         elif backend == "banded":
             # Banded: similar to binary_tree but with bandwidth reduction

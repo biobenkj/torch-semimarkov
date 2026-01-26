@@ -24,6 +24,7 @@ SEMIRING_MAP = {
 # Edge-tensor backends (use SemiMarkov class with pre-computed edges)
 EDGE_TENSOR_BACKENDS = {
     "binary_tree",
+    "binary_tree_sharded",
     "banded",
     "block_triangular",
     "linear_scan",
@@ -37,6 +38,7 @@ STREAMING_BACKENDS = {"triton_streaming"}
 # Backends supporting all semirings (Log, Max, Entropy)
 ALL_SEMIRING_BACKENDS = {
     "binary_tree",
+    "binary_tree_sharded",
     "linear_scan",
     "linear_scan_vectorized",
     "linear_scan_streaming",
@@ -196,6 +198,16 @@ def _run_edge_tensor_benchmark(
                 return v
             elif backend == "linear_scan_streaming":
                 v, _, _ = struct_to_use._dp_scan_streaming(edge_input, lengths, force_grad=True)
+                return v
+            elif backend == "binary_tree_sharded":
+                # Use CheckpointShardSemiring to reduce peak memory at cost of time
+                from torch_semimarkov.semirings.checkpoint import CheckpointShardSemiring
+
+                ShardedSemiring = CheckpointShardSemiring(
+                    type(struct_to_use.semiring), max_size=10000
+                )
+                struct_sharded = SemiMarkov(ShardedSemiring)
+                v, _, _ = struct_sharded._dp_binary_tree(edge_input, lengths, force_grad=True)
                 return v
             else:
                 raise ValueError(f"Unknown edge-tensor backend: {backend}")

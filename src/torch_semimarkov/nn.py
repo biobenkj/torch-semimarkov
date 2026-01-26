@@ -246,6 +246,33 @@ class SemiMarkovCRFHead(nn.Module):
         result = model.logpartition(edge, lengths=lengths + 1, use_linear_scan=True)
         return result[0].squeeze(0)
 
+    def _forward_binary_tree_sharded(
+        self, scores: Tensor, lengths: Tensor, semiring: str
+    ) -> Tensor:
+        """Compute partition via sharded binary tree. Memory-efficient reference implementation.
+
+        Uses CheckpointShardSemiring to reduce peak memory by splitting large matmuls
+        into smaller shards that are processed sequentially with gradient checkpointing.
+        This is slower than streaming but provides a reference implementation for validation.
+        """
+        from .semimarkov import SemiMarkov
+        from .semirings import LogSemiring, MaxSemiring
+        from .semirings.checkpoint import CheckpointShardSemiring
+
+        SEMIRING_MAP = {"log": LogSemiring, "max": MaxSemiring}
+        base_semiring = SEMIRING_MAP[semiring]
+
+        # Wrap semiring with sharded checkpointing for memory efficiency
+        ShardedSemiring = CheckpointShardSemiring(base_semiring, max_size=10000)
+
+        # Build edge tensor (still O(T*K*C^2) memory, but matmuls are sharded)
+        edge = self._build_edge_tensor(scores, lengths)
+
+        # Use binary tree algorithm with sharded semiring
+        model = SemiMarkov(ShardedSemiring)
+        result = model._dp_binary_tree(edge, lengths=lengths + 1, force_grad=True)
+        return result[0].squeeze(0)
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -302,8 +329,13 @@ class SemiMarkovCRFHead(nn.Module):
             backend_type, use_triton_final = "streaming", use_triton
         elif backend == "exact":
             backend_type, use_triton_final = "exact", False
+        elif backend == "binary_tree_sharded":
+            backend_type, use_triton_final = "binary_tree_sharded", False
         else:
-            raise ValueError(f"Unknown backend: {backend}. Use 'auto', 'streaming', or 'exact'.")
+            raise ValueError(
+                f"Unknown backend: {backend}. "
+                "Use 'auto', 'streaming', 'exact', or 'binary_tree_sharded'."
+            )
 
         # Build cumulative scores for prefix-sum edge retrieval
         # CRITICAL: Use float32 for numerical stability at T > 100K
@@ -337,6 +369,9 @@ class SemiMarkovCRFHead(nn.Module):
                 accum_dtype=self.accum_dtype,
                 num_warps=self.num_warps,
             )
+        elif backend_type == "binary_tree_sharded":
+            # Use sharded binary tree backend for memory-efficient reference implementation
+            partition = self._forward_binary_tree_sharded(scores, lengths, "log")
         else:
             # Use exact backend via semimarkov.py
             partition = self._forward_exact(scores, lengths, "log")
@@ -466,8 +501,13 @@ class SemiMarkovCRFHead(nn.Module):
             backend_type, use_triton_final = "streaming", use_triton
         elif backend == "exact":
             backend_type, use_triton_final = "exact", False
+        elif backend == "binary_tree_sharded":
+            backend_type, use_triton_final = "binary_tree_sharded", False
         else:
-            raise ValueError(f"Unknown backend: {backend}. Use 'auto', 'streaming', or 'exact'.")
+            raise ValueError(
+                f"Unknown backend: {backend}. "
+                "Use 'auto', 'streaming', 'exact', or 'binary_tree_sharded'."
+            )
 
         # Build cumulative scores
         # Zero-center before cumsum to prevent magnitude drift at long sequences
@@ -493,6 +533,9 @@ class SemiMarkovCRFHead(nn.Module):
                 accum_dtype=self.accum_dtype,
                 num_warps=self.num_warps,
             )
+        elif backend_type == "binary_tree_sharded":
+            # Use sharded binary tree backend for memory-efficient reference implementation
+            max_score = self._forward_binary_tree_sharded(scores, lengths, "max")
         else:
             # Use exact backend via semimarkov.py
             max_score = self._forward_exact(scores, lengths, "max")

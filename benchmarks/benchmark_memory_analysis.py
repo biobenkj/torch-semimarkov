@@ -105,13 +105,14 @@ def main():
     parser.add_argument(
         "--backends",
         type=str,
-        default="linear_scan_vectorized,linear_scan_streaming,triton_streaming",
+        default="linear_scan_vectorized,linear_scan_streaming,binary_tree_sharded,triton_streaming",
         help=(
             "Comma-separated list of backends. Options: "
-            "binary_tree, banded, block_triangular, "
+            "binary_tree, binary_tree_sharded, banded, block_triangular, "
             "linear_scan, linear_scan_vectorized, linear_scan_streaming, "
             "triton_streaming. "
             "Note: binary_tree/block_triangular have O((KC)^2) memory. "
+            "binary_tree_sharded uses CheckpointShardSemiring for reduced peak memory. "
             "banded is prototype (Log semiring only). "
             "triton_streaming supports Log/Max only."
         ),

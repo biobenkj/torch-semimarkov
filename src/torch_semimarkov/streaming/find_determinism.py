@@ -20,10 +20,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import torch
+import torch  # noqa: E402
 
-from torch_semimarkov.streaming.triton_backward import launch_streaming_triton_backward
-from torch_semimarkov.streaming.triton_forward import (
+from torch_semimarkov.streaming.triton_backward import (  # noqa: E402
+    launch_streaming_triton_backward,
+)
+from torch_semimarkov.streaming.triton_forward import (  # noqa: E402
     _compute_checkpoint_interval,
     _next_power_of_2,
     launch_streaming_triton_kernel,
