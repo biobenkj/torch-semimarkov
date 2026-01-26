@@ -174,6 +174,7 @@ except ImportError:
 if HAS_TRITON:
     from .triton_backward import (
         launch_streaming_triton_backward,
+        launch_streaming_triton_backward_fused,
         launch_streaming_triton_marginals,
     )
     from .triton_forward import (
@@ -200,6 +201,7 @@ __all__ = [
     "HAS_TRITON",
     # Triton launchers (conditionally available)
     "launch_streaming_triton_backward",
+    "launch_streaming_triton_backward_fused",
     "launch_streaming_triton_marginals",
     "launch_streaming_triton_kernel",
     "launch_streaming_triton_kernel_max_bp",

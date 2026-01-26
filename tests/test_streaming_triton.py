@@ -16,6 +16,7 @@ from torch_semimarkov.streaming import (
 if HAS_TRITON:
     from torch_semimarkov.streaming import (
         launch_streaming_triton_backward,
+        launch_streaming_triton_backward_fused,
         launch_streaming_triton_kernel,
     )
 
@@ -1274,3 +1275,271 @@ if __name__ == "__main__":
             print("PASSED: Triton matches PyTorch reference")
         else:
             print("FAILED: Triton does not match PyTorch reference")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")
+class TestTritonFusedBackward:
+    """Test the fused Triton backward kernel against the original backward kernel.
+
+    The fused kernel uses local register accumulation instead of atomic operations,
+    providing 10-50x speedup on backward pass while maintaining numerical accuracy.
+    """
+
+    def test_fused_backward_matches_original(self):
+        """Verify fused backward produces identical gradients to original."""
+        batch, T, K, C = 4, 100, 8, 16
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Run forward
+        partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        grad_output = torch.ones(batch, device="cuda")
+
+        # Original backward
+        grad_cs_orig, grad_tr_orig, grad_db_orig, _, _, _ = launch_streaming_triton_backward(
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            partition,
+            ring_checkpoints,
+            checkpoint_interval,
+            grad_output,
+        )
+
+        # Fused backward
+        grad_cs_fused, grad_tr_fused, grad_db_fused, _, _, _ = (
+            launch_streaming_triton_backward_fused(
+                cum_scores,
+                transition,
+                duration_bias,
+                lengths,
+                partition,
+                ring_checkpoints,
+                checkpoint_interval,
+                grad_output,
+            )
+        )
+
+        # Compare gradients
+        torch.testing.assert_close(
+            grad_cs_fused, grad_cs_orig, rtol=1e-4, atol=1e-6, msg="grad_cum_scores mismatch"
+        )
+        torch.testing.assert_close(
+            grad_tr_fused, grad_tr_orig, rtol=1e-4, atol=1e-6, msg="grad_transition mismatch"
+        )
+        torch.testing.assert_close(
+            grad_db_fused, grad_db_orig, rtol=1e-4, atol=1e-6, msg="grad_duration_bias mismatch"
+        )
+
+    def test_fused_backward_various_sizes(self):
+        """Verify fused backward works across various (T, K, C) configurations."""
+        configs = [
+            (2, 50, 5, 8),
+            (4, 100, 10, 16),
+            (2, 200, 16, 24),
+            (8, 50, 8, 32),
+        ]
+
+        for batch, T, K, C in configs:
+            cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+                batch, T, K, C, device="cuda"
+            )
+
+            partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
+                cum_scores, transition, duration_bias, lengths, K
+            )
+
+            grad_output = torch.ones(batch, device="cuda")
+
+            # Original backward
+            grad_cs_orig, grad_tr_orig, grad_db_orig, _, _, _ = launch_streaming_triton_backward(
+                cum_scores,
+                transition,
+                duration_bias,
+                lengths,
+                partition,
+                ring_checkpoints,
+                checkpoint_interval,
+                grad_output,
+            )
+
+            # Fused backward
+            grad_cs_fused, grad_tr_fused, grad_db_fused, _, _, _ = (
+                launch_streaming_triton_backward_fused(
+                    cum_scores,
+                    transition,
+                    duration_bias,
+                    lengths,
+                    partition,
+                    ring_checkpoints,
+                    checkpoint_interval,
+                    grad_output,
+                )
+            )
+
+            torch.testing.assert_close(
+                grad_cs_fused,
+                grad_cs_orig,
+                rtol=1e-4,
+                atol=1e-6,
+                msg=f"grad_cum_scores mismatch for config {(batch, T, K, C)}",
+            )
+            torch.testing.assert_close(
+                grad_tr_fused,
+                grad_tr_orig,
+                rtol=1e-4,
+                atol=1e-6,
+                msg=f"grad_transition mismatch for config {(batch, T, K, C)}",
+            )
+            torch.testing.assert_close(
+                grad_db_fused,
+                grad_db_orig,
+                rtol=1e-4,
+                atol=1e-6,
+                msg=f"grad_duration_bias mismatch for config {(batch, T, K, C)}",
+            )
+
+    def test_fused_backward_determinism(self):
+        """Verify fused backward is deterministic across multiple runs."""
+        batch, T, K, C = 4, 100, 8, 16
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        grad_output = torch.ones(batch, device="cuda")
+
+        # Run fused backward multiple times
+        results = []
+        for _ in range(5):
+            grad_cs, grad_tr, grad_db, _, _, _ = launch_streaming_triton_backward_fused(
+                cum_scores,
+                transition,
+                duration_bias,
+                lengths,
+                partition,
+                ring_checkpoints,
+                checkpoint_interval,
+                grad_output,
+            )
+            results.append((grad_cs.clone(), grad_tr.clone(), grad_db.clone()))
+
+        # Verify all runs produce identical results
+        for i in range(1, 5):
+            diff_cs = (results[0][0] - results[i][0]).abs().max().item()
+            diff_tr = (results[0][1] - results[i][1]).abs().max().item()
+            diff_db = (results[0][2] - results[i][2]).abs().max().item()
+
+            assert diff_cs == 0, f"grad_cum_scores not deterministic: run 0 vs {i}, diff={diff_cs}"
+            assert diff_tr == 0, f"grad_transition not deterministic: run 0 vs {i}, diff={diff_tr}"
+            assert (
+                diff_db == 0
+            ), f"grad_duration_bias not deterministic: run 0 vs {i}, diff={diff_db}"
+
+    def test_fused_backward_rejects_duration_dependent_transitions(self):
+        """Verify fused backward raises error for duration-dependent transitions."""
+        batch, T, K, C = 2, 50, 5, 8
+        cum_scores, _, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+        # Create duration-dependent transition (K, C, C)
+        transition = torch.randn(K, C, C, device="cuda") * 0.1
+
+        partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        grad_output = torch.ones(batch, device="cuda")
+
+        with pytest.raises(ValueError, match="static transitions"):
+            launch_streaming_triton_backward_fused(
+                cum_scores,
+                transition,
+                duration_bias,
+                lengths,
+                partition,
+                ring_checkpoints,
+                checkpoint_interval,
+                grad_output,
+            )
+
+    def test_fused_backward_with_boundaries(self):
+        """Verify fused backward works with boundary projections."""
+        batch, T, K, C = 2, 50, 5, 8
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Create boundary projections
+        proj_start = torch.randn(batch, T, C, device="cuda") * 0.1
+        proj_end = torch.randn(batch, T, C, device="cuda") * 0.1
+
+        partition, ring_checkpoints, checkpoint_interval = launch_streaming_triton_kernel(
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            K,
+            proj_start=proj_start,
+            proj_end=proj_end,
+        )
+
+        grad_output = torch.ones(batch, device="cuda")
+
+        # Original backward
+        grad_cs_orig, grad_tr_orig, grad_db_orig, grad_ps_orig, grad_pe_orig, _ = (
+            launch_streaming_triton_backward(
+                cum_scores,
+                transition,
+                duration_bias,
+                lengths,
+                partition,
+                ring_checkpoints,
+                checkpoint_interval,
+                grad_output,
+                proj_start=proj_start,
+                proj_end=proj_end,
+            )
+        )
+
+        # Fused backward
+        grad_cs_fused, grad_tr_fused, grad_db_fused, grad_ps_fused, grad_pe_fused, _ = (
+            launch_streaming_triton_backward_fused(
+                cum_scores,
+                transition,
+                duration_bias,
+                lengths,
+                partition,
+                ring_checkpoints,
+                checkpoint_interval,
+                grad_output,
+                proj_start=proj_start,
+                proj_end=proj_end,
+            )
+        )
+
+        # Compare all gradients
+        torch.testing.assert_close(
+            grad_cs_fused, grad_cs_orig, rtol=1e-4, atol=1e-6, msg="grad_cum_scores mismatch"
+        )
+        torch.testing.assert_close(
+            grad_tr_fused, grad_tr_orig, rtol=1e-4, atol=1e-6, msg="grad_transition mismatch"
+        )
+        torch.testing.assert_close(
+            grad_db_fused, grad_db_orig, rtol=1e-4, atol=1e-6, msg="grad_duration_bias mismatch"
+        )
+        torch.testing.assert_close(
+            grad_ps_fused, grad_ps_orig, rtol=1e-4, atol=1e-6, msg="grad_proj_start mismatch"
+        )
+        torch.testing.assert_close(
+            grad_pe_fused, grad_pe_orig, rtol=1e-4, atol=1e-6, msg="grad_proj_end mismatch"
+        )

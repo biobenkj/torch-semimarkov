@@ -31,7 +31,7 @@ import torch.nn as nn
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from mamba_encoder_stub import MambaEncoderStub, get_encoder
+from mamba_encoder_stub import get_encoder
 
 from torch_semimarkov import SemiMarkovCRFHead
 
@@ -50,15 +50,9 @@ class ProfileConfig:
 
 # Standard test configurations from the roadmap
 CONFIGS = {
-    "short": ProfileConfig(
-        name="short", T=1000, K=16, C=24, batch=32, use_case="Typical NLP"
-    ),
-    "medium": ProfileConfig(
-        name="medium", T=10000, K=32, C=24, batch=16, use_case="Speech/Bio"
-    ),
-    "long": ProfileConfig(
-        name="long", T=100000, K=64, C=48, batch=4, use_case="Genomics"
-    ),
+    "short": ProfileConfig(name="short", T=1000, K=16, C=24, batch=32, use_case="Typical NLP"),
+    "medium": ProfileConfig(name="medium", T=10000, K=32, C=24, batch=16, use_case="Speech/Bio"),
+    "long": ProfileConfig(name="long", T=100000, K=64, C=48, batch=4, use_case="Genomics"),
     "inference": ProfileConfig(
         name="inference", T=10000, K=16, C=24, batch=1, use_case="Single-sample"
     ),
@@ -268,9 +262,7 @@ def profile_with_profiler(
     print(table.table(sort_by="cuda_time_total", row_limit=20))
 
     # Fallback to timer-based measurement for accurate component breakdown
-    timer_results = profile_with_timer(
-        pipeline, x, lengths, labels, warmup, iterations, use_triton
-    )
+    timer_results = profile_with_timer(pipeline, x, lengths, labels, warmup, iterations, use_triton)
 
     return timer_results
 
@@ -335,9 +327,7 @@ def run_profiling(
                 use_triton=actual_use_triton,
             )
         else:
-            results = profile_with_timer(
-                pipeline, x, lengths, labels, use_triton=actual_use_triton
-            )
+            results = profile_with_timer(pipeline, x, lengths, labels, use_triton=actual_use_triton)
 
         # Add config info
         results["config"] = config.name
@@ -349,10 +339,14 @@ def run_profiling(
         results["use_triton"] = actual_use_triton
 
         # Print results
-        print(f"\n  Results:")
+        print("\n  Results:")
         print(f"    Encoder:     {results['encoder_ms']:8.2f} ms ({results['encoder_pct']:5.1f}%)")
-        print(f"    CRF Forward: {results['crf_forward_ms']:8.2f} ms ({results['crf_forward_pct']:5.1f}%)")
-        print(f"    Backward:    {results['backward_ms']:8.2f} ms ({results['backward_pct']:5.1f}%)")
+        print(
+            f"    CRF Forward: {results['crf_forward_ms']:8.2f} ms ({results['crf_forward_pct']:5.1f}%)"
+        )
+        print(
+            f"    Backward:    {results['backward_ms']:8.2f} ms ({results['backward_pct']:5.1f}%)"
+        )
         print(f"    Total:       {results['total_ms']:8.2f} ms")
 
         # Decision guidance
@@ -361,7 +355,7 @@ def run_profiling(
             print(f"\n  Decision: CRF is NOT the bottleneck ({crf_total_pct:.1f}% of total)")
         elif crf_total_pct > 30:
             print(f"\n  Decision: CRF IS the bottleneck ({crf_total_pct:.1f}% of total)")
-            print(f"            Optimization would benefit this configuration.")
+            print("            Optimization would benefit this configuration.")
         else:
             print(f"\n  Decision: CRF is borderline ({crf_total_pct:.1f}% of total)")
 
@@ -417,7 +411,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Encoder-Decoder Pipeline Profiling")
+    print("Encoder-Decoder Pipeline Profiling")
     print(f"Device: {device}")
     print(f"Encoder: {args.encoder}")
     print(f"Triton: {'disabled' if args.no_triton else 'enabled'}")

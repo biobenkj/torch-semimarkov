@@ -6,7 +6,6 @@ compute profile. Use for development/testing on machines without GPU.
 For actual profiling, replace with real Mamba encoder on CUDA machine.
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -190,11 +189,11 @@ def get_encoder(
                 n_layer=n_layer,
                 **factory_kwargs,
             )
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "mamba-ssm not installed. Use encoder_type='stub' for development "
                 "or install mamba-ssm: pip install mamba-ssm"
-            )
+            ) from err
 
     elif encoder_type == "transformer":
         # Simple transformer encoder for comparison
