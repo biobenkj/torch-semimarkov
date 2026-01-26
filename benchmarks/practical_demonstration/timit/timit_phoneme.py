@@ -931,6 +931,7 @@ class TIMITModel(nn.Module):
         max_duration: int = 1,
         hidden_dim: int = 256,
         duration_distribution: str = "learned",
+        accum_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.encoder = encoder
@@ -944,6 +945,7 @@ class TIMITModel(nn.Module):
             max_duration=max_duration,
             hidden_dim=hidden_dim,
             duration_distribution=duration_distribution,
+            accum_dtype=accum_dtype,
         )
 
     def forward(self, features: Tensor, lengths: Tensor) -> dict:
@@ -1785,12 +1787,15 @@ def train_model(
     log_every: int = 1,
     crf_reg: float = 0.0,
     fixed_length: int | None = None,
+    accum_dtype: torch.dtype = torch.float32,
 ) -> tuple[TIMITModel | TIMITModelPytorchCRF, TIMITMetrics]:
     """Train a model and return it with metrics.
 
     Args:
         crf_reg: L2 regularization coefficient for CRF parameters (Semi-Markov only).
         fixed_length: If provided, force all sequences to this length (for debugging).
+        accum_dtype: Dtype for gradient accumulation. float32 (default) for speed,
+            float64 for numerical stability at large batch sizes.
     """
     device = torch.device(device)
 
@@ -1845,6 +1850,7 @@ def train_model(
             encoder=encoder,
             max_duration=k,
             hidden_dim=hidden_dim,
+            accum_dtype=accum_dtype,
         ).to(device)
     else:  # semicrf
         k = max_duration
@@ -1852,6 +1858,7 @@ def train_model(
             encoder=encoder,
             max_duration=k,
             hidden_dim=hidden_dim,
+            accum_dtype=accum_dtype,
         ).to(device)
 
     logger.info(
@@ -2371,6 +2378,13 @@ def main():
         help="Force all sequences to this fixed length (for debugging boundary handling). "
         "Sequences shorter are padded, longer are truncated.",
     )
+    train_parser.add_argument(
+        "--accum-dtype",
+        choices=["float32", "float64"],
+        default="float32",
+        help="Dtype for gradient accumulation. float32 (default) is ~2x faster, "
+        "float64 provides numerical stability for batch_size >= 128.",
+    )
 
     # Compare
     compare_parser = subparsers.add_parser(
@@ -2416,6 +2430,7 @@ def main():
             n_mels=args.n_mels,
         )
     elif args.command == "train":
+        accum_dtype = torch.float64 if args.accum_dtype == "float64" else torch.float32
         train_model(
             args.data_dir,
             model_type=args.model,
@@ -2430,6 +2445,7 @@ def main():
             log_every=args.log_every,
             crf_reg=args.crf_reg,
             fixed_length=args.fixed_length,
+            accum_dtype=accum_dtype,
         )
     elif args.command == "compare":
         results = compare_models(
