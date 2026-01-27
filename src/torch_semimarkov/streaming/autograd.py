@@ -167,7 +167,6 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         semiring: str = "log",
         proj_start: Optional[torch.Tensor] = None,
         proj_end: Optional[torch.Tensor] = None,
-        accum_dtype: torch.dtype = torch.float64,
         num_warps: int = 4,
     ) -> torch.Tensor:
         # Use Triton kernel for forward
@@ -197,7 +196,6 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
         ctx.K = K
         ctx.semiring = semiring
         ctx.checkpoint_interval = checkpoint_interval
-        ctx.accum_dtype = accum_dtype
         ctx.num_warps = num_warps
 
         return partition
@@ -241,7 +239,6 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
                 grad_output,
                 proj_start=proj_start,
                 proj_end=proj_end,
-                accum_dtype=ctx.accum_dtype,
                 num_warps=ctx.num_warps,
             )
         )
@@ -283,7 +280,6 @@ class SemiCRFStreamingTriton(torch.autograd.Function):
             None,  # semiring
             grad_proj_start,
             grad_proj_end,
-            None,  # accum_dtype
             None,  # num_warps
         )
 
@@ -299,7 +295,6 @@ def semi_crf_streaming_forward(
     proj_end: Optional[torch.Tensor] = None,
     use_triton: bool = True,
     use_compile: bool = False,  # Deprecated, kept for API compatibility
-    accum_dtype: torch.dtype = torch.float64,
     num_warps: int = 4,
 ) -> torch.Tensor:
     r"""Compute Semi-CRF partition function with streaming edge computation.
@@ -330,9 +325,6 @@ def semi_crf_streaming_forward(
             :math:`(\text{batch}, T, C)`. Default: ``None``
         use_triton (bool, optional): If ``True``, use Triton kernels when available.
             Default: ``True``
-        accum_dtype (torch.dtype, optional): Dtype for gradient accumulation in backward.
-            Use ``torch.float64`` (default) for numerical stability at batch >= 128.
-            Use ``torch.float32`` for lower memory at batch <= 64.
         num_warps (int, optional): Number of warps per block for Triton kernels.
             Higher values increase parallelism but also register pressure.
             Recommended range: 2-8. Default: ``4``
@@ -405,7 +397,6 @@ def semi_crf_streaming_forward(
                 semiring,
                 proj_start,
                 proj_end,
-                accum_dtype,
                 num_warps,
             )
         else:

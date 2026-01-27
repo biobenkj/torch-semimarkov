@@ -659,10 +659,9 @@ if HAS_TRITON:
                                     )
 
                                     # grad_duration_bias: (unscaled)
-                                    # Use dur_idx (not k) to handle K=1: k=1 maps to index 0
                                     tl.atomic_add(
                                         grad_db_ws_base
-                                        + dur_idx * stride_gdbw_k
+                                        + k * stride_gdbw_k
                                         + c_dst_idx_tile * stride_gdbw_c,
                                         marginal_sum_src_tile,
                                         mask=c_dst_mask_tile,

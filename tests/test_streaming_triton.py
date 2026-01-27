@@ -234,6 +234,112 @@ class TestTritonStreamingKernel:
         # Use slightly looser tolerance for longer sequences
         torch.testing.assert_close(partition_triton, partition_pytorch, rtol=1e-3, atol=1e-3)
 
+    def test_triton_k1_forward_matches_pytorch(self):
+        """Verify Triton kernel matches PyTorch for K=1 (linear CRF)."""
+        batch, T, K, C = 2, 50, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch reference
+        partition_pytorch, _, _ = semi_crf_streaming_forward_pytorch(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        # Triton kernel
+        partition_triton, ring_ckpts, ckpt_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        torch.testing.assert_close(partition_triton, partition_pytorch, rtol=1e-4, atol=1e-4)
+
+    def test_triton_k1_backward_finite_gradients(self):
+        """Verify K=1 Triton backward produces finite gradients.
+
+        This is a regression test for the K=1 out-of-bounds bug where
+        grad_duration_bias was written to index k=1 instead of dur_idx=0.
+        """
+        batch, T, K, C = 2, 50, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Forward through Triton
+        partition, ring_ckpts, ckpt_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        # Backward through Triton
+        grad_output = torch.ones_like(partition)
+        grads = launch_streaming_triton_backward(
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            partition,
+            ring_ckpts,
+            ckpt_interval,
+            grad_output,
+        )
+
+        grad_cum_scores, grad_transition, grad_duration_bias, _, _, _ = grads
+
+        assert torch.isfinite(grad_cum_scores).all(), "K=1 grad_cum_scores has non-finite values"
+        assert torch.isfinite(grad_transition).all(), "K=1 grad_transition has non-finite values"
+        assert torch.isfinite(
+            grad_duration_bias
+        ).all(), "K=1 grad_duration_bias has non-finite values"
+
+    def test_triton_k1_gradients_match_pytorch(self):
+        """Verify K=1 Triton gradients match PyTorch reference."""
+        from torch_semimarkov.streaming import semi_crf_streaming_backward_pytorch
+
+        batch, T, K, C = 2, 30, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Forward through both
+        partition_pytorch, ring_ckpts_pytorch, ckpt_interval = semi_crf_streaming_forward_pytorch(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+        partition_triton, ring_ckpts_triton, _ = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        # Backward through both
+        grad_output = torch.ones_like(partition_pytorch)
+
+        grads_pytorch = semi_crf_streaming_backward_pytorch(
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            K,
+            partition_pytorch,
+            ring_ckpts_pytorch,
+            ckpt_interval,
+            "log",
+        )
+        grads_triton = launch_streaming_triton_backward(
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            partition_triton,
+            ring_ckpts_triton,
+            ckpt_interval,
+            grad_output,
+        )
+
+        # Compare gradients
+        grad_cs_pytorch, grad_tr_pytorch, grad_db_pytorch, _, _ = grads_pytorch
+        grad_cs_triton, grad_tr_triton, grad_db_triton, _, _, _ = grads_triton
+
+        torch.testing.assert_close(grad_cs_triton, grad_cs_pytorch, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(grad_tr_triton, grad_tr_pytorch, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(grad_db_triton, grad_db_pytorch, rtol=1e-3, atol=1e-3)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton not available")

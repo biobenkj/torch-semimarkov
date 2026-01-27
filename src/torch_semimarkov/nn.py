@@ -69,9 +69,6 @@ class SemiMarkovCRFHead(nn.Module):
             Default: ``None`` (uses learned duration bias)
         edge_memory_threshold (float, optional): Memory threshold in bytes for
             switching to streaming backend. Default: ``8e9`` (8GB)
-        accum_dtype (torch.dtype, optional): Dtype for gradient accumulation in
-            backward pass. Use ``torch.float64`` (default) for numerical stability
-            at batch >= 128. Use ``torch.float32`` for lower memory at batch <= 64.
         num_warps (int, optional): Number of warps per block for Triton kernels.
             Higher values increase parallelism but also register pressure.
             Recommended range: 2-8. Default: ``4``
@@ -129,14 +126,12 @@ class SemiMarkovCRFHead(nn.Module):
         init_scale: float = 0.1,
         duration_distribution: Optional[Union[str, DurationDistribution]] = None,
         edge_memory_threshold: float = 8e9,
-        accum_dtype: torch.dtype = torch.float64,
         num_warps: int = 4,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.max_duration = max_duration
         self.edge_memory_threshold = edge_memory_threshold
-        self.accum_dtype = accum_dtype
         self.num_warps = num_warps
 
         # CRF parameters
@@ -366,7 +361,6 @@ class SemiMarkovCRFHead(nn.Module):
                 self.max_duration,
                 semiring="log",
                 use_triton=use_triton_final,
-                accum_dtype=self.accum_dtype,
                 num_warps=self.num_warps,
             )
         elif backend_type == "binary_tree_sharded":
@@ -530,7 +524,6 @@ class SemiMarkovCRFHead(nn.Module):
                 self.max_duration,
                 semiring="max",
                 use_triton=use_triton_final,
-                accum_dtype=self.accum_dtype,
                 num_warps=self.num_warps,
             )
         elif backend_type == "binary_tree_sharded":
@@ -629,7 +622,6 @@ class SemiMarkovCRFHead(nn.Module):
                 self.max_duration,
                 semiring="max",
                 use_triton=use_triton,
-                accum_dtype=self.accum_dtype,
                 num_warps=self.num_warps,
             )
             all_segments = [[] for _ in range(batch)]
