@@ -204,8 +204,9 @@ class TestTritonStreamingKernel:
             cum_scores, transition, duration_bias, lengths, K
         )
 
-        # Verify checkpoint shape
-        expected_num_ckpts = (T + ckpt_interval - 1) // ckpt_interval + 1
+        # Verify checkpoint shape: ceil(T / ckpt_interval) checkpoints
+        # Checkpoints are saved at t=0, ckpt_interval, 2*ckpt_interval, etc.
+        expected_num_ckpts = (T + ckpt_interval - 1) // ckpt_interval
         assert (
             ring_ckpts.shape[1] == expected_num_ckpts
         ), f"Expected {expected_num_ckpts} checkpoints"
@@ -233,6 +234,147 @@ class TestTritonStreamingKernel:
 
         # Use slightly looser tolerance for longer sequences
         torch.testing.assert_close(partition_triton, partition_pytorch, rtol=1e-3, atol=1e-3)
+
+    def test_triton_k1_forward_matches_pytorch(self):
+        """Verify Triton kernel matches PyTorch for K=1 (linear CRF)."""
+        batch, T, K, C = 2, 50, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch reference
+        partition_pytorch, _, _ = semi_crf_streaming_forward_pytorch(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        # Triton kernel
+        partition_triton, ring_ckpts, ckpt_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        torch.testing.assert_close(partition_triton, partition_pytorch, rtol=1e-4, atol=1e-4)
+
+    def test_triton_k1_backward_finite_gradients(self):
+        """Verify K=1 Triton backward produces finite gradients.
+
+        This is a regression test for the K=1 out-of-bounds bug where
+        grad_duration_bias was written to index k=1 instead of dur_idx=0.
+        """
+        batch, T, K, C = 2, 50, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # Forward through Triton
+        partition, ring_ckpts, ckpt_interval = launch_streaming_triton_kernel(
+            cum_scores, transition, duration_bias, lengths, K
+        )
+
+        # Backward through Triton
+        grad_output = torch.ones_like(partition)
+        grads = launch_streaming_triton_backward(
+            cum_scores,
+            transition,
+            duration_bias,
+            lengths,
+            partition,
+            ring_ckpts,
+            ckpt_interval,
+            grad_output,
+        )
+
+        grad_cum_scores, grad_transition, grad_duration_bias, _, _, _ = grads
+
+        assert torch.isfinite(grad_cum_scores).all(), "K=1 grad_cum_scores has non-finite values"
+        assert torch.isfinite(grad_transition).all(), "K=1 grad_transition has non-finite values"
+        assert torch.isfinite(
+            grad_duration_bias
+        ).all(), "K=1 grad_duration_bias has non-finite values"
+
+    def test_triton_k1_gradients_match_pytorch(self):
+        """Verify K=1 Triton gradients match PyTorch reference via autograd."""
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        batch, T, K, C = 2, 30, 1, 4
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch path (full autograd)
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+
+        partition_py = semi_crf_streaming_forward(cs_py, tr_py, db_py, lengths, K, use_triton=False)
+        partition_py.sum().backward()
+
+        # Triton path (full Triton forward + backward kernels)
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+
+        partition_tr = semi_crf_streaming_forward(cs_tr, tr_tr, db_tr, lengths, K, use_triton=True)
+        partition_tr.sum().backward()
+
+        # Compare partition values
+        torch.testing.assert_close(partition_tr, partition_py, rtol=1e-4, atol=1e-4)
+
+        # Compare gradients (use looser tolerance for Triton backward)
+        torch.testing.assert_close(cs_tr.grad, cs_py.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(tr_tr.grad, tr_py.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(db_tr.grad, db_py.grad, rtol=1e-2, atol=1e-2)
+
+    def test_triton_k1_timit_config(self):
+        """Verify K=1 Triton backward works with TIMIT-like configuration.
+
+        TIMIT uses:
+        - C=39 phoneme classes → C_PAD=64 (significant padding)
+        - Longer sequences (100-600 frames)
+        - Larger batches (32)
+
+        This tests the combination of K=1 + larger C_PAD which requires
+        multiple tiles (4 tiles for TILE_C=16).
+
+        If this test fails, the bug is in the tiling logic for K=1 + C_PAD > C.
+        If this test passes, the bug may be data-dependent.
+        """
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        # Match TIMIT configuration
+        batch, T, K, C = 4, 150, 1, 39  # C=39 → C_PAD=64
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch path (reference)
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+
+        partition_py = semi_crf_streaming_forward(cs_py, tr_py, db_py, lengths, K, use_triton=False)
+        partition_py.sum().backward()
+
+        # Triton path
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+
+        partition_tr = semi_crf_streaming_forward(cs_tr, tr_tr, db_tr, lengths, K, use_triton=True)
+        partition_tr.sum().backward()
+
+        # Check for NaN/Inf (the TIMIT failure mode)
+        assert torch.isfinite(partition_tr).all(), "K=1 TIMIT-config: partition has NaN/Inf"
+        assert torch.isfinite(cs_tr.grad).all(), "K=1 TIMIT-config: grad_cum_scores has NaN/Inf"
+        assert torch.isfinite(tr_tr.grad).all(), "K=1 TIMIT-config: grad_transition has NaN/Inf"
+        assert torch.isfinite(db_tr.grad).all(), "K=1 TIMIT-config: grad_duration_bias has NaN/Inf"
+
+        # Compare partition values
+        torch.testing.assert_close(partition_tr, partition_py, rtol=1e-4, atol=1e-4)
+
+        # Compare gradients (use looser tolerance for larger config)
+        torch.testing.assert_close(cs_tr.grad, cs_py.grad, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(tr_tr.grad, tr_py.grad, rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(db_tr.grad, db_py.grad, rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1162,6 +1304,236 @@ class TestTritonBackwardDebug:
         # Don't assert - this is for debugging only
         if not (cs_match and tr_match and db_match):
             print("\nWARNING: Gradients don't match! Use output above to diagnose.")
+
+    def test_triton_k1_debug_multitile(self):
+        """Debug test to pinpoint K=1 + multi-tile divergence.
+
+        This test systematically compares grad_cum_scores between PyTorch and
+        Triton to find:
+        1. The first timestep where gradients diverge significantly
+        2. Which class indices have the largest errors
+        3. Whether the error pattern is systematic or random
+
+        Key insight: For K=1, the backward kernel processes segments of length 1
+        (t → t+1). The bug manifests as 10^19 magnitude errors, suggesting:
+        - Uninitialized memory access, OR
+        - Incorrect logsumexp accumulation across tiles
+        """
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        # Use the failing config: K=1, C=39 → C_PAD=64, 4 tiles
+        batch, T, K, C = 2, 50, 1, 39
+        C_PAD = 64  # Next power of 2
+        TILE_C = 16
+        num_tiles = C_PAD // TILE_C  # = 4 tiles
+
+        print("\n" + "=" * 70)
+        print("K=1 MULTI-TILE DEBUG TEST")
+        print("=" * 70)
+        print(f"Config: batch={batch}, T={T}, K={K}, C={C}, C_PAD={C_PAD}")
+        print(f"Tiles: {num_tiles} tiles of TILE_C={TILE_C}")
+        print(f"Ring buffer slots: K={K} (all positions map to index 0)")
+
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch reference
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+        partition_py = semi_crf_streaming_forward(cs_py, tr_py, db_py, lengths, K, use_triton=False)
+        partition_py.sum().backward()
+
+        # Triton under test
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+        partition_tr = semi_crf_streaming_forward(cs_tr, tr_tr, db_tr, lengths, K, use_triton=True)
+        partition_tr.sum().backward()
+
+        # === Analysis Phase ===
+        print("\n--- Forward Pass ---")
+        print(f"Partition match: {torch.allclose(partition_py, partition_tr, rtol=1e-4, atol=1e-4)}")
+        print(f"PyTorch: {partition_py.tolist()}")
+        print(f"Triton:  {partition_tr.tolist()}")
+
+        print("\n--- Backward Pass: grad_cum_scores ---")
+        diff = (cs_tr.grad - cs_py.grad).abs()
+
+        # Find first timestep with significant error (> 0.1)
+        threshold = 0.1
+        error_mask = diff > threshold
+
+        if not error_mask.any():
+            print(f"All gradients match within tolerance {threshold}")
+            return
+
+        # Find first error location
+        first_found = False
+        for b in range(batch):
+            for t in range(T + 1):
+                if error_mask[b, t].any():
+                    max_err_idx = diff[b, t].argmax().item()
+                    max_err = diff[b, t, max_err_idx].item()
+                    py_val = cs_py.grad[b, t, max_err_idx].item()
+                    tr_val = cs_tr.grad[b, t, max_err_idx].item()
+
+                    # Determine which tile this class belongs to
+                    tile_idx = max_err_idx // TILE_C
+                    within_tile_idx = max_err_idx % TILE_C
+
+                    print(f"\nFIRST DIVERGENCE at batch={b}, t={t}, c={max_err_idx}")
+                    print(f"  Tile: {tile_idx} (position {within_tile_idx} within tile)")
+                    print(f"  PyTorch: {py_val:.6e}")
+                    print(f"  Triton:  {tr_val:.6e}")
+                    print(f"  Abs diff: {max_err:.6e}")
+
+                    # Show all classes at this (b, t) position
+                    print(f"\n  All classes at (b={b}, t={t}):")
+                    print(f"  {'c':>3} {'tile':>4} {'PyTorch':>12} {'Triton':>12} {'diff':>12}")
+                    for c in range(C):
+                        tile = c // TILE_C
+                        d = diff[b, t, c].item()
+                        marker = "***" if d > threshold else ""
+                        print(
+                            f"  {c:3d} {tile:4d} {cs_py.grad[b, t, c].item():12.4e} "
+                            f"{cs_tr.grad[b, t, c].item():12.4e} {d:12.4e} {marker}"
+                        )
+                    first_found = True
+                    break
+            if first_found:
+                break
+
+        # Statistical summary
+        print("\n--- Error Distribution by Tile ---")
+        for tile in range(num_tiles):
+            c_start = tile * TILE_C
+            c_end = min((tile + 1) * TILE_C, C)
+            if c_start < C:
+                tile_diff = diff[:, :, c_start:c_end]
+                tile_errors = (tile_diff > threshold).sum().item()
+                tile_max = tile_diff.max().item()
+                print(f"  Tile {tile} (c={c_start}-{c_end - 1}): {tile_errors} errors, max={tile_max:.4e}")
+
+        # Check if errors correlate with ring buffer wraparound points
+        print("\n--- Error by Position (t) ---")
+        for t in [0, 1, 5, 10, 20, T - 1, T]:
+            if t <= T:
+                t_errors = (diff[:, t, :] > threshold).sum().item()
+                t_max = diff[:, t, :].max().item()
+                ring_idx = t % K
+                print(f"  t={t:3d} (ring_idx={ring_idx}): {t_errors:4d} errors, max={t_max:.4e}")
+
+        print("=" * 70)
+
+        # Don't fail - this is diagnostic
+
+    def test_triton_k1_isolate_tile_count(self):
+        """Isolate whether the bug is specific to multi-tile processing.
+
+        Compare:
+        - C=4 → C_PAD=4 → 1 tile (expected: PASS)
+        - C=17 → C_PAD=32 → 2 tiles (check if fails)
+        - C=33 → C_PAD=64 → 4 tiles (expected: FAIL)
+
+        If 2-tile also fails, the bug is in tile accumulation.
+        If only 4-tile fails, the bug may be in higher-tile handling.
+        """
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        TILE_C = 16
+        test_cases = [
+            (4, 4, 1, "1 tile"),  # C=4 → C_PAD=4
+            (17, 32, 2, "2 tiles"),  # C=17 → C_PAD=32
+            (33, 64, 4, "4 tiles"),  # C=33 → C_PAD=64
+        ]
+
+        print("\n" + "=" * 70)
+        print("K=1 TILE COUNT ISOLATION TEST")
+        print("=" * 70)
+
+        batch, T, K = 2, 50, 1
+
+        for C, C_PAD, num_tiles, label in test_cases:
+            cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+                batch, T, K, C, device="cuda"
+            )
+
+            # PyTorch reference
+            cs_py = cum_scores.clone().requires_grad_(True)
+            partition_py = semi_crf_streaming_forward(
+                cs_py, transition, duration_bias, lengths, K, use_triton=False
+            )
+            partition_py.sum().backward()
+
+            # Triton
+            cs_tr = cum_scores.clone().requires_grad_(True)
+            partition_tr = semi_crf_streaming_forward(
+                cs_tr, transition, duration_bias, lengths, K, use_triton=True
+            )
+            partition_tr.sum().backward()
+
+            # Compute statistics
+            diff = (cs_tr.grad - cs_py.grad).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            num_errors = (diff > 0.1).sum().item()
+
+            status = "PASS" if max_diff < 1.0 else "FAIL"
+            print(
+                f"{label:10s} C={C:2d} C_PAD={C_PAD:2d}: "
+                f"max_diff={max_diff:.2e}, mean={mean_diff:.2e}, errors={num_errors:4d} [{status}]"
+            )
+
+        print("=" * 70)
+
+    def test_triton_k2_multitile_control(self):
+        """Control test: K=2 with large C to check if bug is K=1-specific.
+
+        If K=2 with C=39 (4 tiles) passes, the bug is specific to K=1.
+        If K=2 with C=39 also fails, the bug is in general multi-tile logic.
+        """
+        from torch_semimarkov.streaming import semi_crf_streaming_forward
+
+        batch, T, K, C = 2, 50, 2, 39  # K=2, same C as TIMIT
+
+        print("\n" + "=" * 70)
+        print("K=2 MULTI-TILE CONTROL TEST")
+        print("=" * 70)
+        print(f"Config: K={K}, C={C}, C_PAD=64, 4 tiles")
+
+        cum_scores, transition, duration_bias, lengths = create_streaming_inputs(
+            batch, T, K, C, device="cuda"
+        )
+
+        # PyTorch reference
+        cs_py = cum_scores.clone().requires_grad_(True)
+        tr_py = transition.clone().requires_grad_(True)
+        db_py = duration_bias.clone().requires_grad_(True)
+        partition_py = semi_crf_streaming_forward(cs_py, tr_py, db_py, lengths, K, use_triton=False)
+        partition_py.sum().backward()
+
+        # Triton
+        cs_tr = cum_scores.clone().requires_grad_(True)
+        tr_tr = transition.clone().requires_grad_(True)
+        db_tr = duration_bias.clone().requires_grad_(True)
+        partition_tr = semi_crf_streaming_forward(cs_tr, tr_tr, db_tr, lengths, K, use_triton=True)
+        partition_tr.sum().backward()
+
+        # Compare
+        cs_diff = (cs_tr.grad - cs_py.grad).abs()
+        tr_diff = (tr_tr.grad - tr_py.grad).abs()
+        db_diff = (db_tr.grad - db_py.grad).abs()
+
+        print(f"Forward match: {torch.allclose(partition_py, partition_tr, rtol=1e-4, atol=1e-4)}")
+        print(f"grad_cum_scores: max_diff={cs_diff.max().item():.2e}, errors={(cs_diff > 0.1).sum().item()}")
+        print(f"grad_transition: max_diff={tr_diff.max().item():.2e}")
+        print(f"grad_duration_bias: max_diff={db_diff.max().item():.2e}")
+
+        status = "PASS" if cs_diff.max().item() < 1.0 else "FAIL"
+        print(f"Result: [{status}]")
+        print("=" * 70)
 
     def test_triton_backward_debug_larger(self):
         """Larger debug test matching the actual failing test config."""
