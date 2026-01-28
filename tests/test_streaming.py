@@ -66,8 +66,9 @@ class TestEdgeBlockComputation:
         edge_block = compute_edge_block_streaming(cum_scores, transition, duration_bias, t, k)
 
         # Manual computation
+        # Duration k uses index k-1 (0-based indexing)
         content_score = cum_scores[:, t + k, :] - cum_scores[:, t, :]  # (batch, C)
-        segment_score = content_score + duration_bias[k]
+        segment_score = content_score + duration_bias[k - 1]
         expected = segment_score.unsqueeze(-1) + transition.T.unsqueeze(0)
 
         torch.testing.assert_close(edge_block, expected)
@@ -519,10 +520,11 @@ class TestStreamingOracleValues:
         edge_block = compute_edge_block_streaming(cum_scores, transition, duration_bias, t, k)
 
         # Verify each element
+        # Duration k uses index k-1 (0-based indexing)
         for c_new in range(C):
             for c_prev in range(C):
                 content_score = cum_scores[0, t + k, c_new] - cum_scores[0, t, c_new]
-                dur_bias = duration_bias[k, c_new]
+                dur_bias = duration_bias[k - 1, c_new]
                 trans = transition[c_prev, c_new]
                 expected = content_score + dur_bias + trans
 

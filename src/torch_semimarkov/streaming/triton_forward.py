@@ -12,6 +12,17 @@ computed on-the-fly from cumulative scores via prefix-sum decomposition:
     + \text{duration\_bias}[k, c_{\text{dst}}]
     + \text{transition}[c_{\text{src}}, c_{\text{dst}}]
 
+.. warning::
+    **Minimum K Requirement**: These kernels require K >= 3 for correct operation.
+    The ring buffer architecture assumes meaningful separation between timesteps:
+
+    - **K=1**: Ring buffer aliasing (all t % 1 = 0). Use ``LinearCRFStreaming`` instead.
+    - **K=2**: Ring buffer fragility (alternating slots). Use ``SemiCRFK2Streaming`` instead.
+    - **K>=3**: Sufficient ring rotation for stable operation.
+
+    The dispatch logic in ``autograd.py`` automatically routes K<3 to specialized
+    PyTorch implementations. Do not call these kernels directly with K<3.
+
 Functions:
     launch_streaming_triton_kernel: Main entry point for launching Triton forward kernels.
 """
@@ -191,12 +202,10 @@ if HAS_TRITON:
             # Accumulate alpha[t] = logsumexp over (k, c_src)
             alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-            # Loop over valid segment durations k = 1, 2, ..., min(K-1, t)
-            # tl.maximum ensures K=1 processes at least one duration
-            for k in tl.range(1, tl.maximum(K, 2)):
-                # For K=1: k=1 is valid (maps to duration_bias[0])
-                # For K>1: k=1..K-1 are valid
-                k_valid = (k <= t) & (k <= tl.maximum(K - 1, 1))
+            # Loop over valid segment durations k = 1, 2, ..., min(K, t)
+            for k in tl.range(1, K + 1):
+                # Duration k uses index k-1 in duration_bias
+                k_valid = (k <= t) & (k <= K)
                 start_pos = t - k
 
                 # Ring index for alpha[start_pos]
@@ -227,9 +236,8 @@ if HAS_TRITON:
                 # Content score = cum_scores[t, c_dst] - cum_scores[start, c_dst]
                 content_score = cum_end - cum_start  # (C_PAD,)
 
-                # Load duration bias
-                # Use min(k, K-1) to handle K=1 case: k=1 maps to index 0
-                dur_idx = tl.minimum(k, K - 1)
+                # Load duration bias: duration k uses index k-1
+                dur_idx = k - 1
                 dur_bias = tl.load(
                     duration_bias_ptr + dur_idx * stride_db_k + c_idx * stride_db_c,
                     mask=active & k_valid & c_mask,
@@ -452,11 +460,10 @@ if HAS_TRITON:
             active = t <= seq_len
             alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float32)
 
-            # tl.maximum ensures K=1 processes at least one duration
-            for k in tl.range(1, tl.maximum(K, 2)):
-                # For K=1: k=1 is valid (maps to duration_bias[0])
-                # For K>1: k=1..K-1 are valid
-                k_valid = (k <= t) & (k <= tl.maximum(K - 1, 1))
+            # Loop over valid segment durations k = 1, 2, ..., min(K, t)
+            for k in tl.range(1, K + 1):
+                # Duration k uses index k-1 in duration_bias
+                k_valid = (k <= t) & (k <= K)
                 start_pos = t - k
                 ring_k_idx = start_pos % K
 
@@ -480,8 +487,8 @@ if HAS_TRITON:
                 )
 
                 content_score = cum_end - cum_start
-                # Use min(k, K-1) to handle K=1 case: k=1 maps to index 0
-                dur_idx = tl.minimum(k, K - 1)
+                # Duration k uses index k-1
+                dur_idx = k - 1
                 dur_bias = tl.load(
                     duration_bias_ptr + dur_idx * stride_db_k + c_idx * stride_db_c,
                     mask=active & k_valid & c_mask,
@@ -671,8 +678,10 @@ if HAS_TRITON:
             best_k_t = tl.zeros([C_PAD], dtype=tl.int32)
             best_c_src_t = tl.zeros([C_PAD], dtype=tl.int32)
 
-            for k in tl.range(1, tl.maximum(K, 2)):
-                k_valid = (k <= t) & (k <= tl.maximum(K - 1, 1))
+            # Loop over valid segment durations k = 1, 2, ..., min(K, t)
+            for k in tl.range(1, K + 1):
+                # Duration k uses index k-1 in duration_bias
+                k_valid = (k <= t) & (k <= K)
                 start_pos = t - k
                 ring_k_idx = start_pos % K
 
@@ -695,7 +704,7 @@ if HAS_TRITON:
                 )
 
                 content_score = cum_end - cum_start
-                dur_idx = tl.minimum(k, K - 1)
+                dur_idx = k - 1
                 dur_bias = tl.load(
                     duration_bias_ptr + dur_idx * stride_db_k + c_idx * stride_db_c,
                     mask=active & k_valid & c_mask,

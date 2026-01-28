@@ -15,6 +15,17 @@ Gradients are computed via marginal probabilities:
     \frac{\exp(\alpha[t, c_{\text{src}}] + \text{edge} + \beta[t+k, c_{\text{dst}}])}
     {\exp(\log Z)}
 
+.. warning::
+    **Minimum K Requirement**: This kernel requires K >= 3 for correct operation.
+    The ring buffer and checkpoint architecture assumes meaningful separation
+    between timesteps. For K<3, use the specialized PyTorch implementations:
+
+    - **K=1**: ``linear_crf_backward_pytorch`` in pytorch_reference.py
+    - **K=2**: ``semi_crf_k2_backward_pytorch`` in pytorch_reference.py
+
+    The dispatch logic in ``autograd.py`` automatically routes K<3 to these
+    specialized implementations. Do not call this kernel directly with K<3.
+
 Functions:
     launch_streaming_triton_backward: Main entry point for launching backward kernel.
 """
@@ -320,8 +331,8 @@ if HAS_TRITON:
                     if t < seg_end and t < seq_len:
                         alpha_t = tl.full([C_PAD], NEG_INF, dtype=tl.float64)
 
-                        # Loop over valid durations (tl.maximum ensures K=1 works)
-                        for k in tl.range(1, tl.maximum(K, 2)):
+                        # Loop over valid segment durations k = 1, 2, ..., K
+                        for k in tl.range(1, K + 1):
                             start_pos = t - k
                             # Only process valid start positions
                             if start_pos >= 0:
@@ -365,8 +376,8 @@ if HAS_TRITON:
                                 )
                                 content_score = cum_end - cum_start
 
-                                # Use min(k, K-1) to handle K=1 case: k=1 maps to index 0
-                                dur_idx = tl.minimum(k, K - 1)
+                                # Duration k uses index k-1
+                                dur_idx = k - 1
                                 dur_bias = tl.load(
                                     duration_bias_ptr
                                     + dur_idx * stride_db_k
@@ -476,13 +487,14 @@ if HAS_TRITON:
                         # compute (TILE_C, C_PAD) tiles and accumulate gradients per-tile.
                         # For beta update, use online logsumexp across tiles (Flash Attention pattern).
 
-                        # tl.maximum ensures K=1 processes at least one duration
-                        for k in tl.range(1, tl.maximum(K, 2)):
+                        # Loop over valid segment durations k = 1, 2, ..., K
+                        for k in tl.range(1, K + 1):
                             end_pos = t + k
                             # Only process valid end positions
                             if end_pos <= seq_len and end_pos <= T:
                                 end_ring_idx = end_pos % K
-                                dur_idx = tl.minimum(k, K - 1)
+                                # Duration k uses index k-1
+                                dur_idx = k - 1
 
                                 # === Accumulators for this k iteration ===
                                 # Boundary marginals accumulator (scalar)

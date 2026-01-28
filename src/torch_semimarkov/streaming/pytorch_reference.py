@@ -18,6 +18,547 @@ def _compute_checkpoint_interval(T: int, K: int) -> int:
     return max(K, optimal)
 
 
+# =============================================================================
+# K=1 Linear CRF Fast Path
+# =============================================================================
+
+
+def linear_crf_forward_pytorch(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    lengths: torch.Tensor,
+    duration_bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Optimized K=1 (linear CRF) forward pass.
+
+    For K=1, the semi-CRF reduces to a standard linear-chain CRF. This
+    implementation eliminates all K-related overhead (ring buffers, duration
+    loops, checkpointing) for maximum performance.
+
+    Complexity: O(T × C²) time, O(batch × C) memory.
+
+    Args:
+        cum_scores: Cumulative projected scores of shape (batch, T+1, C).
+        transition: Label transition scores of shape (C, C).
+        lengths: Sequence lengths of shape (batch,).
+        duration_bias: Optional duration bias of shape (K, C). Only index 0 is used.
+
+    Returns:
+        Tensor: Log partition function of shape (batch,).
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Initialize alpha (all labels equally likely at start)
+    alpha = torch.zeros(batch, C, device=device, dtype=dtype)
+
+    # Track final alpha for variable lengths
+    final_alpha = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+
+    # Optional duration bias (only index 0 for K=1)
+    dur_bias = duration_bias[0] if duration_bias is not None else 0.0
+
+    for t in range(1, T + 1):
+        # Emission score: cumsum difference for this timestep
+        emission = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + dur_bias  # (batch, C)
+
+        # Linear CRF recurrence:
+        # alpha[t, c_dst] = logsumexp_{c_src}(alpha[t-1, c_src] + trans[c_src, c_dst]) + emission[c_dst]
+        # alpha: (batch, C_src) -> unsqueeze to (batch, C_src, 1)
+        # transition: (C_src, C_dst)
+        # broadcast: (batch, C_src, C_dst) -> logsumexp over C_src -> (batch, C_dst)
+        alpha_new = torch.logsumexp(alpha.unsqueeze(-1) + transition, dim=-2) + emission
+
+        # Update alpha only for active sequences
+        active_mask = (t <= lengths).view(batch, 1)
+        alpha = torch.where(active_mask, alpha_new, alpha)
+
+        # Capture final alpha at sequence endpoints
+        final_mask = (t == lengths).view(batch, 1)
+        final_alpha = torch.where(final_mask, alpha_new, final_alpha)
+
+    # Partition function: logsumexp over final labels
+    return torch.logsumexp(final_alpha, dim=-1)
+
+
+def linear_crf_backward_pytorch(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    lengths: torch.Tensor,
+    log_Z: torch.Tensor,
+    duration_bias: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    r"""Optimized K=1 (linear CRF) backward pass via forward-backward algorithm.
+
+    Computes gradients for cum_scores, transition, and duration_bias using
+    the forward-backward algorithm. No checkpointing needed for K=1.
+
+    Args:
+        cum_scores: Cumulative projected scores of shape (batch, T+1, C).
+        transition: Label transition scores of shape (C, C).
+        lengths: Sequence lengths of shape (batch,).
+        log_Z: Log partition function of shape (batch,).
+        duration_bias: Optional duration bias of shape (K, C).
+
+    Returns:
+        Tuple of (grad_cum_scores, grad_transition, grad_duration_bias).
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Optional duration bias
+    dur_bias = duration_bias[0] if duration_bias is not None else 0.0
+
+    # Forward pass: compute all alpha values
+    alpha_all = torch.full((batch, T + 1, C), NEG_INF, device=device, dtype=dtype)
+    alpha_all[:, 0, :] = 0.0  # Initial state
+
+    for t in range(1, T + 1):
+        emission = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + dur_bias
+        alpha_new = (
+            torch.logsumexp(alpha_all[:, t - 1, :].unsqueeze(-1) + transition, dim=-2) + emission
+        )
+        active_mask = (t <= lengths).view(batch, 1)
+        alpha_all[:, t, :] = torch.where(active_mask, alpha_new, alpha_all[:, t - 1, :])
+
+    # Backward pass: compute all beta values
+    beta_all = torch.full((batch, T + 1, C), NEG_INF, device=device, dtype=dtype)
+
+    # Initialize beta at final positions
+    for b in range(batch):
+        beta_all[b, lengths[b].item(), :] = 0.0
+
+    for t in range(T - 1, -1, -1):
+        # For sequences where t < length, compute beta[t] from beta[t+1]
+        emission_next = cum_scores[:, t + 1, :] - cum_scores[:, t, :] + dur_bias
+
+        # beta[t, c_src] = logsumexp_{c_dst}(trans[c_src, c_dst] + emission[c_dst] + beta[t+1, c_dst])
+        # transition: (C_src, C_dst)
+        # emission_next + beta[t+1]: (batch, C_dst) -> unsqueeze to (batch, 1, C_dst)
+        # broadcast: (batch, C_src, C_dst) -> logsumexp over C_dst -> (batch, C_src)
+        beta_new = torch.logsumexp(
+            transition.unsqueeze(0) + (emission_next + beta_all[:, t + 1, :]).unsqueeze(-2),
+            dim=-1,
+        )
+
+        active_mask = (t < lengths).view(batch, 1)
+        beta_all[:, t, :] = torch.where(active_mask, beta_new, beta_all[:, t, :])
+
+    # Compute gradients via marginals
+    grad_cum_scores = torch.zeros_like(cum_scores)
+    grad_transition = torch.zeros(batch, C, C, device=device, dtype=dtype)
+    grad_duration_bias = (
+        torch.zeros(batch, C, device=device, dtype=dtype) if duration_bias is not None else None
+    )
+
+    for t in range(1, T + 1):
+        active_mask = (t <= lengths).view(batch, 1, 1)
+        emission = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + dur_bias
+
+        # Edge marginal: P(c_src -> c_dst at time t)
+        # log_marginal[b, c_src, c_dst] = alpha[t-1, c_src] + trans[c_src, c_dst] + emission[c_dst] + beta[t, c_dst] - log_Z
+        log_marginal = (
+            alpha_all[:, t - 1, :].unsqueeze(-1)  # (batch, C_src, 1)
+            + transition.unsqueeze(0)  # (1, C_src, C_dst)
+            + (emission + beta_all[:, t, :]).unsqueeze(-2)  # (batch, 1, C_dst)
+            - log_Z.view(batch, 1, 1)
+        )
+        log_marginal = torch.clamp(log_marginal, min=-80.0, max=80.0)
+        marginal = torch.exp(log_marginal)
+        marginal = torch.where(active_mask, marginal, torch.zeros_like(marginal))
+
+        # Gradient contributions
+        marginal_sum_dst = marginal.sum(dim=-2)  # (batch, C_dst)
+
+        # grad_cum_scores: +1 at position t, -1 at position t-1
+        grad_cum_scores[:, t, :] += marginal_sum_dst
+        grad_cum_scores[:, t - 1, :] -= marginal_sum_dst
+
+        # grad_transition: sum over batch of marginals
+        grad_transition += marginal
+
+        # grad_duration_bias: same as marginal_sum_dst
+        if grad_duration_bias is not None:
+            grad_duration_bias += marginal_sum_dst
+
+    # grad_duration_bias needs to be (batch, K, C) format with K=1
+    if duration_bias is not None:
+        grad_duration_bias = grad_duration_bias.unsqueeze(1)  # (batch, 1, C)
+
+    return grad_cum_scores, grad_transition, grad_duration_bias
+
+
+def linear_crf_viterbi_pytorch(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    lengths: torch.Tensor,
+    duration_bias: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Optimized K=1 (linear CRF) Viterbi decoding.
+
+    Args:
+        cum_scores: Cumulative projected scores of shape (batch, T+1, C).
+        transition: Label transition scores of shape (C, C).
+        lengths: Sequence lengths of shape (batch,).
+        duration_bias: Optional duration bias of shape (K, C).
+
+    Returns:
+        Tuple of (viterbi_scores, best_paths) where best_paths has shape (batch, T).
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Optional duration bias
+    dur_bias = duration_bias[0] if duration_bias is not None else 0.0
+
+    # Viterbi forward pass with backpointers
+    alpha = torch.zeros(batch, C, device=device, dtype=dtype)
+    backpointers = torch.zeros(batch, T, C, dtype=torch.long, device=device)
+
+    for t in range(1, T + 1):
+        emission = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + dur_bias
+
+        # Viterbi: max instead of logsumexp
+        # scores[c_src, c_dst] = alpha[c_src] + trans[c_src, c_dst]
+        scores = alpha.unsqueeze(-1) + transition  # (batch, C_src, C_dst)
+        alpha_new, bp = torch.max(scores, dim=-2)  # (batch, C_dst)
+        alpha_new = alpha_new + emission
+
+        active_mask = (t <= lengths).view(batch, 1)
+        alpha = torch.where(active_mask, alpha_new, alpha)
+        backpointers[:, t - 1, :] = bp
+
+    # Get best final label for each sequence
+    final_alpha = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+    for b in range(batch):
+        final_alpha[b] = alpha[b] if lengths[b] == T else final_alpha[b]
+        # Actually need to track per-sequence final alpha
+    # Simpler: just use the alpha at the sequence length
+    viterbi_scores = torch.zeros(batch, device=device, dtype=dtype)
+    best_final_labels = torch.zeros(batch, dtype=torch.long, device=device)
+
+    for b in range(batch):
+        L = lengths[b].item()
+        # Recompute alpha at position L for this batch item
+        alpha_b = torch.zeros(C, device=device, dtype=dtype)
+        for t in range(1, L + 1):
+            emission = cum_scores[b, t, :] - cum_scores[b, t - 1, :] + dur_bias
+            scores = alpha_b.unsqueeze(-1) + transition
+            alpha_b, _ = torch.max(scores, dim=-2)
+            alpha_b = alpha_b + emission
+        viterbi_scores[b], best_final_labels[b] = torch.max(alpha_b, dim=-1)
+
+    # Traceback
+    best_paths = torch.zeros(batch, T, dtype=torch.long, device=device)
+    for b in range(batch):
+        L = lengths[b].item()
+        current_label = best_final_labels[b].item()
+        for t in range(L - 1, -1, -1):
+            best_paths[b, t] = current_label
+            if t > 0:
+                current_label = backpointers[b, t, current_label].item()
+
+    return viterbi_scores, best_paths
+
+
+# =============================================================================
+# K=2 Specialized Path
+# =============================================================================
+
+
+def semi_crf_k2_forward_pytorch(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    duration_bias: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    r"""Optimized K=2 semi-CRF forward pass.
+
+    For K=2, segments can have duration 1 or 2. This implementation uses
+    explicit 2-step history instead of a ring buffer, eliminating modular
+    arithmetic and checkpoint overhead.
+
+    Complexity: O(T × C²) time, O(batch × C) memory.
+
+    Args:
+        cum_scores: Cumulative projected scores of shape (batch, T+1, C).
+        transition: Label transition scores of shape (C, C).
+        duration_bias: Duration bias of shape (K, C) where K=2.
+        lengths: Sequence lengths of shape (batch,).
+
+    Returns:
+        Tensor: Log partition function of shape (batch,).
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Initialize alpha history (explicit 2-step, no ring buffer)
+    alpha_prev1 = torch.zeros(batch, C, device=device, dtype=dtype)  # alpha[t-1]
+    alpha_prev2 = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)  # alpha[t-2]
+
+    # Track final alpha for variable lengths
+    final_alpha = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+
+    for t in range(1, T + 1):
+        # Duration k=1: segment from t-1 to t
+        emission_k1 = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + duration_bias[0]
+        score_k1 = torch.logsumexp(alpha_prev1.unsqueeze(-1) + transition, dim=-2) + emission_k1
+
+        # Duration k=2: segment from t-2 to t (if t >= 2)
+        if t >= 2:
+            emission_k2 = cum_scores[:, t, :] - cum_scores[:, t - 2, :] + duration_bias[1]
+            score_k2 = torch.logsumexp(alpha_prev2.unsqueeze(-1) + transition, dim=-2) + emission_k2
+            # Combine scores from both durations
+            alpha_new = torch.logsumexp(torch.stack([score_k1, score_k2], dim=-1), dim=-1)
+        else:
+            alpha_new = score_k1
+
+        # Update history (shift)
+        alpha_prev2 = alpha_prev1.clone()
+
+        # Update alpha_prev1 only for active sequences
+        active_mask = (t <= lengths).view(batch, 1)
+        alpha_prev1 = torch.where(active_mask, alpha_new, alpha_prev1)
+
+        # Capture final alpha at sequence endpoints
+        final_mask = (t == lengths).view(batch, 1)
+        final_alpha = torch.where(final_mask, alpha_new, final_alpha)
+
+    return torch.logsumexp(final_alpha, dim=-1)
+
+
+def semi_crf_k2_backward_pytorch(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    duration_bias: torch.Tensor,
+    lengths: torch.Tensor,
+    log_Z: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Optimized K=2 semi-CRF backward pass via forward-backward algorithm.
+
+    Args:
+        cum_scores: Cumulative projected scores of shape (batch, T+1, C).
+        transition: Label transition scores of shape (C, C).
+        duration_bias: Duration bias of shape (K, C) where K=2.
+        lengths: Sequence lengths of shape (batch,).
+        log_Z: Log partition function of shape (batch,).
+
+    Returns:
+        Tuple of (grad_cum_scores, grad_transition, grad_duration_bias).
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Forward pass: store all alpha values for backward
+    alpha_all = torch.full((batch, T + 1, C), NEG_INF, device=device, dtype=dtype)
+    alpha_all[:, 0, :] = 0.0
+
+    for t in range(1, T + 1):
+        alpha_prev1 = alpha_all[:, t - 1, :]
+        alpha_prev2 = (
+            alpha_all[:, t - 2, :]
+            if t >= 2
+            else torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+        )
+
+        emission_k1 = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + duration_bias[0]
+        score_k1 = torch.logsumexp(alpha_prev1.unsqueeze(-1) + transition, dim=-2) + emission_k1
+
+        if t >= 2:
+            emission_k2 = cum_scores[:, t, :] - cum_scores[:, t - 2, :] + duration_bias[1]
+            score_k2 = torch.logsumexp(alpha_prev2.unsqueeze(-1) + transition, dim=-2) + emission_k2
+            alpha_new = torch.logsumexp(torch.stack([score_k1, score_k2], dim=-1), dim=-1)
+        else:
+            alpha_new = score_k1
+
+        active_mask = (t <= lengths).view(batch, 1)
+        alpha_all[:, t, :] = torch.where(active_mask, alpha_new, alpha_all[:, t - 1, :])
+
+    # Backward pass: compute beta values
+    beta_all = torch.full((batch, T + 1, C), NEG_INF, device=device, dtype=dtype)
+
+    # Initialize beta at final positions
+    for b in range(batch):
+        beta_all[b, lengths[b].item(), :] = 0.0
+
+    for t in range(T - 1, -1, -1):
+        beta_new = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+
+        # Contribution from k=1 segments ending at t+1
+        if t + 1 <= T:
+            emission_k1 = cum_scores[:, t + 1, :] - cum_scores[:, t, :] + duration_bias[0]
+            contrib_k1 = torch.logsumexp(
+                transition.unsqueeze(0) + (emission_k1 + beta_all[:, t + 1, :]).unsqueeze(-2),
+                dim=-1,
+            )
+            beta_new = torch.logsumexp(torch.stack([beta_new, contrib_k1], dim=-1), dim=-1)
+
+        # Contribution from k=2 segments ending at t+2
+        if t + 2 <= T:
+            emission_k2 = cum_scores[:, t + 2, :] - cum_scores[:, t, :] + duration_bias[1]
+            contrib_k2 = torch.logsumexp(
+                transition.unsqueeze(0) + (emission_k2 + beta_all[:, t + 2, :]).unsqueeze(-2),
+                dim=-1,
+            )
+            beta_new = torch.logsumexp(torch.stack([beta_new, contrib_k2], dim=-1), dim=-1)
+
+        active_mask = (t < lengths).view(batch, 1)
+        beta_all[:, t, :] = torch.where(active_mask, beta_new, beta_all[:, t, :])
+
+    # Compute gradients via marginals
+    grad_cum_scores = torch.zeros_like(cum_scores)
+    grad_transition = torch.zeros(batch, C, C, device=device, dtype=dtype)
+    grad_duration_bias = torch.zeros(batch, 2, C, device=device, dtype=dtype)
+
+    for t in range(1, T + 1):
+        # k=1 edges: segments from t-1 to t
+        active_mask_k1 = (t <= lengths).view(batch, 1, 1)
+        emission_k1 = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + duration_bias[0]
+
+        log_marginal_k1 = (
+            alpha_all[:, t - 1, :].unsqueeze(-1)
+            + transition.unsqueeze(0)
+            + (emission_k1 + beta_all[:, t, :]).unsqueeze(-2)
+            - log_Z.view(batch, 1, 1)
+        )
+        log_marginal_k1 = torch.clamp(log_marginal_k1, min=-80.0, max=80.0)
+        marginal_k1 = torch.exp(log_marginal_k1)
+        marginal_k1 = torch.where(active_mask_k1, marginal_k1, torch.zeros_like(marginal_k1))
+
+        marginal_k1_sum = marginal_k1.sum(dim=-2)  # (batch, C_dst)
+        grad_cum_scores[:, t, :] += marginal_k1_sum
+        grad_cum_scores[:, t - 1, :] -= marginal_k1_sum
+        grad_transition += marginal_k1
+        grad_duration_bias[:, 0, :] += marginal_k1_sum
+
+        # k=2 edges: segments from t-2 to t (if t >= 2)
+        if t >= 2:
+            active_mask_k2 = (t <= lengths).view(batch, 1, 1)
+            emission_k2 = cum_scores[:, t, :] - cum_scores[:, t - 2, :] + duration_bias[1]
+
+            log_marginal_k2 = (
+                alpha_all[:, t - 2, :].unsqueeze(-1)
+                + transition.unsqueeze(0)
+                + (emission_k2 + beta_all[:, t, :]).unsqueeze(-2)
+                - log_Z.view(batch, 1, 1)
+            )
+            log_marginal_k2 = torch.clamp(log_marginal_k2, min=-80.0, max=80.0)
+            marginal_k2 = torch.exp(log_marginal_k2)
+            marginal_k2 = torch.where(active_mask_k2, marginal_k2, torch.zeros_like(marginal_k2))
+
+            marginal_k2_sum = marginal_k2.sum(dim=-2)
+            grad_cum_scores[:, t, :] += marginal_k2_sum
+            grad_cum_scores[:, t - 2, :] -= marginal_k2_sum
+            grad_transition += marginal_k2
+            grad_duration_bias[:, 1, :] += marginal_k2_sum
+
+    return grad_cum_scores, grad_transition, grad_duration_bias
+
+
+def semi_crf_k2_viterbi_pytorch(
+    cum_scores: torch.Tensor,
+    transition: torch.Tensor,
+    duration_bias: torch.Tensor,
+    lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Optimized K=2 semi-CRF Viterbi decoding.
+
+    Args:
+        cum_scores: Cumulative projected scores of shape (batch, T+1, C).
+        transition: Label transition scores of shape (C, C).
+        duration_bias: Duration bias of shape (K, C) where K=2.
+        lengths: Sequence lengths of shape (batch,).
+
+    Returns:
+        Tuple of (viterbi_scores, best_paths, best_durations).
+    """
+    batch, T_plus_1, C = cum_scores.shape
+    T = T_plus_1 - 1
+    device = cum_scores.device
+    dtype = cum_scores.dtype
+
+    # Viterbi forward with backpointers
+    alpha_prev1 = torch.zeros(batch, C, device=device, dtype=dtype)
+    alpha_prev2 = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+
+    # Backpointers: (batch, T, C) for best (k, c_src)
+    bp_k = torch.zeros(batch, T, C, dtype=torch.long, device=device)
+    bp_c = torch.zeros(batch, T, C, dtype=torch.long, device=device)
+
+    final_alpha = torch.full((batch, C), NEG_INF, device=device, dtype=dtype)
+
+    for t in range(1, T + 1):
+        # k=1 scores
+        emission_k1 = cum_scores[:, t, :] - cum_scores[:, t - 1, :] + duration_bias[0]
+        scores_k1 = alpha_prev1.unsqueeze(-1) + transition  # (batch, C_src, C_dst)
+        max_k1, argmax_k1 = torch.max(scores_k1, dim=-2)
+        max_k1 = max_k1 + emission_k1
+
+        if t >= 2:
+            # k=2 scores
+            emission_k2 = cum_scores[:, t, :] - cum_scores[:, t - 2, :] + duration_bias[1]
+            scores_k2 = alpha_prev2.unsqueeze(-1) + transition
+            max_k2, argmax_k2 = torch.max(scores_k2, dim=-2)
+            max_k2 = max_k2 + emission_k2
+
+            # Compare k=1 vs k=2
+            k1_better = max_k1 >= max_k2
+            alpha_new = torch.where(k1_better, max_k1, max_k2)
+            best_k = torch.where(
+                k1_better, torch.ones_like(argmax_k1), torch.full_like(argmax_k1, 2)
+            )
+            best_c = torch.where(k1_better, argmax_k1, argmax_k2)
+        else:
+            alpha_new = max_k1
+            best_k = torch.ones(batch, C, dtype=torch.long, device=device)
+            best_c = argmax_k1
+
+        bp_k[:, t - 1, :] = best_k
+        bp_c[:, t - 1, :] = best_c
+
+        # Update history
+        alpha_prev2 = alpha_prev1.clone()
+        active_mask = (t <= lengths).view(batch, 1)
+        alpha_prev1 = torch.where(active_mask, alpha_new, alpha_prev1)
+
+        final_mask = (t == lengths).view(batch, 1)
+        final_alpha = torch.where(final_mask, alpha_new, final_alpha)
+
+    # Get best final scores and labels
+    viterbi_scores, best_final_labels = torch.max(final_alpha, dim=-1)
+
+    # Traceback
+    best_paths = torch.zeros(batch, T, dtype=torch.long, device=device)
+    best_durations = torch.zeros(batch, T, dtype=torch.long, device=device)
+
+    for b in range(batch):
+        L = lengths[b].item()
+        t = L - 1
+        current_label = best_final_labels[b].item()
+
+        while t >= 0:
+            best_paths[b, t] = current_label
+            k = bp_k[b, t, current_label].item()
+            best_durations[b, t] = k
+            prev_label = bp_c[b, t, current_label].item()
+
+            # Move back by duration k
+            t = t - k
+            current_label = prev_label
+
+    return viterbi_scores, best_paths, best_durations
+
+
 def compute_edge_block_streaming(
     cum_scores: torch.Tensor,
     transition: torch.Tensor,
@@ -31,9 +572,8 @@ def compute_edge_block_streaming(
     # Content score via cumsum difference: (batch, C)
     content_score = cum_scores[:, t + k, :] - cum_scores[:, t, :]
 
-    # Add duration bias (clamp k to valid range for K=1 case)
-    K = duration_bias.shape[0]
-    dur_idx = min(k, K - 1)
+    # Add duration bias: duration k uses index k-1
+    dur_idx = k - 1
     segment_score = content_score + duration_bias[dur_idx]
 
     # Add boundary scores if provided
@@ -50,8 +590,8 @@ def compute_edge_block_streaming(
         # Static transitions: (C, C)
         trans_k = transition
     else:
-        # Duration-dependent transitions: (K, C, C) - index by k
-        trans_k = transition[k]
+        # Duration-dependent transitions: (K, C, C) - duration k uses index k-1
+        trans_k = transition[k - 1]
 
     edge_block = segment_score.unsqueeze(-1) + trans_k.T.unsqueeze(0)
 
@@ -117,11 +657,11 @@ def semi_crf_streaming_forward_pytorch(
         # Include t == lengths to compute alpha at final position
         active_mask = t <= lengths
 
-        # Number of valid durations at this position
-        k_eff = min(K - 1, t)
+        # Number of valid durations at this position: k = 1, 2, ..., min(K, t)
+        k_eff = min(K, t)
 
         scores_all = []
-        for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
+        for k in range(1, k_eff + 1):
             start = t - k
 
             # Get alpha[start] from ring buffer
@@ -232,13 +772,14 @@ def semi_crf_streaming_viterbi_with_backpointers(
     # Main forward loop
     for t in range(1, T + 1):
         active_mask = t <= lengths
-        k_eff = min(K - 1, t)
+        # Number of valid durations at this position: k = 1, 2, ..., min(K, t)
+        k_eff = min(K, t)
 
         # Collect scores for all valid durations
         scores_list = []
         k_indices = []
 
-        for k in range(1, max(k_eff + 1, 2)):
+        for k in range(1, k_eff + 1):
             start = t - k
             ring_idx = start % K
             alpha_prev = alpha_ring[:, ring_idx, :]  # (batch, C_src)
@@ -370,10 +911,11 @@ def semi_crf_streaming_backward_pytorch(
         for t in range(seg_start + 1, seg_end):
             active_mask = t < lengths
 
-            k_eff = min(K - 1, t)
+            # Number of valid durations at this position: k = 1, 2, ..., min(K, t)
+            k_eff = min(K, t)
             scores_all = []
 
-            for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
+            for k in range(1, k_eff + 1):
                 start = t - k
                 ring_idx = start % K
                 alpha_prev = alpha_ring[:, ring_idx, :]
@@ -417,10 +959,11 @@ def semi_crf_streaming_backward_pytorch(
                 continue
 
             # Maximum duration: segments can end at position lengths (using cum_scores[:, lengths, :])
-            max_k = min(K - 1, T - t)
+            # k = 1, 2, ..., min(K, T - t)
+            max_k = min(K, T - t)
             new_beta_scores = []
 
-            for k in range(1, max(max_k + 1, 2)):  # max ensures K=1 processes duration 1
+            for k in range(1, max_k + 1):
                 end_pos = t + k
                 # Include segments where end_pos == lengths (covering positions t to lengths-1)
                 valid_mask = (end_pos <= lengths) & active_mask
@@ -482,8 +1025,8 @@ def semi_crf_streaming_backward_pytorch(
 
                 # grad_duration_bias: per-batch accumulation
                 # marginal.sum(dim=-1) sums over C_src -> (batch, C_dest)
-                # Clamp k to valid index range (for K=1 case where k=1 but K-1=0)
-                dur_idx = min(k, K - 1)
+                # Duration k uses index k-1
+                dur_idx = k - 1
                 grad_duration_bias[:, dur_idx, :] += marginal.sum(dim=-1)  # (batch, C_dest)
 
                 # grad_proj_start, grad_proj_end
@@ -586,10 +1129,11 @@ def semi_crf_streaming_marginals_pytorch(
         for t in range(seg_start + 1, seg_end):
             active_mask = t < lengths
 
-            k_eff = min(K - 1, t)
+            # Number of valid durations at this position: k = 1, 2, ..., min(K, t)
+            k_eff = min(K, t)
             scores_all = []
 
-            for k in range(1, max(k_eff + 1, 2)):
+            for k in range(1, k_eff + 1):
                 start = t - k
                 ring_idx = start % K
                 alpha_prev = alpha_ring[:, ring_idx, :]
@@ -624,10 +1168,11 @@ def semi_crf_streaming_marginals_pytorch(
             if not active_mask.any():
                 continue
 
-            max_k = min(K - 1, T - t)
+            # Maximum duration: k = 1, 2, ..., min(K, T - t)
+            max_k = min(K, T - t)
             new_beta_scores = []
 
-            for k in range(1, max(max_k + 1, 2)):
+            for k in range(1, max_k + 1):
                 end_pos = t + k
                 valid_mask = (end_pos <= lengths) & active_mask
 

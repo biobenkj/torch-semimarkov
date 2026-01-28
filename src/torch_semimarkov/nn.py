@@ -206,18 +206,19 @@ class SemiMarkovCRFHead(nn.Module):
         )
 
         for n in range(T):
-            for k in range(1, max(min(K, T - n + 1), 2)):  # max ensures K=1 processes duration 1
+            # Loop over valid durations k = 1, 2, ..., min(K, T - n)
+            for k in range(1, min(K, T - n) + 1):
                 # Content score for segment [n, n+k)
                 content = cum_scores[:, n + k, :] - cum_scores[:, n, :]  # (batch, C)
 
-                # Use same indexing convention as streaming implementation
-                dur_idx = min(k, K - 1)
+                # Duration k uses index k-1 (0-based indexing)
+                dur_idx = k - 1
 
                 # Add duration bias
                 segment_score = content + self.duration_bias[dur_idx]  # (batch, C)
 
                 # Add transition (C_dest x C_src)
-                # edge[n, k, c_dest, c_src] = segment_score[c_dest] + transition[c_src, c_dest]
+                # edge[n, dur_idx, c_dest, c_src] = segment_score[c_dest] + transition[c_src, c_dest]
                 edge[:, n, dur_idx] = segment_score.unsqueeze(-1) + self.transition.T.unsqueeze(0)
 
         return edge
@@ -649,9 +650,10 @@ class SemiMarkovCRFHead(nn.Module):
 
         # Forward pass with backpointer storage
         for t in range(1, seq_len + 1):
-            k_eff = min(K - 1, t)
+            # Number of valid durations at this position: k = 1, 2, ..., min(K, t)
+            k_eff = min(K, t)
 
-            for k in range(1, max(k_eff + 1, 2)):  # max ensures K=1 processes duration 1
+            for k in range(1, k_eff + 1):
                 start = t - k
 
                 # Compute edge block for this (start, k)
@@ -773,9 +775,9 @@ class SemiMarkovCRFHead(nn.Module):
         # Content score
         content = (cum_scores[end + 1, label] - cum_scores[start, label]).item()
 
-        # Duration bias (duration_bias[k] stores bias for segments of duration k)
+        # Duration bias: duration k uses index k-1
         duration = end - start + 1
-        dur_idx = min(duration, self.max_duration - 1)  # Clamp to valid range
+        dur_idx = duration - 1  # Duration k uses index k-1
         dur_bias = self.duration_bias[dur_idx, label].item()
 
         # Transition (if not first segment)
