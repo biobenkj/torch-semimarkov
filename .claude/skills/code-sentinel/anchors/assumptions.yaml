@@ -1,0 +1,141 @@
+# Code Sentinel Assumptions Registry
+# Version 1.0 - Structured verification specifications
+#
+# Verification types:
+#   - anchor: Verifies via existing anchor in anchors.yaml
+#   - pattern: Greps for pattern in specified file
+#   - shell: Executes shell command, checks exit code
+#   - test_passes: Runs pytest on specific test
+#   - manual: Requires human/agent judgment (not auto-verified)
+
+version: "1.0"
+
+assumptions:
+  triton-forward-k3plus:
+    - id: A1
+      description: "Ring buffer uses `t % K` write indexing"
+      verification:
+        type: anchor
+        ref: RING_BUFFER_WRITE
+      mechanical: true
+
+    - id: A2
+      description: "NEG_INF guard pattern exists"
+      verification:
+        type: anchor
+        ref: NEGINF_GUARD
+      mechanical: true
+
+    - id: A3
+      description: "Checkpoint save occurs at interval boundaries"
+      verification:
+        type: anchor
+        ref: CHECKPOINT_SAVE
+      mechanical: true
+
+    - id: A4
+      description: "C_PAD is power of 2"
+      verification:
+        type: manual
+        guidance: "Check C_PAD assignment in launcher (~line 881) uses `2 ** math.ceil(math.log2(C))`"
+      mechanical: false
+
+    - id: A5
+      description: "Kernel launched via `launch_streaming_triton_kernel`"
+      verification:
+        type: anchor
+        ref: KERNEL_LAUNCH
+      mechanical: true
+
+  dispatch-overview:
+    - id: D1
+      description: "K=1 dispatches to LinearCRFStreaming"
+      verification:
+        type: anchor
+        ref: K1_DISPATCH
+      mechanical: true
+
+    - id: D2
+      description: "K=2 dispatches to SemiCRFK2Streaming"
+      verification:
+        type: anchor
+        ref: K2_DISPATCH
+      mechanical: true
+
+    - id: D3
+      description: "K>=3 GPU checks can_use_triton"
+      verification:
+        type: anchor
+        ref: CAN_USE_TRITON
+      mechanical: true
+
+    - id: D4
+      description: "Triton path uses SemiCRFStreamingTriton"
+      verification:
+        type: anchor
+        ref: TRITON_DISPATCH
+      mechanical: true
+
+    - id: D5
+      description: "K boundary conditions use correct comparisons"
+      verification:
+        type: manual
+        guidance: "Inspect K==1, K==2, K>=3 conditionals in dispatch function (~lines 580-650)"
+      mechanical: false
+
+  crf-heads:
+    - id: N1
+      description: "Zero-centering applied before cumsum"
+      verification:
+        type: anchor
+        ref: ZERO_CENTER
+      mechanical: true
+
+    - id: N2
+      description: "Float32 conversion for numerical stability"
+      verification:
+        type: anchor
+        ref: FLOAT32_CONVERT
+      mechanical: true
+
+    - id: N3
+      description: "NaN check after projection exists"
+      verification:
+        type: anchor
+        ref: NAN_CHECK_PROJECTION
+      mechanical: true
+
+    - id: N4
+      description: "NaN check after cumsum exists"
+      verification:
+        type: anchor
+        ref: NAN_CHECK_CUMSUM
+      mechanical: true
+
+    - id: N5
+      description: "Streaming forward called for partition"
+      verification:
+        type: anchor
+        ref: STREAMING_FORWARD_CALL
+      mechanical: true
+
+    - id: N6
+      description: "Backend selection matches dispatch-overview.md"
+      verification:
+        type: manual
+        guidance: "Compare `_select_backend` logic with dispatch-overview decision tree"
+      mechanical: false
+
+    - id: N7
+      description: "T=1 skip for zero-centering documented"
+      verification:
+        type: manual
+        guidance: "Check `if T > 1:` guard before zero-centering (~line 341)"
+      mechanical: false
+
+    - id: N8
+      description: "Duration bias indexing uses k-1"
+      verification:
+        type: manual
+        guidance: "Verify `dur_idx = k - 1` in `_build_edge_tensor` (~line 215)"
+      mechanical: false

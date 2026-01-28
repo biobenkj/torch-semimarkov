@@ -1215,6 +1215,441 @@ def cmd_report(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_graph(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
+    """Generate dependency graph visualization."""
+    meta = sentinel.load_meta()
+    sentinels = meta.get("sentinels", {})
+
+    if not sentinels:
+        print("No sentinels found")
+        return EXIT_SUCCESS
+
+    # Collect edges
+    edges: list[tuple[str, str]] = []
+    nodes: set[str] = set()
+
+    if args.trace:
+        # Single trace + its dependencies
+        if args.trace not in sentinels:
+            print(f"Error: Trace '{args.trace}' not found")
+            return EXIT_GENERAL_ERROR
+        nodes.add(args.trace)
+        deps = sentinels[args.trace].get("depends_on", [])
+        for dep in deps:
+            edges.append((args.trace, dep))
+            nodes.add(dep)
+    else:
+        # All traces
+        for trace_name, trace_meta in sentinels.items():
+            nodes.add(trace_name)
+            for dep in trace_meta.get("depends_on", []):
+                edges.append((trace_name, dep))
+                nodes.add(dep)
+
+    # Generate output
+    if args.format == "dot":
+        output = _generate_dot_graph(nodes, edges)
+    else:  # mermaid (default)
+        output = _generate_mermaid_graph(nodes, edges)
+
+    if args.output:
+        Path(args.output).write_text(output)
+        print(f"Graph written to {args.output}")
+    else:
+        print(output)
+
+    return EXIT_SUCCESS
+
+
+def _generate_mermaid_graph(nodes: set[str], edges: list[tuple[str, str]]) -> str:
+    """Generate Mermaid diagram."""
+    lines = ["```mermaid", "graph TD"]
+
+    # Add edges
+    if edges:
+        for src, dst in sorted(edges):
+            # Sanitize names for Mermaid (replace hyphens with underscores in IDs)
+            src_id = src.replace("-", "_")
+            dst_id = dst.replace("-", "_")
+            lines.append(f"    {src_id}[{src}] --> {dst_id}[{dst}]")
+    else:
+        # No dependencies, just list nodes
+        for node in sorted(nodes):
+            node_id = node.replace("-", "_")
+            lines.append(f"    {node_id}[{node}]")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def _generate_dot_graph(nodes: set[str], edges: list[tuple[str, str]]) -> str:
+    """Generate DOT format for Graphviz."""
+    lines = ["digraph sentinels {", "    rankdir=TB;", "    node [shape=box];", ""]
+
+    # Add nodes
+    for node in sorted(nodes):
+        node_id = node.replace("-", "_")
+        lines.append(f'    {node_id} [label="{node}"];')
+
+    lines.append("")
+
+    # Add edges
+    for src, dst in sorted(edges):
+        src_id = src.replace("-", "_")
+        dst_id = dst.replace("-", "_")
+        lines.append(f"    {src_id} -> {dst_id};")
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def cmd_coverage(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
+    """Generate trace coverage metrics."""
+    anchors = sentinel.load_anchors()
+    src_dir = sentinel.repo_root / "src"
+
+    if not src_dir.exists():
+        print(f"Error: src/ directory not found at {src_dir}")
+        return EXIT_GENERAL_ERROR
+
+    # Build map of file -> anchored lines
+    anchored_files: dict[str, set[int]] = {}
+    for _trace_name, trace_anchors in anchors.items():
+        for _anchor_name, spec in trace_anchors.items():
+            file_path = spec["file"]
+            line = spec["expected_line"]
+            if file_path not in anchored_files:
+                anchored_files[file_path] = set()
+            anchored_files[file_path].add(line)
+
+    # Analyze each Python file
+    coverage_data: dict[str, dict[str, Any]] = {}
+    total_functions = 0
+    total_anchored = 0
+    total_weighted = 0.0
+    total_weighted_anchored = 0.0
+
+    importance_weights = {"critical": 3.0, "high": 2.0, "medium": 1.0}
+
+    for py_file in sorted(src_dir.rglob("*.py")):
+        if "__pycache__" in str(py_file):
+            continue
+
+        try:
+            rel_path = str(py_file.relative_to(sentinel.repo_root))
+        except ValueError:
+            rel_path = str(py_file)
+
+        functions = sentinel.extract_functions(py_file)
+        if not functions:
+            continue
+
+        anchored_lines = anchored_files.get(rel_path, set())
+
+        # Count anchored functions (within tolerance of anchor line)
+        anchored_count = 0
+        file_weighted = 0.0
+        file_weighted_anchored = 0.0
+
+        for func in functions:
+            weight = importance_weights.get(func.importance, 1.0)
+            file_weighted += weight
+            total_weighted += weight
+
+            # Check if any anchor is near this function (within 5 lines)
+            is_anchored = any(abs(func.line - anchor_line) <= 5 for anchor_line in anchored_lines)
+            if is_anchored:
+                anchored_count += 1
+                file_weighted_anchored += weight
+                total_weighted_anchored += weight
+
+        total_functions += len(functions)
+        total_anchored += anchored_count
+
+        coverage_data[rel_path] = {
+            "total": len(functions),
+            "anchored": anchored_count,
+            "percentage": (anchored_count / len(functions) * 100) if functions else 0,
+            "weighted_total": file_weighted,
+            "weighted_anchored": file_weighted_anchored,
+        }
+
+    # Calculate overall metrics
+    overall_pct = (total_anchored / total_functions * 100) if total_functions else 0
+    weighted_pct = (total_weighted_anchored / total_weighted * 100) if total_weighted else 0
+
+    # Output
+    if args.format == "json":
+        report = {
+            "files": coverage_data,
+            "summary": {
+                "total_functions": total_functions,
+                "anchored_functions": total_anchored,
+                "coverage_percent": round(overall_pct, 1),
+                "weighted_coverage_percent": round(weighted_pct, 1),
+            },
+        }
+        print(json.dumps(report, indent=2))
+    else:
+        # Text format with progress bars
+        print("Code Sentinel Coverage Report")
+        print("=" * 60)
+        print()
+
+        # Group by directory
+        by_dir: dict[str, list[str]] = {}
+        for file_path in coverage_data:
+            dir_path = str(Path(file_path).parent)
+            if dir_path not in by_dir:
+                by_dir[dir_path] = []
+            by_dir[dir_path].append(file_path)
+
+        for dir_path in sorted(by_dir.keys()):
+            print(f"{dir_path}/")
+            for file_path in sorted(by_dir[dir_path]):
+                data = coverage_data[file_path]
+                filename = Path(file_path).name
+                pct = data["percentage"]
+                bar = _progress_bar(pct)
+                print(f"  {filename:<30} {bar} {pct:5.1f}% ({data['anchored']}/{data['total']})")
+            print()
+
+        print("=" * 60)
+        print(
+            f"Overall: {overall_pct:.1f}% coverage ({total_anchored}/{total_functions} functions)"
+        )
+        print(f"Weighted: {weighted_pct:.1f}% (critical=3x, high=2x, medium=1x)")
+
+    # Check threshold
+    if args.threshold:
+        if overall_pct < args.threshold:
+            print(f"\n✗ Coverage {overall_pct:.1f}% below threshold {args.threshold}%")
+            return EXIT_GENERAL_ERROR
+        else:
+            print(f"\n✓ Coverage {overall_pct:.1f}% meets threshold {args.threshold}%")
+
+    return EXIT_SUCCESS
+
+
+def _progress_bar(percentage: float, width: int = 10) -> str:
+    """Generate a text progress bar."""
+    filled = int(percentage / 100 * width)
+    empty = width - filled
+    return "█" * filled + "░" * empty
+
+
+def cmd_sync_docs(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
+    """Regenerate markdown assumption tables from assumptions.yaml."""
+    assumptions_path = sentinel.sentinel_dir / "anchors" / "assumptions.yaml"
+    if not assumptions_path.exists():
+        print(f"Error: assumptions.yaml not found at {assumptions_path}")
+        return EXIT_GENERAL_ERROR
+
+    assumptions_data = yaml.safe_load(assumptions_path.read_text())
+    if not assumptions_data or "assumptions" not in assumptions_data:
+        print("Error: Invalid assumptions.yaml format")
+        return EXIT_GENERAL_ERROR
+
+    updated_count = 0
+
+    for trace_name, assumptions in assumptions_data["assumptions"].items():
+        trace_path = sentinel.traces_dir / f"{trace_name}.md"
+        if not trace_path.exists():
+            print(f"  Skip {trace_name}: trace file not found")
+            continue
+
+        content = trace_path.read_text()
+
+        # Generate new tables
+        mechanical = [a for a in assumptions if a.get("mechanical", True)]
+        manual = [a for a in assumptions if not a.get("mechanical", True)]
+
+        # Build mechanical table
+        mech_table = "| ID | Assumption | Verification |\n"
+        mech_table += "|----|------------|--------------|"
+        for a in mechanical:
+            v = a["verification"]
+            if v["type"] == "anchor":
+                verification_str = f"anchor: {v['ref']}"
+            elif v["type"] == "shell":
+                verification_str = f"`{v['command']}`"
+            elif v["type"] == "pattern":
+                verification_str = f"pattern: {v['regex'][:30]}..."
+            else:
+                verification_str = v.get("guidance", "manual")[:50]
+            mech_table += f"\n| {a['id']} | {a['description']} | {verification_str} |"
+
+        # Build manual table
+        manual_table = "| ID | Assumption | Verification Guidance |\n"
+        manual_table += "|----|------------|----------------------|"
+        for a in manual:
+            guidance = a["verification"].get("guidance", "No guidance")
+            manual_table += f"\n| {a['id']} | {a['description']} | {guidance} |"
+
+        # Try to find and replace the Mechanically Verified table
+        # Pattern matches from "### Mechanically Verified" through the table
+        mech_pattern = (
+            r"(### Mechanically Verified\n\n)"
+            r"(?:These are verified automatically[^\n]*\n\n)?"
+            r"\| ID \| Assumption \| Verification \|\n"
+            r"\|[-|]+\|\n"
+            r"(?:\| [A-Z][0-9]+ \|[^\n]+\|\n)+"
+        )
+
+        mech_replacement = (
+            r"\1"
+            f"These are verified automatically via `python3 verify-assumptions.py {trace_name}`.\n\n"
+            f"{mech_table}\n"
+        )
+
+        new_content, mech_count = re.subn(mech_pattern, mech_replacement, content)
+
+        # Try to find and replace the Agent-Verified table
+        agent_pattern = (
+            r"(### Agent-Verified \(on trace load\)\n\n)"
+            r"(?:These require human/agent judgment[^\n]*\n\n)?"
+            r"\| ID \| Assumption \| Verification Guidance \|\n"
+            r"\|[-|]+\|\n"
+            r"(?:\| [A-Z][0-9]+ \|[^\n]+\|\n)+"
+        )
+
+        agent_replacement = (
+            r"\1"
+            "These require human/agent judgment when loading the trace.\n\n"
+            f"{manual_table}\n"
+        )
+
+        new_content, agent_count = re.subn(agent_pattern, agent_replacement, new_content)
+
+        if mech_count > 0 or agent_count > 0:
+            if not args.dry_run:
+                trace_path.write_text(new_content)
+            updated_count += 1
+            print(f"  {'Would update' if args.dry_run else 'Updated'} {trace_name}")
+            if mech_count > 0:
+                print(f"      Mechanical assumptions: {len(mechanical)}")
+            if agent_count > 0:
+                print(f"      Agent-verified: {len(manual)}")
+        else:
+            print(f"  Skip {trace_name}: no matching table structure found")
+
+    print()
+    if args.dry_run:
+        print(f"Dry run: would update {updated_count} trace(s)")
+    else:
+        print(f"Updated {updated_count} trace(s) from assumptions.yaml")
+
+    return EXIT_SUCCESS
+
+
+def cmd_context(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
+    """Generate context for LLM consumption."""
+    trace_name = args.trace
+    meta = sentinel.load_meta()
+    anchors = sentinel.load_anchors()
+
+    trace_meta = meta.get("sentinels", {}).get(trace_name, {})
+    if not trace_meta:
+        print(f"Error: Trace '{trace_name}' not found")
+        return EXIT_GENERAL_ERROR
+
+    # Verify the trace
+    result = sentinel.verify_trace(trace_name)
+
+    # Extract critical invariants from trace markdown
+    trace_path = sentinel.traces_dir / f"{trace_name}.md"
+    critical_invariants = []
+    if trace_path.exists():
+        content = trace_path.read_text()
+        # Find Critical Invariants section
+        inv_match = re.search(
+            r"## Critical Invariants\n\n((?:- \[[ x]\] .+\n)+)",
+            content,
+        )
+        if inv_match:
+            for line in inv_match.group(1).strip().split("\n"):
+                # Remove checkbox prefix
+                inv_text = re.sub(r"^- \[[ x]\] ", "", line.strip())
+                if inv_text and inv_text != "TODO: Document critical invariants":
+                    critical_invariants.append(inv_text)
+
+    if args.format == "llm":
+        # Generate LLM-optimized YAML output
+        context = {
+            "trace": trace_name,
+            "status": result.overall_status.value,
+            "commit": result.verified_commit,
+            "staleness": "current" if result.commit_status == Status.VERIFIED else "stale",
+            "anchors_verified": [],
+            "assumptions_passed": [],
+            "assumptions_failed": [],
+            "assumptions_manual": [],
+            "critical_invariants": critical_invariants,
+            "load_with": trace_meta.get("depends_on", []),
+        }
+
+        # Add anchor details
+        for anchor in result.anchors:
+            trace_anchors = anchors.get(trace_name, {})
+            anchor_spec = trace_anchors.get(anchor.name, {})
+            context["anchors_verified"].append(
+                {
+                    "name": anchor.name,
+                    "file": anchor_spec.get("file", "unknown"),
+                    "line": anchor.actual_line or anchor.expected_line,
+                    "status": anchor.status.lower(),
+                }
+            )
+
+        # Categorize assumptions
+        for assumption in result.assumptions:
+            if assumption.passed:
+                context["assumptions_passed"].append(assumption.id)
+            else:
+                context["assumptions_failed"].append(assumption.id)
+
+        # Agent-verified assumptions are manual
+        context["assumptions_manual"] = trace_meta.get("assumptions_agent", [])
+
+        # Output as YAML
+        print(yaml.dump(context, default_flow_style=False, sort_keys=False))
+
+    else:
+        # Human-readable format (default)
+        print(f"=== Sentinel Context: {trace_name} ===")
+        print()
+        print(f"Status: {result.overall_status.value}")
+        print(f"Commit: {result.verified_commit}")
+        print(f"Staleness: {'current' if result.commit_status == Status.VERIFIED else 'STALE'}")
+        print()
+
+        print("Anchors:")
+        for anchor in result.anchors:
+            status_sym = "✓" if anchor.status == "VERIFIED" else "✗"
+            print(
+                f"  {status_sym} {anchor.name}: line {anchor.actual_line or anchor.expected_line}"
+            )
+
+        print()
+        print("Assumptions:")
+        for assumption in result.assumptions:
+            status_sym = "✓" if assumption.passed else "✗"
+            print(f"  {status_sym} {assumption.id}: {assumption.description}")
+
+        if critical_invariants:
+            print()
+            print("Critical Invariants:")
+            for inv in critical_invariants:
+                print(f"  • {inv}")
+
+        deps = trace_meta.get("depends_on", [])
+        if deps:
+            print()
+            print(f"Load with: {', '.join(deps)}")
+
+    return EXIT_SUCCESS
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Code Sentinel - Verification pipeline for torch-semimarkov",
@@ -1283,6 +1718,43 @@ Examples:
         "--format", choices=["json", "markdown"], default="json", help="Output format"
     )
 
+    # graph
+    graph_parser = subparsers.add_parser("graph", help="Generate dependency graph")
+    graph_parser.add_argument(
+        "--trace", help="Generate graph for specific trace and its dependencies"
+    )
+    graph_parser.add_argument(
+        "--format", choices=["mermaid", "dot"], default="mermaid", help="Output format"
+    )
+    graph_parser.add_argument("--output", help="Output file path")
+
+    # coverage
+    coverage_parser = subparsers.add_parser("coverage", help="Generate trace coverage metrics")
+    coverage_parser.add_argument(
+        "--format", choices=["text", "json"], default="text", help="Output format"
+    )
+    coverage_parser.add_argument(
+        "--threshold", type=float, help="Minimum coverage percentage (exit 1 if below)"
+    )
+
+    # context
+    context_parser = subparsers.add_parser("context", help="Generate context for LLM consumption")
+    context_parser.add_argument("trace", help="Trace name")
+    context_parser.add_argument(
+        "--format",
+        choices=["text", "llm"],
+        default="text",
+        help="Output format (llm = YAML optimized for LLM context)",
+    )
+
+    # sync-docs
+    sync_docs_parser = subparsers.add_parser(
+        "sync-docs", help="Regenerate trace markdown tables from assumptions.yaml"
+    )
+    sync_docs_parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be changed without writing"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1303,6 +1775,10 @@ Examples:
         "retrace": cmd_retrace,
         "install-hooks": cmd_install_hooks,
         "report": cmd_report,
+        "graph": cmd_graph,
+        "coverage": cmd_coverage,
+        "context": cmd_context,
+        "sync-docs": cmd_sync_docs,
     }
 
     return commands[args.command](args, sentinel)
