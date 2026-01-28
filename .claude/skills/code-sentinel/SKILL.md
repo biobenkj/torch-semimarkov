@@ -30,8 +30,14 @@ Persistent execution traces ("Sentinels") for torch-semimarkov backends. Prevent
 # Check overall health
 ./sentinel.py status
 
+# Scaffold a new trace from source
+./sentinel.py init src/torch_semimarkov/streaming/new_module.py
+
 # Verify before debugging
 ./sentinel.py verify --trace triton-forward-k3plus
+
+# Auto-detect and fix anchor drift
+./sentinel.py retrace triton-forward-k3plus --auto --apply
 
 # Run full pre-commit pipeline
 ./sentinel.py pipeline
@@ -152,18 +158,25 @@ semi_crf_streaming_forward() [autograd.py:474]
 | [k2-fast-path.md](traces/k2-fast-path.md) | K=2 fast path | pytorch_reference.py |
 | [non-streaming-backends.md](traces/non-streaming-backends.md) | Non-streaming API | semimarkov.py |
 | [autograd-kernel-interface.md](traces/autograd-kernel-interface.md) | Autograd contract | autograd.py |
+| [crf-heads.md](traces/crf-heads.md) | User-facing CRF API | nn.py |
 
 ## CLI Reference
 
 | Command | Description |
 |---------|-------------|
 | `./sentinel.py status` | Show overall sentinel health |
+| `./sentinel.py init SOURCE` | Scaffold a new trace from source file |
+| `./sentinel.py init SOURCE --name NAME` | Scaffold with custom trace name |
+
+**Note on `init` scaffolding:** The `init` command intentionally provides only ~17% of a completed trace (structure + line refs). The ~83% gap represents **irreducible domain knowledge**—explaining *why* code works, *what* invariants matter, and *which* patterns are numerically critical. This is by design: sentinels derive value from encoding understanding that source code alone does not express. Do NOT attempt to auto-generate this content.
 | `./sentinel.py verify --trace NAME` | Verify specific trace |
 | `./sentinel.py verify --all` | Verify all traces |
 | `./sentinel.py verify --all --check-consistency` | Verify all with consistency check |
 | `./sentinel.py pipeline` | Run full pre-commit pipeline |
+| `./sentinel.py retrace NAME --auto` | Auto-analyze anchor impacts |
+| `./sentinel.py retrace NAME --auto --apply` | Analyze and apply safe updates |
 | `./sentinel.py retrace NAME --diff-only` | Show diff without updating |
-| `./sentinel.py retrace NAME --anchors-only` | Auto-update anchor line numbers |
+| `./sentinel.py retrace NAME --anchors-only` | Force update anchor line numbers |
 | `./sentinel.py install-hooks` | Install git pre-commit hooks |
 | `./sentinel.py report --format json` | Generate JSON report |
 | `./sentinel.py report --format markdown` | Generate Markdown report |
@@ -228,11 +241,17 @@ When code changes require sentinel updates:
 # Check health before debugging
 ./sentinel.py status
 
+# Scaffold a new trace
+./sentinel.py init src/torch_semimarkov/nn.py --name crf-heads
+
 # Trace the Triton forward kernel
 ./sentinel.py verify --trace triton-forward-k3plus
 
 # Debug NaN in backward pass
 ./sentinel.py verify --trace triton-backward-k3plus
+
+# Auto-analyze and fix drifted anchors
+./sentinel.py retrace triton-forward-k3plus --auto --apply
 
 # Pre-commit check
 ./sentinel.py pipeline

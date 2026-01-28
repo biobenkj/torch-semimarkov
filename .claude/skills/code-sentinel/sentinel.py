@@ -38,6 +38,26 @@ EXIT_CONSISTENCY_FAILED = 4
 EXIT_ASSUMPTION_FAILED = 5
 EXIT_GENERAL_ERROR = 10
 
+# Importance patterns for init command (domain-specific for torch-semimarkov)
+CRITICAL_PATTERNS = [
+    r"def forward\(",
+    r"def backward\(",
+    r"\.apply\(",
+    r"@triton\.jit",
+    r"def semi_crf",
+    r"def launch_",
+]
+HIGH_PATTERNS = [
+    r"def __init__\(",
+    r"logsumexp",
+    r"NEG_INF",
+    r"torch\.isfinite",
+    r"torch\.isnan",
+    r"torch\.clamp",
+    r"def _score",
+    r"def decode",
+]
+
 
 class Status(Enum):
     VERIFIED = "VERIFIED"
@@ -83,6 +103,26 @@ class TraceVerification:
         if any(not a.passed for a in self.assumptions):
             return Status.DEGRADED
         return Status.VERIFIED
+
+
+@dataclass
+class AnchorImpact:
+    """Impact assessment for an anchor after code changes."""
+
+    anchor_name: str
+    status: str  # unchanged, shifted, modified, deleted
+    old_line: int
+    new_line: int | None = None
+    suggestion: str = ""
+
+
+@dataclass
+class FunctionInfo:
+    """Extracted function/method information for init command."""
+
+    name: str
+    line: int
+    importance: str  # critical, high, medium
 
 
 class CodeSentinel:
@@ -391,6 +431,174 @@ class CodeSentinel:
             return [f for f in result.stdout.strip().split("\n") if f]
         return []
 
+    def extract_functions(self, source_path: Path) -> list[FunctionInfo]:
+        """Extract function names and line numbers from a Python source file."""
+        content = source_path.read_text()
+        functions = []
+
+        # Match function definitions with varying indentation
+        pattern = re.compile(r"^(\s*)(async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
+
+        for i, line in enumerate(content.splitlines(), 1):
+            match = pattern.match(line)
+            if match:
+                indent = match.group(1)
+                name = match.group(3)
+                # Only include top-level or class methods (indent <= 4 spaces)
+                if len(indent) <= 4:
+                    # Determine importance
+                    importance = "medium"
+                    for pat in CRITICAL_PATTERNS:
+                        if re.search(pat, line):
+                            importance = "critical"
+                            break
+                    if importance == "medium":
+                        for pat in HIGH_PATTERNS:
+                            if re.search(pat, line):
+                                importance = "high"
+                                break
+                    functions.append(FunctionInfo(name=name, line=i, importance=importance))
+
+        return functions
+
+    def extract_classes(self, source_path: Path) -> list[tuple[str, int]]:
+        """Extract class names and line numbers from a Python source file."""
+        content = source_path.read_text()
+        classes = []
+
+        pattern = re.compile(r"^class\s+(\w+)", re.MULTILINE)
+
+        for i, line in enumerate(content.splitlines(), 1):
+            match = pattern.match(line)
+            if match:
+                classes.append((match.group(1), i))
+
+        return classes
+
+    def get_files_changed_since(self, commit: str) -> set[str]:
+        """Get set of files changed between commit and HEAD."""
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"{commit}..HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=self.repo_root,
+        )
+        if result.returncode == 0:
+            return {f for f in result.stdout.strip().split("\n") if f}
+        return set()
+
+    def find_pattern_line(
+        self, file_path: Path, pattern: str, after: str | None = None
+    ) -> int | None:
+        """Find the line number where a pattern occurs."""
+        try:
+            content = file_path.read_text()
+            lines = content.splitlines()
+
+            start_idx = 0
+            if after:
+                for i, line in enumerate(lines):
+                    if after in line:
+                        start_idx = i + 1
+                        break
+
+            for i, line in enumerate(lines[start_idx:], start_idx + 1):
+                if pattern in line:
+                    return i
+            return None
+        except Exception:
+            return None
+
+    def analyze_anchor_impacts(self, trace_name: str) -> list[AnchorImpact]:
+        """Analyze how current HEAD affects trace anchors."""
+        meta = self.load_meta()
+        anchors = self.load_anchors()
+
+        trace_meta = meta.get("sentinels", {}).get(trace_name, {})
+        if not trace_meta:
+            return []
+
+        verified_commit = trace_meta.get("verified_commit", "")
+        trace_anchors = anchors.get(trace_name, {})
+
+        # Get changed files
+        changed_files = self.get_files_changed_since(verified_commit)
+
+        impacts = []
+        for anchor_name, spec in trace_anchors.items():
+            anchor_file = spec["file"]
+            old_line = spec["expected_line"]
+
+            # Check if the file was changed
+            if anchor_file not in changed_files:
+                impacts.append(
+                    AnchorImpact(
+                        anchor_name=anchor_name,
+                        status="unchanged",
+                        old_line=old_line,
+                        new_line=old_line,
+                    )
+                )
+                continue
+
+            # Re-verify anchor at HEAD
+            result = self.verify_anchor(
+                pattern=spec["pattern"],
+                expected_line=old_line,
+                file_path=str(self.repo_root / anchor_file),
+                tolerance=spec.get("drift_tolerance", 20),
+                after=spec.get("after"),
+            )
+
+            if result.status == "MISSING":
+                impacts.append(
+                    AnchorImpact(
+                        anchor_name=anchor_name,
+                        status="deleted",
+                        old_line=old_line,
+                        new_line=None,
+                        suggestion="Pattern no longer found - manual review required",
+                    )
+                )
+            elif result.status == "VERIFIED":
+                impacts.append(
+                    AnchorImpact(
+                        anchor_name=anchor_name,
+                        status="unchanged",
+                        old_line=old_line,
+                        new_line=result.actual_line,
+                    )
+                )
+            elif result.status == "DRIFT":
+                # Check if this is just a line shift or semantic change
+                # For now, treat all drifts as shifts (safe to auto-update)
+                impacts.append(
+                    AnchorImpact(
+                        anchor_name=anchor_name,
+                        status="shifted",
+                        old_line=old_line,
+                        new_line=result.actual_line,
+                        suggestion=f"Update expected_line: {old_line} -> {result.actual_line}",
+                    )
+                )
+            elif result.status == "AMBIGUOUS":
+                impacts.append(
+                    AnchorImpact(
+                        anchor_name=anchor_name,
+                        status="modified",
+                        old_line=old_line,
+                        new_line=None,
+                        suggestion="Pattern matches multiple lines - add 'after' disambiguator",
+                    )
+                )
+
+        return impacts
+
+    def save_anchors(self, anchors: dict) -> None:
+        """Save anchors to anchors.yaml."""
+        with open(self.anchors_path, "w") as f:
+            yaml.dump(anchors, f, default_flow_style=False, sort_keys=False)
+
 
 def cmd_status(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
     """Show overall sentinel health."""
@@ -406,6 +614,160 @@ def cmd_status(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
         status = trace_meta.get("status", "UNKNOWN")
         symbol = "✓" if status == "VERIFIED" else "⚠" if status == "STALE" else "✗"
         print(f"  {symbol} {trace_name}: {status}")
+
+    return EXIT_SUCCESS
+
+
+def cmd_init(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
+    """Scaffold a new trace from a source file."""
+    source_path = Path(args.source)
+    if not source_path.is_absolute():
+        source_path = sentinel.repo_root / source_path
+
+    if not source_path.exists():
+        print(f"Error: Source file not found: {source_path}")
+        return EXIT_GENERAL_ERROR
+
+    # Determine trace name
+    trace_name = args.name or source_path.stem
+
+    # Check if trace already exists
+    trace_path = sentinel.traces_dir / f"{trace_name}.md"
+    if trace_path.exists() and not args.force:
+        print(f"Error: Trace already exists: {trace_path}")
+        print("Use --force to overwrite")
+        return EXIT_GENERAL_ERROR
+
+    # Extract functions and classes
+    print(f"Analyzing {source_path}...")
+    functions = sentinel.extract_functions(source_path)
+    classes = sentinel.extract_classes(source_path)
+
+    # Categorize by importance
+    critical = [f for f in functions if f.importance == "critical"]
+    high = [f for f in functions if f.importance == "high"]
+
+    print(f"  Found {len(functions)} functions, {len(classes)} classes")
+    print(f"  Critical: {len(critical)}, High: {len(high)}")
+
+    # Compute relative path for the source file
+    try:
+        rel_source = source_path.relative_to(sentinel.repo_root)
+    except ValueError:
+        rel_source = source_path
+
+    # Generate trace markdown
+    trace_content = f"""# Sentinel: {trace_name}
+
+**Verified against:** `{rel_source}` @ commit `TODO`
+
+**Status:** DRAFT
+
+**Linked tests:** TODO
+
+## Summary
+
+TODO: Describe the purpose and key functionality of this module.
+
+## Active Assumptions
+
+### Mechanically Verified
+
+| ID | Assumption | Verification |
+|----|------------|--------------|
+"""
+
+    # Add suggested assumptions for critical/high functions
+    assumption_id = 1
+    for func in critical[:5]:  # Limit to 5 critical functions
+        trace_content += f"| A{assumption_id} | {func.name} exists at expected location | anchor: {func.name.upper()} |\n"
+        assumption_id += 1
+
+    trace_content += """
+### Agent-Verified (on trace load)
+
+| ID | Assumption | Verification Guidance |
+|----|------------|----------------------|
+| TODO | TODO | TODO |
+
+## Algorithm Flow
+
+TODO: Document the key algorithm steps with line references.
+
+"""
+
+    # Add key functions section
+    if critical or high:
+        trace_content += "## Key Functions\n\n"
+        trace_content += "| Function | Line | Importance |\n"
+        trace_content += "|----------|------|------------|\n"
+        for func in critical + high:
+            trace_content += f"| `{func.name}` | {func.line} | {func.importance} |\n"
+        trace_content += "\n"
+
+    trace_content += """## Critical Invariants
+
+- [ ] TODO: Document critical invariants
+
+## Known Issues
+
+| Issue | Severity | Resolution |
+|-------|----------|------------|
+| None documented | - | - |
+
+## Version History
+
+- **TODO**: Initial trace (DRAFT)
+"""
+
+    # Generate anchor suggestions
+    anchors_content = f"\n# Anchors for {trace_name} (generated scaffold)\n{trace_name}:\n"
+    for func in (critical + high)[:10]:  # Limit to 10 anchors
+        anchor_name = func.name.upper()
+        anchors_content += f"""  {anchor_name}:
+    file: {rel_source}
+    pattern: "def {func.name}("
+    expected_line: {func.line}
+    drift_tolerance: 30
+"""
+
+    # Generate meta entry suggestion
+    meta_entry = f"""
+# Add to .sentinel-meta.yaml under sentinels:
+  {trace_name}:
+    verified_commit: TODO
+    source_files:
+      - {rel_source}
+    assumptions_mechanical: []
+    assumptions_agent: []
+    anchors: [{', '.join(f.name.upper() for f in (critical + high)[:10])}]
+    linked_tests: []
+    status: DRAFT
+    depends_on: []
+"""
+
+    # Write trace file
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(trace_content)
+    print(f"\nCreated trace: {trace_path}")
+
+    # Show anchor suggestions
+    print("\n=== Suggested Anchors ===")
+    print("Add to anchors/anchors.yaml:")
+    print(anchors_content)
+
+    # Show meta entry suggestion
+    print("\n=== Suggested Meta Entry ===")
+    print(meta_entry)
+
+    print("\n" + "=" * 60)
+    print("Next steps:")
+    print("  1. Edit the trace file to complete TODO sections")
+    print("  2. Add anchors to anchors/anchors.yaml")
+    print("  3. Add entry to .sentinel-meta.yaml")
+    print("  4. Update verified_commit and status when ready")
+    print("  5. Run: ./sentinel.py verify --trace " + trace_name)
+    print("=" * 60)
 
     return EXIT_SUCCESS
 
@@ -615,6 +977,72 @@ def cmd_retrace(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
             )
         return EXIT_SUCCESS
 
+    if args.auto:
+        # Auto-detect anchor changes
+        print("\n=== Auto-Retrace Analysis ===\n")
+        impacts = sentinel.analyze_anchor_impacts(trace_name)
+
+        if not impacts:
+            print("No anchors found for this trace")
+            return EXIT_SUCCESS
+
+        # Group by status
+        unchanged = [i for i in impacts if i.status == "unchanged"]
+        shifted = [i for i in impacts if i.status == "shifted"]
+        modified = [i for i in impacts if i.status == "modified"]
+        deleted = [i for i in impacts if i.status == "deleted"]
+
+        print("Anchor Impact Summary:")
+        print(f"  Unchanged: {len(unchanged)}")
+        print(f"  Shifted (auto-fixable): {len(shifted)}")
+        print(f"  Modified (needs review): {len(modified)}")
+        print(f"  Deleted (manual fix): {len(deleted)}")
+        print()
+
+        if shifted:
+            print("Shifted anchors (safe to auto-update):")
+            for impact in shifted:
+                print(f"  {impact.anchor_name}: {impact.old_line} -> {impact.new_line}")
+
+        if modified:
+            print("\nModified anchors (manual review required):")
+            for impact in modified:
+                print(f"  ✗ {impact.anchor_name}: {impact.suggestion}")
+
+        if deleted:
+            print("\nDeleted anchors (pattern not found):")
+            for impact in deleted:
+                print(f"  ✗ {impact.anchor_name}: {impact.suggestion}")
+
+        # Apply if requested
+        if args.apply and shifted:
+            print("\n=== Applying Safe Updates ===\n")
+            anchors = sentinel.load_anchors()
+            trace_anchors = anchors.get(trace_name, {})
+            updated = 0
+
+            for impact in shifted:
+                if impact.anchor_name in trace_anchors and impact.new_line:
+                    trace_anchors[impact.anchor_name]["expected_line"] = impact.new_line
+                    print(f"  Updated {impact.anchor_name}: {impact.old_line} -> {impact.new_line}")
+                    updated += 1
+
+            if updated:
+                sentinel.save_anchors(anchors)
+                print(f"\nSaved {updated} anchor update(s) to anchors.yaml")
+            else:
+                print("\nNo updates applied")
+        elif args.apply and not shifted:
+            print("\nNo safe updates to apply")
+        elif shifted:
+            print(f"\nRun with --apply to update {len(shifted)} shifted anchor(s)")
+
+        if modified or deleted:
+            print("\n⚠️  Some anchors require manual attention")
+            return EXIT_ANCHOR_DRIFT
+
+        return EXIT_SUCCESS
+
     if args.anchors_only:
         # Auto-update anchor line numbers
         print("\nAuto-updating anchor line numbers...")
@@ -661,8 +1089,7 @@ def cmd_retrace(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
 
         if updated:
             # Save updated anchors
-            with open(sentinel.anchors_path, "w") as f:
-                yaml.dump(anchors, f, default_flow_style=False, sort_keys=False)
+            sentinel.save_anchors(anchors)
             print(f"\nUpdated {updated} anchor(s) in anchors.yaml")
         else:
             print("\nNo anchor updates needed")
@@ -675,7 +1102,10 @@ def cmd_retrace(args: argparse.Namespace, sentinel: CodeSentinel) -> int:
     print(f"  1. {trace_path}")
     print(f"  2. {sentinel.anchors_path}")
     print(f"  3. {sentinel.meta_path}")
-    print("\nOr use --anchors-only to auto-update line numbers.")
+    print("\nOr use:")
+    print("  --auto         Analyze anchor impacts")
+    print("  --auto --apply Apply safe updates")
+    print("  --anchors-only Force update all anchor line numbers")
 
     return EXIT_SUCCESS
 
@@ -792,10 +1222,13 @@ def main() -> int:
         epilog="""
 Examples:
   ./sentinel.py status                          Show sentinel health
+  ./sentinel.py init src/module.py              Scaffold a new trace
   ./sentinel.py verify --trace triton-forward-k3plus
   ./sentinel.py verify --all --check-consistency
   ./sentinel.py pipeline                        Full pre-commit pipeline
-  ./sentinel.py retrace triton-forward-k3plus --anchors-only
+  ./sentinel.py retrace NAME --auto             Analyze anchor impacts
+  ./sentinel.py retrace NAME --auto --apply     Apply safe updates
+  ./sentinel.py retrace NAME --anchors-only     Force update line numbers
   ./sentinel.py report --format json
         """,
     )
@@ -805,6 +1238,12 @@ Examples:
 
     # status
     subparsers.add_parser("status", help="Show sentinel health")
+
+    # init
+    init_parser = subparsers.add_parser("init", help="Scaffold a new trace from source file")
+    init_parser.add_argument("source", help="Source file to analyze")
+    init_parser.add_argument("--name", help="Trace name (default: source filename stem)")
+    init_parser.add_argument("--force", action="store_true", help="Overwrite existing trace")
 
     # verify
     verify_parser = subparsers.add_parser("verify", help="Verify traces")
@@ -824,8 +1263,12 @@ Examples:
     # retrace
     retrace_parser = subparsers.add_parser("retrace", help="Update a sentinel")
     retrace_parser.add_argument("trace_name", help="Name of trace to update")
+    retrace_parser.add_argument("--auto", action="store_true", help="Auto-analyze anchor impacts")
     retrace_parser.add_argument(
-        "--anchors-only", action="store_true", help="Only update anchor line numbers"
+        "--apply", action="store_true", help="Apply safe updates (use with --auto)"
+    )
+    retrace_parser.add_argument(
+        "--anchors-only", action="store_true", help="Force update all anchor line numbers"
     )
     retrace_parser.add_argument(
         "--diff-only", action="store_true", help="Only show diff, don't update"
@@ -854,6 +1297,7 @@ Examples:
 
     commands = {
         "status": cmd_status,
+        "init": cmd_init,
         "verify": cmd_verify,
         "pipeline": cmd_pipeline,
         "retrace": cmd_retrace,

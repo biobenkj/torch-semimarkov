@@ -130,6 +130,32 @@ sentinels:
     status: VERIFIED
     depends_on: []
 
+  crf-heads:
+    verified_commit: 40fe66b
+    source_files:
+      - src/torch_semimarkov/nn.py
+    assumptions_mechanical: [N1, N2, N3, N4, N5]
+    assumptions_agent: [N6, N7, N8]
+    anchors:
+      - CLASS_DEFINITION
+      - INIT_METHOD
+      - FORWARD_METHOD
+      - ZERO_CENTER
+      - FLOAT32_CONVERT
+      - NAN_CHECK_PROJECTION
+      - NAN_CHECK_CUMSUM
+      - BACKEND_SELECT
+      - COMPUTE_LOSS
+      - DECODE_METHOD
+      - DECODE_TRACEBACK
+      - STREAMING_FORWARD_CALL
+    linked_tests:
+      - tests/test_semimarkov.py
+      - tests/test_streaming_triton.py::TestTritonBasic
+    status: VERIFIED
+    depends_on:
+      - dispatch-overview
+
 test_bindings:
   # Maps source files to tests that should run when they change
   src/torch_semimarkov/streaming/triton_forward.py:
@@ -146,3 +172,6 @@ test_bindings:
     - tests/test_streaming_triton.py::TestTritonBasic
   src/torch_semimarkov/semimarkov.py:
     - tests/test_semimarkov.py
+  src/torch_semimarkov/nn.py:
+    - tests/test_semimarkov.py
+    - tests/test_streaming_triton.py::TestTritonBasic

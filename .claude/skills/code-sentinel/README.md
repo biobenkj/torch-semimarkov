@@ -23,8 +23,14 @@ Code Sentinel addresses this by:
 # Check all sentinels for drift
 ./sentinel.py status
 
+# Scaffold a new trace from source file
+./sentinel.py init src/torch_semimarkov/streaming/new_module.py
+
 # Full verification before making changes
 ./sentinel.py verify --trace triton-forward-k3plus
+
+# Auto-detect anchor changes after code modifications
+./sentinel.py retrace triton-forward-k3plus --auto
 
 # Run full pipeline (recommended before commits)
 ./sentinel.py pipeline
@@ -143,6 +149,75 @@ Sentinels:
   ...
 ```
 
+### `sentinel.py init`
+
+Scaffold a new trace from a source file. Analyzes the source to extract functions and classes, assigns importance levels based on domain-specific patterns, and generates a draft trace document with suggested anchors.
+
+```bash
+# Basic usage
+./sentinel.py init src/torch_semimarkov/streaming/new_module.py
+
+# Custom trace name
+./sentinel.py init src/torch_semimarkov/streaming/new_module.py --name my-trace
+
+# Overwrite existing trace
+./sentinel.py init src/torch_semimarkov/streaming/new_module.py --force
+```
+
+Output:
+```
+Analyzing src/torch_semimarkov/streaming/new_module.py...
+  Found 15 functions, 2 classes
+  Critical: 3, High: 5
+
+Created trace: traces/new_module.md
+
+=== Suggested Anchors ===
+Add to anchors/anchors.yaml:
+  FORWARD:
+    file: src/torch_semimarkov/streaming/new_module.py
+    pattern: "def forward("
+    expected_line: 42
+    drift_tolerance: 30
+...
+
+=== Suggested Meta Entry ===
+...
+
+Next steps:
+  1. Edit the trace file to complete TODO sections
+  2. Add anchors to anchors/anchors.yaml
+  3. Add entry to .sentinel-meta.yaml
+  4. Update verified_commit and status when ready
+  5. Run: ./sentinel.py verify --trace new_module
+```
+
+The init command uses domain-specific pattern matching to identify critical functions:
+- **Critical patterns**: `forward`, `backward`, `apply`, `@triton.jit`, `semi_crf`, `launch_`
+- **High patterns**: `__init__`, `logsumexp`, `NEG_INF`, `torch.isfinite`, `torch.isnan`, `decode`
+
+#### Design Philosophy: Intentional Scaffolding Limits
+
+The `init` command intentionally provides only ~17% of a completed trace (structural scaffolding and accurate line references). The remaining ~83% represents **irreducible domain knowledge** that must come from human or LLM understanding:
+
+| Category | % of Final Trace | Nature |
+|----------|------------------|--------|
+| Domain understanding | ~37% | *Why* code does what it does |
+| Numerical patterns | ~19% | Which guards are critical and why |
+| Assumption formulation | ~15% | Mapping invariants to verifiable checks |
+| Anchor pattern discovery | ~11% | Non-obvious patterns (guards, conversions) |
+| Known issues | ~8% | Historical context and edge cases |
+
+**This gap is intentional and should NOT be optimized away.** Sentinels derive their value precisely from encoding understanding that source code alone does not express. Attempting to auto-generate the "why" would defeat the purpose of grounded verification.
+
+The `init` command's role is deliberately limited to:
+
+- Eliminating structural/formatting decisions
+- Providing accurate line number references
+- Identifying key entry points by name
+
+It explicitly does NOT attempt to explain code behavior, identify critical invariants, or document numerical stability patterns—these require reading and understanding the code.
+
 ### `sentinel.py verify`
 
 Run full verification for a specific trace or all traces.
@@ -203,14 +278,44 @@ Exit codes:
 
 ### `sentinel.py retrace`
 
-Regenerate a sentinel when code has changed.
+Regenerate a sentinel when code has changed. Offers multiple modes from fully automatic to manual.
 
 ```bash
+# Auto-analyze anchor impacts (dry run)
+./sentinel.py retrace triton-forward-k3plus --auto
+
+# Auto-analyze and apply safe updates (shifted anchors only)
+./sentinel.py retrace triton-forward-k3plus --auto --apply
+
+# Force update all anchor line numbers
+./sentinel.py retrace triton-forward-k3plus --anchors-only
+
 # Show current state and diff
 ./sentinel.py retrace triton-forward-k3plus --diff-only
+```
 
-# Auto-update anchors only (line numbers shifted, patterns still match)
-./sentinel.py retrace triton-forward-k3plus --anchors-only
+The `--auto` mode analyzes changes since the verified commit and classifies anchor impacts:
+
+- **Unchanged**: Anchor still at expected location (within tolerance)
+- **Shifted** (auto-fixable): Pattern found but line number changed
+- **Modified** (needs review): Pattern matches multiple lines
+- **Deleted** (manual fix): Pattern no longer found
+
+Example output:
+```
+=== Auto-Retrace Analysis ===
+
+Anchor Impact Summary:
+  Unchanged: 5
+  Shifted (auto-fixable): 2
+  Modified (needs review): 0
+  Deleted (manual fix): 0
+
+Shifted anchors (safe to auto-update):
+  RING_BUFFER_WRITE: 320 -> 325
+  CHECKPOINT_SAVE: 329 -> 334
+
+Run with --apply to update 2 shifted anchor(s)
 ```
 
 ### `sentinel.py install-hooks`

@@ -96,3 +96,85 @@ autograd-kernel-interface:
     after: "class SemiCRFStreamingTriton("
     expected_line: 224
     drift_tolerance: 30
+
+# CRF Head anchors (nn.py)
+crf-heads:
+  CLASS_DEFINITION:
+    file: src/torch_semimarkov/nn.py
+    pattern: "class SemiMarkovCRFHead(nn.Module):"
+    expected_line: 39
+    drift_tolerance: 20
+
+  INIT_METHOD:
+    file: src/torch_semimarkov/nn.py
+    pattern: "def __init__("
+    after: "class SemiMarkovCRFHead"
+    expected_line: 121
+    drift_tolerance: 30
+
+  FORWARD_METHOD:
+    file: src/torch_semimarkov/nn.py
+    pattern: "def forward("
+    after: "class SemiMarkovCRFHead"
+    expected_line: 272
+    drift_tolerance: 30
+
+  ZERO_CENTER:
+    file: src/torch_semimarkov/nn.py
+    pattern: "scores_float = scores_float - scores_float.mean(dim=1, keepdim=True)"
+    after: "def forward("
+    expected_line: 342
+    drift_tolerance: 20
+
+  FLOAT32_CONVERT:
+    file: src/torch_semimarkov/nn.py
+    pattern: "scores_float = scores.float()"
+    after: "def forward("
+    expected_line: 340
+    drift_tolerance: 20
+
+  NAN_CHECK_PROJECTION:
+    file: src/torch_semimarkov/nn.py
+    pattern: "if scores.requires_grad and torch.isnan(scores).any():"
+    expected_line: 314
+    drift_tolerance: 25
+
+  NAN_CHECK_CUMSUM:
+    file: src/torch_semimarkov/nn.py
+    pattern: "if cum_scores.requires_grad and torch.isnan(cum_scores).any():"
+    expected_line: 349
+    drift_tolerance: 25
+
+  BACKEND_SELECT:
+    file: src/torch_semimarkov/nn.py
+    pattern: "def _select_backend("
+    expected_line: 170
+    drift_tolerance: 30
+
+  COMPUTE_LOSS:
+    file: src/torch_semimarkov/nn.py
+    pattern: "def compute_loss("
+    after: "class SemiMarkovCRFHead"
+    expected_line: 376
+    drift_tolerance: 30
+
+  DECODE_METHOD:
+    file: src/torch_semimarkov/nn.py
+    pattern: "def decode("
+    after: "class SemiMarkovCRFHead"
+    expected_line: 461
+    drift_tolerance: 30
+
+  DECODE_TRACEBACK:
+    file: src/torch_semimarkov/nn.py
+    pattern: "def decode_with_traceback("
+    after: "class SemiMarkovCRFHead"
+    expected_line: 539
+    drift_tolerance: 30
+
+  STREAMING_FORWARD_CALL:
+    file: src/torch_semimarkov/nn.py
+    pattern: "partition = semi_crf_streaming_forward("
+    after: "def forward("
+    expected_line: 357
+    drift_tolerance: 30

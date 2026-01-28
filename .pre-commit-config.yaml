@@ -5,6 +5,10 @@ repos:
         name: Code Sentinel Pipeline
         entry: .claude/skills/code-sentinel/hooks/pre-commit-anchors.sh
         language: script
-        files: ^src/torch_semimarkov/streaming/
+        # Cover all traced source files:
+        # - streaming/ (triton, pytorch reference, autograd)
+        # - semimarkov.py (non-streaming backends, dispatch)
+        # - nn.py (CRF heads - future)
+        files: ^src/torch_semimarkov/
         pass_filenames: false
         verbose: true
