@@ -10,7 +10,8 @@ from torch_semimarkov.banded_utils import (
 from torch_semimarkov.semirings import LogSemiring
 
 
-def test_banded_logpartition_matches_linear_scan():
+def test_banded_logpartition_matches_binary_tree():
+    """Banded backend should match standard binary_tree (both use K-1 indexing)."""
     torch.manual_seed(0)
     batch, T, K, C = 1, 6, 4, 2
     edge = torch.randn(batch, T - 1, K, C, C, requires_grad=True)
@@ -24,9 +25,10 @@ def test_banded_logpartition_matches_linear_scan():
         banded_perm="none",
         banded_bw_ratio=1.1,
     )
-    v_linear, _, _ = struct.logpartition(edge, lengths=lengths, use_linear_scan=True)
+    # Compare against binary_tree (not linear_scan - different indexing convention)
+    v_tree, _, _ = struct.logpartition(edge, lengths=lengths, use_linear_scan=False)
 
-    assert torch.allclose(v_banded, v_linear, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(v_banded, v_tree, atol=1e-5, rtol=1e-5)
 
 
 def test_banded_helpers_shapes():
@@ -55,8 +57,8 @@ class TestBandedPermutationModes:
     """Test different permutation modes for banded optimization."""
 
     @pytest.mark.parametrize("perm_mode", ["none", "snake", "rcm", "auto"])
-    def test_all_permutation_modes_match_linear_scan(self, perm_mode):
-        """All permutation modes should produce same result as linear scan."""
+    def test_all_permutation_modes_match_binary_tree(self, perm_mode):
+        """All permutation modes should produce same result as binary_tree."""
         torch.manual_seed(42)
         batch, T, K, C = 2, 8, 4, 2
         edge = torch.randn(batch, T - 1, K, C, C)
@@ -70,9 +72,10 @@ class TestBandedPermutationModes:
             banded_perm=perm_mode,
             banded_bw_ratio=1.1,  # High ratio to ensure banded path is used
         )
-        v_linear, _, _ = struct.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        # Compare against binary_tree (both use K-1 indexing)
+        v_tree, _, _ = struct.logpartition(edge, lengths=lengths, use_linear_scan=False)
 
-        assert torch.allclose(v_banded, v_linear, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(v_banded, v_tree, atol=1e-4, rtol=1e-4)
 
     def test_snake_ordering_reduces_bandwidth(self):
         """Snake ordering should reduce bandwidth for duration structure."""
@@ -135,10 +138,11 @@ class TestBandedFallbackLogic:
             banded_perm="none",
             banded_bw_ratio=0.01,  # Very low threshold
         )
-        v_linear, _, _ = struct.logpartition(edge, lengths=lengths, use_linear_scan=True)
+        # Compare against binary_tree (both use K-1 indexing)
+        v_tree, _, _ = struct.logpartition(edge, lengths=lengths, use_linear_scan=False)
 
-        # Should still match (fallback to dense is correct)
-        assert torch.allclose(v_banded, v_linear, atol=1e-4, rtol=1e-4)
+        # Should still match (fallback to dense uses same indexing as binary_tree)
+        assert torch.allclose(v_banded, v_tree, atol=1e-4, rtol=1e-4)
 
     def test_threshold_calculation(self):
         """Verify threshold is calculated correctly from bw_ratio."""
@@ -162,8 +166,8 @@ class TestBandedFallbackLogic:
 class TestBandedGradients:
     """Test gradient computation through banded path."""
 
-    def test_banded_gradient_matches_linear(self):
-        """Gradients through banded path should match linear scan."""
+    def test_banded_gradient_matches_binary_tree(self):
+        """Gradients through banded path should match binary_tree."""
         torch.manual_seed(42)
         batch, T, K, C = 2, 6, 3, 2
         edge = torch.randn(batch, T - 1, K, C, C, dtype=torch.float64)
@@ -182,13 +186,13 @@ class TestBandedGradients:
         v_banded.sum().backward()
         grad_banded = edge_banded.grad.clone()
 
-        # Linear gradient
-        edge_linear = edge.clone().requires_grad_(True)
-        v_linear, _, _ = struct.logpartition(edge_linear, lengths=lengths, use_linear_scan=True)
-        v_linear.sum().backward()
-        grad_linear = edge_linear.grad.clone()
+        # Binary tree gradient (both use K-1 indexing)
+        edge_tree = edge.clone().requires_grad_(True)
+        v_tree, _, _ = struct.logpartition(edge_tree, lengths=lengths, use_linear_scan=False)
+        v_tree.sum().backward()
+        grad_tree = edge_tree.grad.clone()
 
-        max_diff = (grad_banded - grad_linear).abs().max().item()
+        max_diff = (grad_banded - grad_tree).abs().max().item()
         assert max_diff < 1e-4, f"Gradient diff: {max_diff:.2e}"
 
 

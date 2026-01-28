@@ -257,7 +257,8 @@ class UncertaintyMixin:
         # Compute marginals
         model = SemiMarkov(LogSemiring)
         # Edge tensor has T positions (0..T-1), SemiMarkov expects N=T+1 for lengths
-        edge_marginals = model.marginals(edge, lengths=lengths + 1)
+        # Force linear scan to match streaming API indexing convention
+        edge_marginals = model.marginals(edge, lengths=lengths + 1, use_linear_scan=True)
 
         # Aggregate to boundary probability
         # edge_marginals[b, n, k, c_dest, c_src] = P(segment starting at n with label c_dest)

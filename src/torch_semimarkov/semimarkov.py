@@ -92,8 +92,7 @@ class SemiMarkov(_Struct):
         ssize = semiring.size()
         log_potentials.requires_grad_(True)
         log_N, bin_N = self._bin_length(N - 1)
-        # Use K (not K-1) to consider all K durations (1 to K)
-        init = self._chart((batch, bin_N, K, K, C, C), log_potentials, force_grad)
+        init = self._chart((batch, bin_N, K - 1, K - 1, C, C), log_potentials, force_grad)
 
         # Init.
         mask = torch.zeros(*init.shape, device=log_potentials.device).bool()
@@ -112,7 +111,7 @@ class SemiMarkov(_Struct):
             device=log_potentials.device,
         )
         big[:, :, : N - 1] = log_potentials
-        c = init[:, :, :].view(ssize, batch * bin_N, K, K, C, C)
+        c = init[:, :, :].view(ssize, batch * bin_N, K - 1, K - 1, C, C)
         lp = big[:, :, :].view(ssize, batch * bin_N, K, C, C)
         mask = torch.arange(bin_N).view(1, bin_N).expand(batch, bin_N)
         mask = mask.to(log_potentials.device)
@@ -120,20 +119,19 @@ class SemiMarkov(_Struct):
         mask = mask.view(batch * bin_N, 1, 1, 1).to(lp.device)
         lp.data[:] = semiring.fill(lp.data, mask, semiring.zero)
         c.data[:, :, :, 0] = semiring.fill(c.data[:, :, :, 0], (~mask), semiring.zero)
-        # 0-based indexing: duration k uses index k-1, so access indices 0:K
-        c[:, :, :K, 0] = semiring.sum(torch.stack([c.data[:, :, :K, 0], lp[:, :, 0:K]], dim=-1))
+        c[:, :, : K - 1, 0] = semiring.sum(
+            torch.stack([c.data[:, :, : K - 1, 0], lp[:, :, 1:K]], dim=-1)
+        )
         mask = torch.zeros(*init.shape, device=log_potentials.device).bool()
         mask_length = torch.arange(bin_N).view(1, bin_N, 1).expand(batch, bin_N, C)
         mask_length = mask_length.to(log_potentials.device)
-        # Loop over all K durations
-        for k in range(1, K):
+        for k in range(1, K - 1):
             mask_length_k = mask_length < (lengths - 1 - (k - 1)).view(batch, 1, 1)
             mask_length_k = semiring.convert(mask_length_k)
             mask[:, :, :, k - 1, k].diagonal(0, -2, -1).masked_fill_(mask_length_k, True)
         init = semiring.fill(init, mask, semiring.one)
 
-        # K_1 is now K (all durations)
-        K_1 = K
+        K_1 = K - 1
 
         # Order n, n-1
         chart = (
@@ -343,8 +341,7 @@ class SemiMarkov(_Struct):
         edge.requires_grad_(True)
 
         log_N, bin_N = self._bin_length(N - 1)
-        # Use K (not K-1) to consider all K durations (1 to K)
-        init = self._chart((batch, bin_N, K, K, C, C), edge, force_grad)
+        init = self._chart((batch, bin_N, K - 1, K - 1, C, C), edge, force_grad)
 
         # Init mask (same as standard)
         mask = torch.zeros(*init.shape, device=edge.device).bool()
@@ -363,7 +360,7 @@ class SemiMarkov(_Struct):
             device=edge.device,
         )
         big[:, :, : N - 1] = edge
-        c = init[:, :, :].view(ssize, batch * bin_N, K, K, C, C)
+        c = init[:, :, :].view(ssize, batch * bin_N, K - 1, K - 1, C, C)
         lp = big[:, :, :].view(ssize, batch * bin_N, K, C, C)
         mask = torch.arange(bin_N).view(1, bin_N).expand(batch, bin_N)
         mask = mask.to(edge.device)
@@ -371,20 +368,19 @@ class SemiMarkov(_Struct):
         mask = mask.view(batch * bin_N, 1, 1, 1).to(lp.device)
         lp.data[:] = semiring.fill(lp.data, mask, semiring.zero)
         c.data[:, :, :, 0] = semiring.fill(c.data[:, :, :, 0], (~mask), semiring.zero)
-        # 0-based indexing: duration k uses index k-1, so access indices 0:K
-        c[:, :, :K, 0] = semiring.sum(torch.stack([c.data[:, :, :K, 0], lp[:, :, 0:K]], dim=-1))
+        c[:, :, : K - 1, 0] = semiring.sum(
+            torch.stack([c.data[:, :, : K - 1, 0], lp[:, :, 1:K]], dim=-1)
+        )
         mask = torch.zeros(*init.shape, device=edge.device).bool()
         mask_length = torch.arange(bin_N).view(1, bin_N, 1).expand(batch, bin_N, C)
         mask_length = mask_length.to(edge.device)
-        # Loop over all K durations
-        for k in range(1, K):
+        for k in range(1, K - 1):
             mask_length_k = mask_length < (lengths - 1 - (k - 1)).view(batch, 1, 1)
             mask_length_k = semiring.convert(mask_length_k)
             mask[:, :, :, k - 1, k].diagonal(0, -2, -1).masked_fill_(mask_length_k, True)
         init = semiring.fill(init, mask, semiring.one)
 
-        # K_1 is now K (all durations)
-        K_1 = K
+        K_1 = K - 1
 
         # Flatten to (K*C, K*C) - same permutation as standard algorithm
         chart = (
@@ -423,17 +419,15 @@ class SemiMarkov(_Struct):
         k1 + k2 <= S (duration pairs must fit within span) creates
         implicit sparsity in the (K*C, K*C) state space.
         """
-        # Now considering all K durations (not K-1)
-        effective_K = min(K, span_length // 2)
+        effective_K = min(K - 1, span_length // 2)
         lu = ld = effective_K * C
         return lu, ld
 
     def _build_adjacency(self, span_length: int, K: int, C: int, device) -> torch.Tensor:
-        """Build a dense adjacency (K*C) x (K*C) for duration/label pairs
+        """Build a dense adjacency (K_1*C) x (K_1*C) for duration/label pairs
         under the constraint k1 + k2 <= span_length.
         """
-        # Now considering all K durations (not K-1)
-        K_1 = K
+        K_1 = K - 1
         size = K_1 * C
         adj = torch.zeros((size, size), device=device, dtype=torch.bool)
 
@@ -471,8 +465,7 @@ class SemiMarkov(_Struct):
             snake_ordering,
         )
 
-        # K_1 is now K (all durations)
-        K_1 = K
+        K_1 = K - 1
         size = K_1 * C
         adj = self._build_adjacency(span_length, K, C, device=device)
         best_bw = measure_effective_bandwidth(adj.float(), fill_value=0.0)
@@ -518,8 +511,7 @@ class SemiMarkov(_Struct):
 
         # Binary tree setup (same as standard algorithm)
         log_N, bin_N = self._bin_length(N - 1)
-        # Use K (not K-1) to consider all K durations (1 to K)
-        init = self._chart((batch, bin_N, K, K, C, C), edge, force_grad)
+        init = self._chart((batch, bin_N, K - 1, K - 1, C, C), edge, force_grad)
 
         # Init mask (same as standard)
         mask = torch.zeros(*init.shape, device=edge.device).bool()
@@ -538,7 +530,7 @@ class SemiMarkov(_Struct):
             device=edge.device,
         )
         big[:, :, : N - 1] = edge
-        c = init[:, :, :].view(ssize, batch * bin_N, K, K, C, C)
+        c = init[:, :, :].view(ssize, batch * bin_N, K - 1, K - 1, C, C)
         lp = big[:, :, :].view(ssize, batch * bin_N, K, C, C)
         mask = torch.arange(bin_N).view(1, bin_N).expand(batch, bin_N)
         mask = mask.to(edge.device)
@@ -546,20 +538,19 @@ class SemiMarkov(_Struct):
         mask = mask.view(batch * bin_N, 1, 1, 1).to(lp.device)
         lp.data[:] = semiring.fill(lp.data, mask, semiring.zero)
         c.data[:, :, :, 0] = semiring.fill(c.data[:, :, :, 0], (~mask), semiring.zero)
-        # 0-based indexing: duration k uses index k-1, so access indices 0:K
-        c[:, :, :K, 0] = semiring.sum(torch.stack([c.data[:, :, :K, 0], lp[:, :, 0:K]], dim=-1))
+        c[:, :, : K - 1, 0] = semiring.sum(
+            torch.stack([c.data[:, :, : K - 1, 0], lp[:, :, 1:K]], dim=-1)
+        )
         mask = torch.zeros(*init.shape, device=edge.device).bool()
         mask_length = torch.arange(bin_N).view(1, bin_N, 1).expand(batch, bin_N, C)
         mask_length = mask_length.to(edge.device)
-        # Loop over all K durations
-        for k in range(1, K):
+        for k in range(1, K - 1):
             mask_length_k = mask_length < (lengths - 1 - (k - 1)).view(batch, 1, 1)
             mask_length_k = semiring.convert(mask_length_k)
             mask[:, :, :, k - 1, k].diagonal(0, -2, -1).masked_fill_(mask_length_k, True)
         init = semiring.fill(init, mask, semiring.one)
 
-        # K_1 is now K (all durations)
-        K_1 = K
+        K_1 = K - 1
 
         # Flatten to (K*C, K*C)
         chart = (

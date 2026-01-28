@@ -2,7 +2,12 @@
 # Machine-readable state for automation and status queries
 
 version: 2.0
-last_global_verification: 2026-01-28T18:30:00Z
+last_global_verification: 2026-01-28T20:18:48Z
+
+# Note: Dual indexing scheme active during benchmarking phase
+# - Streaming backends: 0-based (dur_idx = k - 1) - production target
+# - Non-streaming backends: 1-based (dur_idx = k) - legacy
+# See dispatch-overview.md and non-streaming-backends.md for details
 
 sentinels:
   triton-forward-k3plus:

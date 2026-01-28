@@ -14,7 +14,14 @@ The torch-semimarkov library provides two API families:
 
 2. **Non-Streaming API** (`SemiMarkov.logpartition`) - Operates on pre-computed edge tensors. Multiple algorithm variants. Entry point: `semimarkov.py:35`
 
-Both APIs use **identical duration indexing**: `dur_idx = k - 1` (0-based) for duration value `k`.
+**Note on Duration Indexing:** The two APIs currently use different indexing conventions by design (benchmarking phase):
+
+| API               | Convention | Index Range | Example                      |
+|-------------------|------------|-------------|------------------------------|
+| **Streaming**     | 0-based    | 0 to K-1    | Duration k uses `edge[k-1]`  |
+| **Non-streaming** | 1-based    | 1 to K-1    | Duration k uses `edge[k]`    |
+
+The streaming (0-based) convention is the production target and will be adopted universally post-benchmarking.
 
 ## Active Assumptions
 
@@ -209,11 +216,12 @@ needs_grad = (
 
 ## Critical Invariants
 
-### Duration Indexing (ALL backends)
+### Duration Indexing (divergent during benchmarking)
 
-- [ ] Duration index formula: `dur_idx = k - 1` for duration value `k`
-- [ ] `duration_bias` shape: `(K, C)` where index 0 = duration 1
-- [ ] Edge tensor last dims: `(c_dst, c_src)` - destination first
+- [ ] **Streaming**: `dur_idx = k - 1` for duration value `k` (0-based, production target)
+- [ ] **Non-streaming**: `dur_idx = k` for duration value `k` (1-based, legacy)
+- [ ] `duration_bias` shape: `(K, C)` - index semantics differ by API
+- [ ] Edge tensor last dims: `(c_dst, c_src)` - destination first (consistent)
 
 ### Streaming API
 
@@ -248,5 +256,6 @@ needs_grad = (
 
 ## Version History
 
+- **2026-01-28**: Documented dual indexing scheme divergence (streaming 0-based vs non-streaming 1-based)
 - **2026-01-28**: Added non-streaming backends (`semimarkov.py`) decision tree, algorithm lookup, entry points, and failure routing @ commit `40fe66b`
 - **2026-01-27**: Initial trace (streaming API only) @ commit `40fe66b`

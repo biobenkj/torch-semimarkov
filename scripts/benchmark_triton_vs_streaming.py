@@ -51,9 +51,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+from torch_semimarkov.triton_scan import semi_crf_triton_forward
 
 from torch_semimarkov.streaming import semi_crf_streaming_forward
-from torch_semimarkov.triton_scan import semi_crf_triton_forward
 
 # Increase recursion limit for torch.compile with deep computational graphs.
 # The semi-CRF DP loop creates ~T sequential dependencies, and torch.compile's

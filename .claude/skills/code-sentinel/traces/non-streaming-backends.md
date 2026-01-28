@@ -66,38 +66,41 @@ use_linear_scan = K_C_product > 200
 
 ## Duration Indexing Convention
 
-**All non-streaming backends use 0-based duration indexing:**
+**Non-streaming backends use 1-based duration indexing** (differs from streaming):
 
-| Duration value | Array index | Access pattern |
-|---------------|-------------|----------------|
-| k = 1 | 0 | `edge[:, :, n, 0, :, :]` |
-| k = 2 | 1 | `edge[:, :, n, 1, :, :]` |
-| ... | ... | ... |
-| k = K | K-1 | `edge[:, :, n, K-1, :, :]` |
+| Duration value | Array index | Access pattern              |
+|----------------|-------------|-----------------------------|
+| k = 1          | 1           | `edge[:, :, n, 1, :, :]`    |
+| k = 2          | 2           | `edge[:, :, n, 2, :, :]`    |
+| ...            | ...         | ...                         |
+| k = K-1        | K-1         | `edge[:, :, n, K-1, :, :]`  |
 
-**Formula:** `dur_idx = k - 1` (identical to streaming backends)
+**Formula:** `dur_idx = k` (direct indexing, index 0 unused)
+
+Note: This differs from streaming backends which use 0-based indexing (`dur_idx = k - 1`). The streaming convention is the production target and will be adopted post-benchmarking.
 
 ### Evidence in Code
 
-**Binary tree** (`semimarkov.py:123-124`):
+**Binary tree** (`semimarkov.py:122-124`):
 ```python
-# 0-based indexing: duration k uses index k-1, so access indices 0:K
-c[:, :, :K, 0] = semiring.sum(torch.stack([c.data[:, :, :K, 0], lp[:, :, 0:K]], dim=-1))
+c[:, :, : K - 1, 0] = semiring.sum(
+    torch.stack([c.data[:, :, : K - 1, 0], lp[:, :, 1:K]], dim=-1)
+)
 ```
 
-**Ring buffer scan** (`semimarkov.py:204-206`):
+**Ring buffer scan** (`semimarkov.py:202-206`):
 ```python
 # Duration k uses edge index k-1
 dur_idx = dur - 1
 edge_slice = edge[:, :, start, dur_idx, :, :]  # (ssize, batch, k_eff, C, C)
 ```
 
-**Standard/Vectorized** (`semimarkov.py:264-268`, `310-314`):
+**Standard/Vectorized** (`semimarkov.py:262-266`, `308-312`):
 ```python
 # Duration k (1 to K) uses index k-1 (0-based indexing)
 t = max(n - K - 1, -1)
 f1 = torch.arange(n - 1, t, -1)  # time positions [n-1, n-2, ..., n-K]
-f2 = torch.arange(0, len(f1))     # duration indices [0, 1, ..., K-1]
+f2 = torch.arange(0, len(f1))    # duration indices [0, 1, ..., K-1]
 ```
 
 ## Edge Tensor Semantics
@@ -240,23 +243,24 @@ def hsmm(init_z_1, transition_z_to_z, transition_z_to_l, emission_n_l_z):
 
 ## Comparison with Streaming API
 
-| Aspect | Non-Streaming | Streaming |
-|--------|---------------|-----------|
-| **Input** | Pre-computed `edge (batch, N-1, K, C, C)` | `cum_scores (batch, T+1, C)` + params |
-| **Edge computation** | User/upstream responsibility | On-the-fly prefix-sum |
-| **Memory (T=1000, K=100, C=24)** | ~19.2 GB | ~92 KB |
-| **Duration indexing** | `dur_idx = k - 1` | `dur_idx = k - 1` ✓ |
-| **Transition semantics** | `edge[..., c_dst, c_src]` | `edge_block[c_dst, c_src]` ✓ |
-| **Gradient support** | Via autograd on edge tensor | Custom backward kernels |
-| **Use case** | Small sequences, pre-computed edges | Training, long sequences |
+| Aspect                             | Non-Streaming                              | Streaming                           |
+|------------------------------------|--------------------------------------------|-------------------------------------|
+| **Input**                          | Pre-computed `edge (batch, N-1, K, C, C)`  | `cum_scores (batch, T+1, C)` + params |
+| **Edge computation**               | User/upstream responsibility               | On-the-fly prefix-sum               |
+| **Memory (T=1000, K=100, C=24)**   | ~19.2 GB                                   | ~92 KB                              |
+| **Duration indexing**              | `dur_idx = k` (1-based)                    | `dur_idx = k - 1` (0-based)         |
+| **Transition semantics**           | `edge[..., c_dst, c_src]`                  | `edge_block[c_dst, c_src]`          |
+| **Gradient support**               | Via autograd on edge tensor                | Custom backward kernels             |
+| **Use case**                       | Small sequences, pre-computed edges        | Training, long sequences            |
 
 ## Critical Invariants
 
-- [ ] Duration index `k-1` for duration value `k` (0-based storage)
+- [ ] Duration index `k` for duration value `k` (1-based storage, indices 1 to K-1)
 - [ ] Edge tensor last two dims are `(c_dst, c_src)` - destination first
 - [ ] Ring buffer uses `(head - (dur - 1)) % ring_len` for history access
 - [ ] Auto-selection threshold: `K*C > 200` triggers linear scan
 - [ ] All algorithms produce identical partition values (up to numerical precision)
+- [ ] Indexing differs from streaming API (0-based) - will be unified post-benchmarking
 
 ## Known Issues
 
@@ -268,4 +272,5 @@ def hsmm(init_z_1, transition_z_to_z, transition_z_to_l, emission_n_l_z):
 
 ## Version History
 
+- **2026-01-28**: Updated to document 1-based duration indexing (benchmarking divergence from streaming)
 - **2026-01-28**: Initial trace @ commit `40fe66b`

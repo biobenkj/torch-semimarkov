@@ -165,14 +165,15 @@ class TestMinimalSequences:
             assert result.segments[b][0].duration == 1
 
     def test_t1_partition_includes_duration_bias(self):
-        """T=1 partition includes duration_bias[1], not duration_bias[0]."""
-        # This is a regression test for the duration indexing bug
+        """T=1 partition includes duration_bias[0] for duration=1 (0-based indexing)."""
+        # This verifies that duration k uses index k-1 (0-based indexing)
+        # Duration 1 → duration_bias[0], Duration 2 → duration_bias[1], etc.
         crf = SemiMarkovCRFHead(num_classes=2, max_duration=5)
 
         # Set known values
         crf.transition.data.fill_(0.0)
         crf.duration_dist.duration_bias.data.fill_(0.0)
-        crf.duration_dist.duration_bias.data[1, :] = 1.0  # duration=1 gets +1
+        crf.duration_dist.duration_bias.data[0, :] = 1.0  # duration=1 uses index 0
 
         hidden = torch.zeros(1, 1, 2)
         hidden[0, 0, 0] = 2.0  # Class 0 gets score 2
@@ -182,8 +183,8 @@ class TestMinimalSequences:
         result = crf(hidden, lengths, use_triton=False)
 
         # Forward recurrence at t=1:
-        # alpha[c] = logsumexp_{c_src} [0 + content[c] + duration_bias[1,c] + transition[c_src,c]]
-        # With transition=0 and C=2: alpha[c] = content[c] + dur_bias[1,c] + log(2)
+        # alpha[c] = logsumexp_{c_src} [0 + content[c] + duration_bias[0,c] + transition[c_src,c]]
+        # With transition=0 and C=2: alpha[c] = content[c] + dur_bias[0,c] + log(2)
         # alpha[0] = 2 + 1 + log(2) ≈ 3.69
         # alpha[1] = 1 + 1 + log(2) ≈ 2.69
         # partition = logsumexp([3.69, 2.69]) ≈ 4.00

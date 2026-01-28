@@ -12,7 +12,7 @@ import torch
 
 from torch_semimarkov import SemiMarkov
 from torch_semimarkov.semirings import LogSemiring
-from torch_semimarkov.triton_scan import semi_crf_forward_pytorch, semi_crf_triton_forward
+from torch_semimarkov.streaming import semi_crf_streaming_forward
 
 
 class TestCPUOnlyOperation:
@@ -52,28 +52,22 @@ class TestCPUOnlyOperation:
         assert v.device.type == "cpu"
         assert torch.isfinite(v).all()
 
-    def test_triton_fallback_to_cpu(self):
-        """Triton forward falls back to CPU implementation."""
+    def test_streaming_forward_on_cpu(self):
+        """Streaming forward works on CPU."""
         batch, T, K, C = 2, 6, 4, 3
-        edge = torch.randn(batch, T - 1, K, C, C)
+        # Build cumulative scores for streaming API
+        scores = torch.randn(batch, T, C)
+        cum_scores = torch.zeros(batch, T + 1, C)
+        cum_scores[:, 1:] = torch.cumsum(scores, dim=1)
+        transition = torch.randn(C, C)
+        duration_bias = torch.randn(K)
         lengths = torch.full((batch,), T, dtype=torch.long)
 
-        # This should use CPU fallback when CUDA is not available
-        out = semi_crf_triton_forward(edge, lengths, use_triton=True)
+        # This should work on CPU (uses PyTorch fallback when CUDA not available)
+        log_Z = semi_crf_streaming_forward(cum_scores, transition, duration_bias, lengths, K)
 
-        assert out.device.type == "cpu"
-        assert torch.isfinite(out).all()
-
-    def test_pytorch_reference_on_cpu(self):
-        """PyTorch reference implementation works on CPU."""
-        batch, T, K, C = 2, 6, 4, 3
-        edge = torch.randn(batch, T - 1, K, C, C)
-        lengths = torch.full((batch,), T, dtype=torch.long)
-
-        ref = semi_crf_forward_pytorch(edge, lengths)
-
-        assert ref.device.type == "cpu"
-        assert torch.isfinite(ref).all()
+        assert log_Z.device.type == "cpu"
+        assert torch.isfinite(log_Z).all()
 
     def test_marginals_on_cpu(self):
         """Marginals computation works on CPU."""
