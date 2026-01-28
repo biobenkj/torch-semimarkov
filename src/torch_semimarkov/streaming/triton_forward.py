@@ -269,16 +269,17 @@ if HAS_TRITON:
                 # segment_score is (C_PAD,), expand to (C_PAD, 1) for c_dst
                 # transition_block is (C_PAD, C_PAD) as transition.T
 
-                # For duration-dependent transitions, load transition[k] inside the loop
+                # For duration-dependent transitions, load transition[dur_idx] inside the loop
+                # Duration k uses index k-1 (same convention as PyTorch reference)
                 if HAS_DURATION_TRANSITIONS:
                     transition_block = tl.load(
                         transition_ptr
-                        + k * stride_tr_k
+                        + dur_idx * stride_tr_k
                         + c_dst_idx * stride_tr_dst
                         + c_src_idx * stride_tr_src,
                         mask=c_mask_2d,
                         other=0.0,
-                    )  # (C_PAD, C_PAD) - transition[k].T
+                    )  # (C_PAD, C_PAD) - transition[dur_idx].T
 
                 edge_block = segment_score[:, None] + transition_block  # (C_PAD, C_PAD)
 
@@ -514,16 +515,17 @@ if HAS_TRITON:
                     )
                     segment_score = segment_score + start_score + end_score
 
-                # For duration-dependent transitions, load transition[k] inside the loop
+                # For duration-dependent transitions, load transition[dur_idx] inside the loop
+                # Duration k uses index k-1 (same convention as PyTorch reference)
                 if HAS_DURATION_TRANSITIONS:
                     transition_block = tl.load(
                         transition_ptr
-                        + k * stride_tr_k
+                        + dur_idx * stride_tr_k
                         + c_dst_idx * stride_tr_dst
                         + c_src_idx * stride_tr_src,
                         mask=c_mask_2d,
                         other=0.0,
-                    )  # (C_PAD, C_PAD) - transition[k].T
+                    )  # (C_PAD, C_PAD) - transition[dur_idx].T
 
                 edge_block = segment_score[:, None] + transition_block
 
@@ -726,10 +728,12 @@ if HAS_TRITON:
                     )
                     segment_score = segment_score + start_score + end_score
 
+                # For duration-dependent transitions, load transition[dur_idx] inside the loop
+                # Duration k uses index k-1 (same convention as PyTorch reference)
                 if HAS_DURATION_TRANSITIONS:
                     transition_block = tl.load(
                         transition_ptr
-                        + k * stride_tr_k
+                        + dur_idx * stride_tr_k
                         + c_dst_idx * stride_tr_dst
                         + c_src_idx * stride_tr_src,
                         mask=c_mask_2d,

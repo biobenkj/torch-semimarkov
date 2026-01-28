@@ -2,7 +2,7 @@
 # Machine-readable state for automation and status queries
 
 version: 2.0
-last_global_verification: 2026-01-28T20:18:48Z
+last_global_verification: 2026-01-28T20:57:43Z
 
 # Note: Dual indexing scheme active during benchmarking phase
 # - Streaming backends: 0-based (dur_idx = k - 1) - production target
@@ -166,15 +166,20 @@ test_bindings:
   src/torch_semimarkov/streaming/triton_forward.py:
     - tests/test_streaming_triton.py::TestTritonBasic
     - tests/test_streaming_triton.py::TestNumericalStability
+    - tests/test_streaming_k_boundaries.py::TestK3TritonBoundary
   src/torch_semimarkov/streaming/triton_backward.py:
     - tests/test_streaming_triton.py::TestTritonBasic
     - tests/test_streaming_triton.py::TestGradients
+    - tests/test_streaming_k_boundaries.py::TestK3TritonBoundary
   src/torch_semimarkov/streaming/autograd.py:
     - tests/test_streaming_triton.py::TestDispatch
     - tests/test_semimarkov.py
+    - tests/test_streaming_k_boundaries.py::TestKBoundaryTransitions
   src/torch_semimarkov/streaming/pytorch_reference.py:
     - tests/test_semimarkov.py
     - tests/test_streaming_triton.py::TestTritonBasic
+    - tests/test_streaming_k_boundaries.py::TestK1LinearCRFBoundary
+    - tests/test_streaming_k_boundaries.py::TestK2SpecializedBoundary
   src/torch_semimarkov/semimarkov.py:
     - tests/test_semimarkov.py
   src/torch_semimarkov/nn.py:

@@ -1015,18 +1015,19 @@ def semi_crf_streaming_backward_pytorch(
 
                 # grad_transition: per-batch accumulation (don't sum over batch)
                 # marginal is (batch, C_dest, C_src), transpose to (batch, C_src, C_dest)
-                # For duration-dependent transitions (K, C, C), index by k
+                # For duration-dependent transitions (K, C, C), index by dur_idx = k - 1
+                # (forward pass uses transition[k - 1] for duration k)
+                dur_idx = k - 1
                 if transition.ndim == 2:
                     grad_transition += marginal.transpose(-1, -2)  # (batch, C_src, C_dest)
                 else:
-                    grad_transition[:, k] += marginal.transpose(
+                    grad_transition[:, dur_idx] += marginal.transpose(
                         -1, -2
-                    )  # (batch, C_src, C_dest) at index k
+                    )  # (batch, C_src, C_dest) at index dur_idx
 
                 # grad_duration_bias: per-batch accumulation
                 # marginal.sum(dim=-1) sums over C_src -> (batch, C_dest)
-                # Duration k uses index k-1
-                dur_idx = k - 1
+                # Duration k uses index dur_idx = k - 1
                 grad_duration_bias[:, dur_idx, :] += marginal.sum(dim=-1)  # (batch, C_dest)
 
                 # grad_proj_start, grad_proj_end

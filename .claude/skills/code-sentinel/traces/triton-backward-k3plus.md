@@ -1,7 +1,7 @@
 # Sentinel: Triton Backward Kernel (K >= 3)
 
 **Verified against:** `src/torch_semimarkov/streaming/triton_backward.py` @ commit `40fe66b`
-**Linked tests:** `tests/test_streaming_triton.py::TestTritonGradients::test_triton_gradients_match_pytorch`
+**Linked tests:** `tests/test_streaming_triton.py::TestTritonGradients`, `tests/test_streaming_k_boundaries.py::TestK3TritonBoundary`
 
 ## Summary
 
@@ -160,6 +160,7 @@ grad_duration_bias = grad_db_workspace[:, :, :C].sum(dim=0).to(dtype)
 
 | Issue | Severity | Frequency | Resolution | Commit |
 |-------|----------|-----------|------------|--------|
+| Duration-dependent transition off-by-one | Critical | HAS_DURATION_TRANSITIONS | Use `dur_idx` not `k` for indexing | uncommitted |
 | @triton.autotune corruption | Critical | Multi-config benchmark | Removed autotune decorator | See DEBUGGING_NAN.md |
 | Float32 accumulator overflow | High | Long sequences, large C | Use float64 accumulators | triton_backward.py:897 |
 | Wrong checkpoint_interval | Critical | Mismatched forward/backward | Pass same interval to both | autograd.py:244 |
@@ -204,4 +205,5 @@ if not torch.isfinite(grad_cum_scores_ws).all():
 
 ## Version History
 
+- **2026-01-28**: Fixed duration-dependent transition indexing (k -> dur_idx = k-1), added K boundary tests
 - **2026-01-27**: Initial trace @ commit `40fe66b`

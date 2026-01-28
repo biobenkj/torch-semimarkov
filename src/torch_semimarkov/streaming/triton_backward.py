@@ -407,12 +407,13 @@ if HAS_TRITON:
                                     )
                                     segment_score = segment_score + start_score + end_score
 
-                                # Load k-indexed transition for duration-dependent case
+                                # Load dur_idx-indexed transition for duration-dependent case
+                                # Duration k uses index k-1 (same convention as PyTorch reference)
                                 # Use clamped indices to avoid OOB pointer calculation
                                 if HAS_DURATION_TRANSITIONS:
                                     transition_block = tl.load(
                                         transition_ptr
-                                        + k * stride_tr_k
+                                        + dur_idx * stride_tr_k
                                         + c_dst_idx_safe * stride_tr_dst
                                         + c_src_idx_safe * stride_tr_src,
                                         mask=c_mask_2d,
@@ -577,10 +578,11 @@ if HAS_TRITON:
 
                                     # Load transition tile (TILE_C, C_PAD)
                                     # Rows = c_dst tile, Columns = all c_src
+                                    # Duration k uses index k-1 (same convention as PyTorch reference)
                                     if HAS_DURATION_TRANSITIONS:
                                         transition_tile = tl.load(
                                             transition_ptr
-                                            + k * stride_tr_k
+                                            + dur_idx * stride_tr_k
                                             + c_dst_idx_tile_safe[:, None] * stride_tr_dst
                                             + c_idx_safe[None, :] * stride_tr_src,
                                             mask=tile_mask_2d,
@@ -651,10 +653,11 @@ if HAS_TRITON:
                                     )
 
                                     # grad_transition: marginal_T_tile = (C_PAD, TILE_C)
+                                    # Duration k uses index k-1 (same convention as forward pass)
                                     marginal_T_tile = tl.trans(marginal_tile)
                                     if HAS_DURATION_TRANSITIONS:
                                         tr_offsets_tile = (
-                                            k * stride_gtw_k
+                                            dur_idx * stride_gtw_k
                                             + c_idx[:, None] * stride_gtw_src
                                             + c_dst_idx_tile[None, :] * stride_gtw_dst
                                         )
