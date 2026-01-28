@@ -2,7 +2,7 @@
 # Machine-readable state for automation and status queries
 
 version: 2.0
-last_global_verification: 2026-01-28T00:00:00Z
+last_global_verification: 2026-01-28T18:30:00Z
 
 sentinels:
   triton-forward-k3plus:
