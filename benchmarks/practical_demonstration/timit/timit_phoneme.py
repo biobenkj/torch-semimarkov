@@ -21,7 +21,7 @@ Three-Way Model Comparison:
 Why Semi-CRFs help on TIMIT:
     - Phonemes have characteristic durations (vowels longer than stops)
     - Duration is linguistically meaningful and predictable
-    - A linear CRF can't encode "this phoneme typically lasts 50-100ms"
+    - A linear CRF cannot encode "this phoneme typically lasts 50-100ms"
     - A semi-CRF learns duration priors per phoneme class
 
 Dataset:
@@ -1612,6 +1612,13 @@ class TIMITMetrics:
     training_time_per_epoch: float = 0.0  # seconds
     total_training_time: float = 0.0  # seconds
     inference_time: float = 0.0  # seconds for full test set
+    # Throughput metrics (for scaling analysis)
+    throughput_utterances_per_sec: float = 0.0  # avg utterances/sec per epoch
+    throughput_utterances_per_sec_std: float = 0.0  # std dev across epochs
+    throughput_frames_per_sec: float = 0.0  # avg frames/sec per epoch
+    throughput_frames_per_sec_std: float = 0.0  # std dev across epochs
+    num_train_utterances: int = 0  # dataset size for context
+    batch_size: int = 0  # batch size for context
 
     def to_dict(self) -> dict:
         """Convert metrics to JSON-serializable dict."""
@@ -1627,6 +1634,12 @@ class TIMITMetrics:
             "training_time_per_epoch": self.training_time_per_epoch,
             "total_training_time": self.total_training_time,
             "inference_time": self.inference_time,
+            "throughput_utterances_per_sec": self.throughput_utterances_per_sec,
+            "throughput_utterances_per_sec_std": self.throughput_utterances_per_sec_std,
+            "throughput_frames_per_sec": self.throughput_frames_per_sec,
+            "throughput_frames_per_sec_std": self.throughput_frames_per_sec_std,
+            "num_train_utterances": self.num_train_utterances,
+            "batch_size": self.batch_size,
         }
         if self.duration_stats:
             result["duration_stats"] = self.duration_stats
@@ -1646,7 +1659,7 @@ def train_epoch(
     backend: str = "streaming",
     use_triton: bool = True,
     crf_reg: float = 0.0,
-) -> tuple[float, float]:
+) -> tuple[float, float, int, int]:
     """Train for one epoch.
 
     Args:
@@ -1654,11 +1667,13 @@ def train_epoch(
             Helps prevent gradient explosion from unbounded transition/duration_bias.
 
     Returns:
-        Tuple of (average_loss, elapsed_time_seconds).
+        Tuple of (average_loss, elapsed_time_seconds, num_utterances, num_frames).
     """
     model.train()
     total_loss = 0
     num_batches = 0
+    total_utterances = 0
+    total_frames = 0
 
     start_time = time.perf_counter()
 
@@ -1666,6 +1681,10 @@ def train_epoch(
         features = batch["features"].to(device)
         labels = batch["labels"].to(device)
         lengths = batch["lengths"].to(device)
+
+        # Track throughput metrics
+        total_utterances += features.shape[0]
+        total_frames += lengths.sum().item()
 
         optimizer.zero_grad()
         loss = model.compute_loss(features, lengths, labels, backend=backend, use_triton=use_triton)
@@ -1683,7 +1702,7 @@ def train_epoch(
         num_batches += 1
 
     elapsed = time.perf_counter() - start_time
-    return total_loss / num_batches, elapsed
+    return total_loss / num_batches, elapsed, total_utterances, total_frames
 
 
 @torch.no_grad()
@@ -1873,9 +1892,13 @@ def train_model(
     best_metrics = None
     total_train_time = 0.0
     epoch_times = []
+    epoch_utterances = []
+    epoch_frames = []
+    epoch_utt_rates = []  # utterances/sec per epoch
+    epoch_frame_rates = []  # frames/sec per epoch
 
     for epoch in range(epochs):
-        train_loss, epoch_time = train_epoch(
+        train_loss, epoch_time, num_utterances, num_frames = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -1886,6 +1909,11 @@ def train_model(
         )
         total_train_time += epoch_time
         epoch_times.append(epoch_time)
+        epoch_utterances.append(num_utterances)
+        epoch_frames.append(num_frames)
+        # Track per-epoch throughput rates
+        epoch_utt_rates.append(num_utterances / epoch_time if epoch_time > 0 else 0)
+        epoch_frame_rates.append(num_frames / epoch_time if epoch_time > 0 else 0)
         scheduler.step()
 
         # Log CRF parameter magnitudes for debugging gradient explosion
@@ -1907,12 +1935,17 @@ def train_model(
         if (epoch + 1) % log_every == 0 or epoch == epochs - 1:
             test_metrics, inference_time = evaluate(model, test_loader, device, backend=backend)
 
+            # Calculate throughput for this epoch
+            utt_per_sec = num_utterances / epoch_time if epoch_time > 0 else 0
+            frames_per_sec = num_frames / epoch_time if epoch_time > 0 else 0
+
             logger.info(
                 f"Epoch {epoch+1}/{epochs} | Loss: {train_loss:.4f} | "
                 f"PER: {test_metrics.phone_error_rate:.4f} | "
                 f"Boundary F1: {test_metrics.boundary_f1:.4f} | "
                 f"Segment F1: {test_metrics.segment_f1:.4f} | "
-                f"Train: {epoch_time:.1f}s | Infer: {inference_time:.1f}s"
+                f"Train: {epoch_time:.1f}s ({utt_per_sec:.1f} utt/s, {frames_per_sec/1000:.1f}k fr/s) | "
+                f"Infer: {inference_time:.1f}s"
             )
 
             if test_metrics.phone_error_rate < best_per:
@@ -1921,6 +1954,15 @@ def train_model(
                 test_metrics.total_training_time = total_train_time
                 test_metrics.training_time_per_epoch = sum(epoch_times) / len(epoch_times)
                 test_metrics.inference_time = inference_time
+                # Update metrics with throughput info (mean and std across epochs)
+                utt_rates = np.array(epoch_utt_rates)
+                frame_rates = np.array(epoch_frame_rates)
+                test_metrics.throughput_utterances_per_sec = float(np.mean(utt_rates))
+                test_metrics.throughput_utterances_per_sec_std = float(np.std(utt_rates))
+                test_metrics.throughput_frames_per_sec = float(np.mean(frame_rates))
+                test_metrics.throughput_frames_per_sec_std = float(np.std(frame_rates))
+                test_metrics.num_train_utterances = len(train_dataset)
+                test_metrics.batch_size = batch_size
                 best_metrics = test_metrics
 
     return model, best_metrics
@@ -2424,7 +2466,7 @@ def main():
             n_mels=args.n_mels,
         )
     elif args.command == "train":
-        train_model(
+        _model, metrics = train_model(
             args.data_dir,
             model_type=args.model,
             max_duration=args.max_duration,
@@ -2439,6 +2481,32 @@ def main():
             crf_reg=args.crf_reg,
             fixed_length=args.fixed_length,
         )
+        # Print training summary with throughput
+        k = 1 if args.model in ("pytorch-crf", "linear") else args.max_duration
+        triton_str = "Triton" if not args.no_triton else "PyTorch"
+        print("\n" + "=" * 60)
+        print("TRAINING SUMMARY")
+        print("=" * 60)
+        print(f"  Model: {args.model} (K={k}, {triton_str})")
+        print(f"  Backend: {args.backend}")
+        print(f"  Batch size: {metrics.batch_size}")
+        print(f"  Dataset: {metrics.num_train_utterances} utterances")
+        print(f"  Epochs: {args.epochs}")
+        print(f"  Total training time: {metrics.total_training_time:.1f}s")
+        print(f"  Avg time per epoch: {metrics.training_time_per_epoch:.2f}s")
+        print(
+            f"  Throughput: {metrics.throughput_utterances_per_sec:.1f} ± "
+            f"{metrics.throughput_utterances_per_sec_std:.1f} utt/s"
+        )
+        print(
+            f"             {metrics.throughput_frames_per_sec/1000:.1f} ± "
+            f"{metrics.throughput_frames_per_sec_std/1000:.1f}k frames/s"
+        )
+        print("-" * 60)
+        print(f"  Best PER: {metrics.phone_error_rate:.4f}")
+        print(f"  Boundary F1: {metrics.boundary_f1:.4f}")
+        print(f"  Segment F1: {metrics.segment_f1:.4f}")
+        print("=" * 60)
     elif args.command == "compare":
         results = compare_models(
             args.data_dir,
