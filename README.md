@@ -26,8 +26,9 @@ This makes Semi-Markov CRF inference practical for long sequences—chromosome-s
 
 **torch-semimarkov** provides:
 
-- **Streaming scan** — $O(KC)$ memory, universally applicable
-- **Triton fused kernel** — optional GPU acceleration
+- **Streaming Semi-CRF inference** with $O(KC)$ memory via ring buffer and on-the-fly edge computation
+  - PyTorch reference implementation (CPU/GPU, always available)
+  - Triton fused kernel (GPU, 2-5× faster when available)
 
 ## Why Semi-CRFs?
 
@@ -140,7 +141,7 @@ This library follows **destination-first** convention for edge tensors, where `e
 
 **Special case K=1:** When `max_duration=1`, the model behaves like a standard HMM where all segments have duration 1. In this case, `duration_bias[0]` stores the bias for duration 1 (due to clamping).
 
-### Triton Kernel
+### GPU Acceleration (Triton)
 
 When Triton is installed, torch-semimarkov uses custom GPU kernels with fused edge computation that significantly accelerate both forward and backward passes.
 
@@ -154,7 +155,10 @@ content = cum_scores[t+k, c] - cum_scores[t, c]  # O(1) lookup
 edge[t, k, c_dst, c_src] = content + duration_bias[k, c] + transition[c_src, c_dst]
 ```
 
+Both the PyTorch reference and Triton implementations use the same streaming algorithm: ring buffer for O(KC) DP state, prefix-sum edge decomposition, and checkpoint-based backward pass. The Triton kernel fuses these operations for higher GPU throughput.
+
 Key optimizations:
+
 - **Fused edge computation** — computes edges on-the-fly via prefix-sum, avoiding the full edge tensor
 - **O(KC) memory** — ring buffer for DP state, independent of sequence length
 - **Separate forward/backward kernels** — the forward-backward algorithm requires computing marginals from both α (forward) and β (backward) messages, so these are necessarily separate kernel launches with checkpointing
@@ -201,8 +205,9 @@ Tests run CPU-only by default. GPU tests require CUDA and are skipped in CI.
 
 | Component | Status |
 |-----------|--------|
-| **Streaming Scan** | O(KC) memory, default backend |
-| **Triton Kernel** | GPU acceleration, Log/Max semirings, custom forward/backward |
+| **Streaming Algorithm** | O(KC) memory, ring buffer + prefix-sum edges |
+| **PyTorch Backend** | Reference implementation, CPU/GPU |
+| **Triton Backend** | Fused GPU kernel, Log/Max semirings, 2-5× faster |
 | **Semirings** | Log, Max, Std, KMax, Entropy, CrossEntropy, KLDivergence |
 
 ## Acknowledgments
