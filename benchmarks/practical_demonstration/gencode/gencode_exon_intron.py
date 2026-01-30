@@ -79,6 +79,7 @@ import argparse
 import gzip
 import json
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -87,10 +88,13 @@ from typing import Literal, NamedTuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 # Conditional imports for preprocessing
 try:
@@ -127,6 +131,97 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Diagnostics
+# =============================================================================
+
+
+def print_diagnostics(batch_size: int = 32, seq_len: int = 10000, max_duration: int = 500):
+    """Print system/library diagnostics for debugging OOM issues."""
+    logger.info("=" * 60)
+    logger.info("DIAGNOSTICS")
+    logger.info("=" * 60)
+
+    # Triton availability
+    try:
+        import triton
+
+        logger.info(f"Triton: v{triton.__version__}")
+    except ImportError:
+        logger.warning("Triton: NOT INSTALLED (will use PyTorch streaming fallback)")
+
+    # Mamba availability
+    if HAS_MAMBA:
+        logger.info("Mamba SSM: available")
+    else:
+        logger.info("Mamba SSM: NOT INSTALLED (use --encoder mamba_stub for CPU dev)")
+
+    # pytorch-crf availability
+    if HAS_TORCHCRF:
+        logger.info("pytorch-crf: available")
+    else:
+        logger.info("pytorch-crf: NOT INSTALLED (--model pytorch-crf unavailable)")
+
+    # CUDA
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            total_gb = props.total_memory / 1e9
+            logger.info(f"GPU {i}: {props.name}, {total_gb:.1f}GB total")
+    else:
+        logger.info("CUDA: not available")
+
+    # Memory estimates
+    C = NUM_CLASSES
+    exact_gb = batch_size * seq_len * max_duration * C * C * 4 / 1e9
+    streaming_gb = batch_size * seq_len * C * 4 / 1e9  # cumsum tensor dominates
+
+    logger.info(f"Memory estimate (B={batch_size}, T={seq_len}, K={max_duration}, C={C}):")
+    logger.info(f"  Exact backend:     {exact_gb:.1f}GB (edge tensor)")
+    logger.info(f"  Streaming backend: {streaming_gb:.2f}GB (cumsum tensor)")
+    logger.info("=" * 60)
+
+
+# =============================================================================
+# Distributed Training Utilities
+# =============================================================================
+
+
+def setup_distributed(rank: int, world_size: int, backend: str = "nccl"):
+    """Initialize distributed process group.
+
+    Args:
+        rank: GPU rank (0 to world_size-1)
+        world_size: Total number of GPUs
+        backend: Communication backend ("nccl" for GPU, "gloo" for CPU)
+
+    Environment variables (optional):
+        MASTER_ADDR: Coordinator address (default: localhost)
+        MASTER_PORT: Coordinator port (default: 12355)
+        NCCL_SOCKET_IFNAME: Network interface for NCCL (e.g., "ib0", "eth0")
+    """
+    os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
+
+    # For InfiniBand over Ethernet (IPoIB), NCCL uses TCP sockets automatically
+    # If needed, set NCCL_SOCKET_IFNAME to specify the interface:
+    #   export NCCL_SOCKET_IFNAME=ib0  (or your IPoIB interface name)
+
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_distributed():
+    """Cleanup distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    """Check if this is the main process (rank 0)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 # =============================================================================
@@ -1068,10 +1163,14 @@ class ExonIntronModel(nn.Module):
         max_duration: int = 1,  # K=1 for linear CRF
         hidden_dim: int = 256,
         duration_distribution: str = "learned",
+        backend: str = "streaming",  # Default: streaming Triton kernel
+        use_triton: bool = True,  # Default: use Triton (not PyTorch fallback)
     ):
         super().__init__()
         self.encoder = encoder
         self.max_duration = max_duration
+        self.backend = backend
+        self.use_triton = use_triton
 
         # Use UncertaintySemiMarkovCRFHead for calibration/uncertainty estimation
         from torch_semimarkov import UncertaintySemiMarkovCRFHead
@@ -1094,15 +1193,54 @@ class ExonIntronModel(nn.Module):
         hidden = self.encoder(sequence)
         return self.crf(hidden, lengths)
 
-    def compute_loss(self, sequence: Tensor, lengths: Tensor, labels: Tensor) -> Tensor:
-        """Compute NLL loss."""
-        hidden = self.encoder(sequence)
-        return self.crf.compute_loss(hidden, lengths, labels)
+    def compute_loss(
+        self,
+        sequence: Tensor,
+        lengths: Tensor,
+        labels: Tensor,
+        backend: str | None = None,
+        use_triton: bool | None = None,
+    ) -> Tensor:
+        """Compute NLL loss.
 
-    def decode(self, sequence: Tensor, lengths: Tensor):
-        """Viterbi decoding."""
+        Args:
+            sequence: Input features (batch, T, input_dim)
+            lengths: Sequence lengths (batch,)
+            labels: Per-position labels (batch, T)
+            backend: Override default backend ("streaming", "exact", "auto")
+            use_triton: Override default Triton usage
+        """
         hidden = self.encoder(sequence)
-        return self.crf.decode_with_traceback(hidden, lengths)
+        return self.crf.compute_loss(
+            hidden,
+            lengths,
+            labels,
+            backend=backend if backend is not None else self.backend,
+            use_triton=use_triton if use_triton is not None else self.use_triton,
+        )
+
+    def decode(
+        self,
+        sequence: Tensor,
+        lengths: Tensor,
+        backend: str | None = None,
+        use_triton: bool | None = None,
+    ):
+        """Viterbi decoding.
+
+        Args:
+            sequence: Input features (batch, T, input_dim)
+            lengths: Sequence lengths (batch,)
+            backend: Override default backend ("streaming", "exact", "auto")
+            use_triton: Override default Triton usage
+        """
+        hidden = self.encoder(sequence)
+        return self.crf.decode_with_traceback(
+            hidden,
+            lengths,
+            backend=backend if backend is not None else self.backend,
+            use_triton=use_triton if use_triton is not None else self.use_triton,
+        )
 
 
 class ExonIntronModelPytorchCRF(nn.Module):
@@ -1404,14 +1542,31 @@ def compute_duration_calibration(
 
 
 def train_epoch(
-    model: ExonIntronModel,
+    model: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    sampler: DistributedSampler | None = None,
+    epoch: int = 0,
+    distributed: bool = False,
 ) -> float:
-    """Train for one epoch."""
+    """Train for one epoch.
+
+    Args:
+        model: Model to train (may be DDP-wrapped)
+        dataloader: Training data loader
+        optimizer: Optimizer
+        device: Device to train on
+        sampler: Optional DistributedSampler (for DDP training)
+        epoch: Current epoch number (for sampler shuffling)
+        distributed: Whether running in distributed mode (for loss aggregation)
+    """
+    # Set epoch for proper shuffling in distributed mode
+    if sampler is not None:
+        sampler.set_epoch(epoch)
+
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     num_batches = 0
 
     for batch in dataloader:
@@ -1431,7 +1586,16 @@ def train_epoch(
         total_loss += loss.item()
         num_batches += 1
 
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+
+    # Aggregate loss across all GPUs in distributed mode
+    if distributed and dist.is_initialized():
+        loss_tensor = torch.tensor([avg_loss, num_batches], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        # Weighted average by number of batches per GPU
+        avg_loss = loss_tensor[0].item() / dist.get_world_size()
+
+    return avg_loss
 
 
 @torch.no_grad()
@@ -1529,6 +1693,15 @@ def train_model(
     d_state: int = 16,
     d_conv: int = 4,
     expand: int = 2,
+    # Backend selection
+    backend: str = "streaming",  # Default: streaming Triton kernel
+    use_triton: bool = True,  # Default: use Triton (not PyTorch fallback)
+    # Logging
+    log_every: int = 1,  # Evaluate and log every N epochs
+    # Distributed training
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[nn.Module, SegmentMetrics | None]:
     """
     Train a model and return it with metrics.
@@ -1543,22 +1716,47 @@ def train_model(
         batch_size: Training batch size
         learning_rate: Learning rate
         epochs: Number of training epochs
-        device: Device to train on
+        device: Device to train on (ignored if distributed=True)
         d_state: Mamba SSM state dimension
         d_conv: Mamba local convolution width
         expand: Mamba expansion factor
+        backend: Backend for semi-CRF - "streaming" (default), "exact", or "auto"
+        use_triton: Whether to use Triton kernels (default True)
+        log_every: Evaluate and log every N epochs (default 1)
+        distributed: Enable distributed training (DDP)
+        rank: GPU rank for distributed training
+        world_size: Total number of GPUs for distributed training
     """
-    device_obj = torch.device(device)
+    # Device setup - use rank for distributed, otherwise use provided device
+    if distributed:
+        device_obj = torch.device(f"cuda:{rank}")
+    else:
+        device_obj = torch.device(device)
 
     # Load data
     train_dataset = GencodeDataset(data_dir / "train.jsonl")
     val_dataset = GencodeDataset(data_dir / "val.jsonl")
 
+    # Use DistributedSampler for DDP training (only for train, not val)
+    train_sampler: DistributedSampler | None = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        )
+
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),  # Only shuffle if no sampler
+        sampler=train_sampler,
+        collate_fn=collate_fn,
     )
+    # Validation: no distributed sampler - only rank 0 evaluates on full set
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
     )
 
     # Adjust layers for encoder type (Mamba typically uses more layers)
@@ -1591,6 +1789,8 @@ def train_model(
             encoder=encoder,
             max_duration=k,
             hidden_dim=hidden_dim,
+            backend=backend,
+            use_triton=use_triton,
         ).to(device_obj)
     else:  # semicrf
         k = max_duration
@@ -1598,12 +1798,22 @@ def train_model(
             encoder=encoder,
             max_duration=k,
             hidden_dim=hidden_dim,
+            backend=backend,
+            use_triton=use_triton,
         ).to(device_obj)
 
-    logger.info(
-        f"Model: {model_type} + {encoder_type}, K={k}, "
-        f"params={sum(p.numel() for p in model.parameters()):,}"
-    )
+    # Wrap model in DDP for distributed training
+    if distributed:
+        model = DDP(model, device_ids=[rank])
+
+    # Only log from main process
+    if is_main_process():
+        logger.info(
+            f"Model: {model_type} + {encoder_type}, K={k}, "
+            f"backend={backend}, triton={use_triton}, "
+            f"params={sum(p.numel() for p in model.parameters()):,}"
+            + (f", distributed={world_size} GPUs" if distributed else "")
+        )
 
     is_pytorch_crf = model_type == "pytorch-crf"
 
@@ -1614,25 +1824,69 @@ def train_model(
     best_metrics: SegmentMetrics | None = None
 
     for epoch in range(epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device_obj)
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device_obj,
+            sampler=train_sampler,
+            epoch=epoch,
+            distributed=distributed,
+        )
         scheduler.step()
 
-        # Evaluate every 5 epochs
-        if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-            val_metrics = evaluate(model, val_loader, device_obj, is_pytorch_crf)
+        # Evaluate every N epochs
+        # In distributed mode: only rank 0 evaluates on full val set, others wait
+        if (epoch + 1) % log_every == 0 or epoch == epochs - 1:
+            if is_main_process():
+                val_metrics = evaluate(model, val_loader, device_obj, is_pytorch_crf)
 
-            logger.info(
-                f"Epoch {epoch+1}/{epochs} | Loss: {train_loss:.4f} | "
-                f"Val F1 (pos): {val_metrics.position_f1_macro:.4f} | "
-                f"Val F1 (boundary): {val_metrics.boundary_f1:.4f} | "
-                f"Val F1 (segment): {val_metrics.segment_f1:.4f}"
-            )
+                logger.info(
+                    f"Epoch {epoch+1}/{epochs} | Loss: {train_loss:.4f} | "
+                    f"Val F1 (pos): {val_metrics.position_f1_macro:.4f} | "
+                    f"Val F1 (boundary): {val_metrics.boundary_f1:.4f} | "
+                    f"Val F1 (segment): {val_metrics.segment_f1:.4f}"
+                )
 
-            if val_metrics.boundary_f1 > best_val_f1:
-                best_val_f1 = val_metrics.boundary_f1
-                best_metrics = val_metrics
+                if val_metrics.boundary_f1 > best_val_f1:
+                    best_val_f1 = val_metrics.boundary_f1
+                    best_metrics = val_metrics
+
+            # Synchronize all processes after evaluation
+            if distributed and dist.is_initialized():
+                dist.barrier()
 
     return model, best_metrics
+
+
+def train_distributed_worker(
+    rank: int,
+    world_size: int,
+    data_dir: Path,
+    **kwargs,
+):
+    """Worker function for distributed training.
+
+    Spawned by torch.multiprocessing.spawn for each GPU.
+
+    Args:
+        rank: GPU rank (0 to world_size-1)
+        world_size: Total number of GPUs
+        data_dir: Path to data directory
+        **kwargs: All other arguments passed to train_model
+    """
+    setup_distributed(rank, world_size)
+
+    try:
+        train_model(
+            data_dir,
+            distributed=True,
+            rank=rank,
+            world_size=world_size,
+            **kwargs,
+        )
+    finally:
+        cleanup_distributed()
 
 
 def compare_models(
@@ -1820,6 +2074,42 @@ def main():
     train_parser.add_argument("--d-state", type=int, default=16, help="Mamba SSM state dimension")
     train_parser.add_argument("--d-conv", type=int, default=4, help="Mamba local convolution width")
     train_parser.add_argument("--expand", type=int, default=2, help="Mamba expansion factor")
+    # Backend selection
+    train_parser.add_argument(
+        "--backend",
+        choices=["streaming", "exact", "auto"],
+        default="streaming",
+        help="Backend for semi-CRF: streaming (default, memory-efficient), exact, or auto",
+    )
+    train_parser.add_argument(
+        "--no-triton",
+        action="store_true",
+        help="Disable Triton kernels (use PyTorch fallback)",
+    )
+    train_parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Evaluate and log every N epochs (default: 1)",
+    )
+    # Distributed training
+    train_parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Enable multi-GPU DDP training",
+    )
+    train_parser.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help="Number of GPUs for distributed training (default: all available)",
+    )
+    train_parser.add_argument(
+        "--nccl-ifname",
+        type=str,
+        default=None,
+        help="Network interface for NCCL (e.g., ib0 for IPoIB, eth0 for ethernet)",
+    )
 
     # Compare command
     compare_parser = subparsers.add_parser(
@@ -1845,6 +2135,24 @@ def main():
     compare_parser.add_argument("--d-state", type=int, default=16)
     compare_parser.add_argument("--d-conv", type=int, default=4)
     compare_parser.add_argument("--expand", type=int, default=2)
+    # Backend selection
+    compare_parser.add_argument(
+        "--backend",
+        choices=["streaming", "exact", "auto"],
+        default="streaming",
+        help="Backend for semi-CRF: streaming (default), exact, or auto",
+    )
+    compare_parser.add_argument(
+        "--no-triton",
+        action="store_true",
+        help="Disable Triton kernels (use PyTorch fallback)",
+    )
+    compare_parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Evaluate and log every N epochs (default: 1)",
+    )
 
     args = parser.parse_args()
 
@@ -1854,23 +2162,63 @@ def main():
         )
     elif args.command == "train":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        train_model(
-            args.data_dir,
-            model_type=args.model,
-            encoder_type=args.encoder,
-            max_duration=args.max_duration,
-            hidden_dim=args.hidden_dim,
-            num_layers=args.num_layers,
-            epochs=args.epochs,
+        # Print diagnostics before training
+        print_diagnostics(
             batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            d_state=args.d_state,
-            d_conv=args.d_conv,
-            expand=args.expand,
+            seq_len=10000,  # Default chunk size
+            max_duration=args.max_duration,
         )
+
+        # Common training kwargs
+        train_kwargs = {
+            "model_type": args.model,
+            "encoder_type": args.encoder,
+            "max_duration": args.max_duration,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "d_state": args.d_state,
+            "d_conv": args.d_conv,
+            "expand": args.expand,
+            "backend": args.backend,
+            "use_triton": not args.no_triton,
+            "log_every": args.log_every,
+        }
+
+        if args.distributed:
+            import torch.multiprocessing as mp
+
+            world_size = args.world_size or torch.cuda.device_count()
+            if world_size < 2:
+                logger.warning("Distributed training requires >=2 GPUs, falling back to single GPU")
+                train_model(args.data_dir, device=device, **train_kwargs)
+            else:
+                # Set NCCL interface if specified (for IPoIB or specific network)
+                if args.nccl_ifname:
+                    os.environ["NCCL_SOCKET_IFNAME"] = args.nccl_ifname
+                    logger.info(f"Using network interface: {args.nccl_ifname}")
+
+                logger.info(f"Launching DDP training with {world_size} GPUs")
+                mp.spawn(
+                    train_distributed_worker,
+                    args=(world_size, args.data_dir),
+                    kwargs=train_kwargs,
+                    nprocs=world_size,
+                    join=True,
+                )
+        else:
+            # Single-GPU training
+            train_model(args.data_dir, device=device, **train_kwargs)
     elif args.command == "compare":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Print diagnostics before comparison
+        print_diagnostics(
+            batch_size=args.batch_size,
+            seq_len=10000,  # Default chunk size
+            max_duration=args.max_duration,
+        )
         results = compare_models(
             args.data_dir,
             encoder_type=args.encoder,
@@ -1883,6 +2231,9 @@ def main():
             d_state=args.d_state,
             d_conv=args.d_conv,
             expand=args.expand,
+            backend=args.backend,
+            use_triton=not args.no_triton,
+            log_every=args.log_every,
         )
         if args.output_json:
             from datetime import datetime
